@@ -101,7 +101,7 @@ class ClevrerTripletDataset(Dataset):
         return valid_triplets, frame_folder_triplet_ranges
 
     @staticmethod
-    @lru_cache(maxsize=8)
+    @lru_cache(maxsize=2)
     def _cached_full_video_frames_torchvision(video_path):
         from torchvision.io import read_video
 

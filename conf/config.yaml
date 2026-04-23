@@ -24,7 +24,8 @@ training:
   overfit_video_index: -1
   overfit_shuffle: false
   overfit_num_workers: 0
-  gradient_checkpointing: true
+  # Higher-order DEL gradients are not safe with checkpointed transformer blocks.
+  gradient_checkpointing: false
   lr: 0.0001
   lr_warmup_epochs: 10
   weight_decay: 0.00001
@@ -36,10 +37,15 @@ training:
   solver_steps: 5
   training_solver_steps: 1
   lambda_del: 1.0
-  solver_microbatch_size: 4
+  # Keep solver-MSE opt-in; default training uses DEL on ground-truth triples.
+  lambda_solver_mse: 0.0
+  solver_microbatch_size: 1
   autoregressive_rollout_steps: 0
   autoregressive_detach_between_steps: true
   sequence_encode_batch_size: 1
+  diagnostics_every: 10
+  vae_reconstruction_check_frames: 4
+  vae_reconstruction_warn_mse: 0.05
   inference_every: 1
   save_inference_images: true
   save_inference_video: true

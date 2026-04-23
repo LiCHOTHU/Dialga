@@ -1,0 +1,3 @@
+enabled: false
+background_mode: static_frame0
+output_root: ${oc.env:SCRATCH,/tmp}/Dialga/render

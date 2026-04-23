@@ -1,0 +1,51 @@
+defaults:
+  - dynamics: default
+  - perception: sam2
+  - render: composite
+  - _self_
+
+experiment:
+  name: object_dynamics
+  save_root: ${oc.env:SCRATCH,/tmp}/Dialga
+  output_dir: ${experiment.save_root}/runs/${experiment.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  checkpoint_dir: ${experiment.output_dir}/checkpoints
+  seed: 0
+
+dataset:
+  annotation_dir: ${experiment.save_root}/CLEVRER/annotations
+  video_dir: /storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/train_video
+  split: train
+  val_split: val
+  traj_len: 33
+  stride: 4
+  frames_per_video: 128
+  max_objects: 8
+  coordinate_mode: world_xy
+  use_inside_camera_view_mask: true
+
+training:
+  batch_size: 8
+  num_workers: 0
+  epochs: 50
+  lr: 0.001
+  weight_decay: 0.0001
+  grad_clip_norm: 1.0
+  device: cuda
+  print_every: 10
+  eval_every: 1
+  save_every: 1
+  limit_train_batches: 0
+  limit_val_batches: 0
+  detect_anomaly: false
+
+evaluation:
+  enabled: true
+  batch_size: 8
+  num_workers: 0
+  checkpoint_path: null
+  split: ${dataset.val_split}
+  max_batches: 0
+
+hydra:
+  run:
+    dir: ${experiment.output_dir}

@@ -1,5 +1,13 @@
 # ⏱️ DIALGA: Discrete Integration And Lagrangian Generative Architecture
 
+## Repository Status
+
+The repo is currently transitioning from the earlier latent-video VSFM prototype to an object-state dynamics pipeline.
+
+- New object-state code lives under `src/dynamics/`, `src/data/clevrer_states.py`, and `scripts/train_dynamics.py`.
+- Runtime outputs and future checkpoints should be written under `$SCRATCH/Dialga` rather than the repo directory.
+- The older latent-space training path is still present as legacy code while the rewrite is being validated.
+
 **DIALGA** is a physics-grounded forward dynamics model that implements **Variational Solver Flow Matching (VSFM)**. 
 
 Standard video generation models treat physical evolution as an arbitrary, conditional visual mapping—leading to "case-based generalization" where models simply hallucinate pixels that look like their training data, breaking the laws of physics in out-of-distribution scenarios. 
@@ -36,10 +44,11 @@ A custom shell script is provided to pull the dataset directly to your HPC stora
 ```bash
 chmod +x scripts/download_clevrer.sh
 ```
-2. Execute the script (Target Directory: `/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER`):
+2. Execute the script (default target directory: `/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER`):
 ```bash
 ./scripts/download_clevrer.sh
 ```
+You can override the destination with `BASE_DIR=/your/path ./scripts/download_clevrer.sh`.
 3. Run the frame extraction utility to convert the raw `.mp4` training files into structured $(o_{t-1}, o_t, o_{t+1})$ triplets for the PyTorch Dataloader:
 ```bash
 python data/extract_frames.py --input /storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/train_video --output /storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/frames

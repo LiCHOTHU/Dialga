@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import os
 import logging
 from pathlib import Path
@@ -22,6 +23,22 @@ except ImportError:
     wandb = None
 
 log = logging.getLogger(__name__)
+
+
+@contextmanager
+def _temporary_eval_mode(*modules):
+    managed_modules = [module for module in modules if module is not None]
+    previous_training_modes = [module.training for module in managed_modules]
+
+    for module in managed_modules:
+        module.eval()
+
+    try:
+        yield
+    finally:
+        for module, was_training in zip(managed_modules, previous_training_modes):
+            module.train(was_training)
+
 
 def calculate_del_residual(
     lagrangian,
@@ -137,6 +154,7 @@ def compute_autoregressive_overfit_losses(
     solver_steps=1,
     rollout_steps=0,
     detach_between_steps=True,
+    include_del=True,
 ):
     """
     Trains on a full video trajectory by rolling out autoregressively from the
@@ -167,13 +185,14 @@ def compute_autoregressive_overfit_losses(
         )
 
         mse_sum = mse_sum + F.mse_loss(q_next_pred, q_next_true)
-        residual_pred = calculate_del_residual(
-            lagrangian=lagrangian,
-            q_prev=q_prev,
-            q_curr=q_curr,
-            q_next=q_next_pred,
-        )
-        del_sum = del_sum + residual_pred.pow(2).mean()
+        if include_del:
+            residual_pred = calculate_del_residual(
+                lagrangian=lagrangian,
+                q_prev=q_prev,
+                q_curr=q_curr,
+                q_next=q_next_pred,
+            )
+            del_sum = del_sum + residual_pred.pow(2).mean()
 
         if detach_between_steps:
             q_prev = q_curr.detach()
@@ -186,19 +205,123 @@ def compute_autoregressive_overfit_losses(
     return mse_sum / normalizer, del_sum / normalizer
 
 
+def compute_ground_truth_sequence_losses(lagrangian, q_sequence, rollout_steps=0):
+    """
+    DEL-only sequence objective on ground-truth triples.
+
+    The returned MSE is a constant-velocity anchor diagnostic only; it is not
+    backpropagated through a differentiable DEL solver.
+    """
+    if q_sequence.shape[0] < 3:
+        raise RuntimeError("Need at least 3 latent frames for sequence DEL training.")
+
+    max_steps = q_sequence.shape[0] - 2
+    if rollout_steps <= 0:
+        rollout_steps = max_steps
+    rollout_steps = min(int(rollout_steps), max_steps)
+
+    anchor_mse_sum = q_sequence.new_zeros(())
+    del_sum = q_sequence.new_zeros(())
+
+    for step_idx in range(rollout_steps):
+        q_prev = q_sequence[step_idx : step_idx + 1]
+        q_curr = q_sequence[step_idx + 1 : step_idx + 2]
+        q_next_true = q_sequence[step_idx + 2 : step_idx + 3]
+
+        anchor_pred = 2 * q_curr - q_prev
+        anchor_mse_sum = anchor_mse_sum + F.mse_loss(anchor_pred, q_next_true)
+
+        residual_true = calculate_del_residual(
+            lagrangian=lagrangian,
+            q_prev=q_prev,
+            q_curr=q_curr,
+            q_next=q_next_true,
+        )
+        del_sum = del_sum + residual_true.pow(2).mean()
+
+    normalizer = float(rollout_steps)
+    return anchor_mse_sum / normalizer, del_sum / normalizer
+
+
+def summarize_lagrangian_components(lagrangian, q_prev, q_curr):
+    with torch.no_grad():
+        components = lagrangian.compute_components(q_prev, q_curr)
+    return {
+        "mass_mean": components["mass"].mean().item(),
+        "mass_min": components["mass"].min().item(),
+        "mass_max": components["mass"].max().item(),
+        "kinetic_mean": components["kinetic"].mean().item(),
+        "potential_mean": components["potential"].mean().item(),
+        "energy_mean": components["mechanical_energy"].mean().item(),
+    }
+
+
+def summarize_energy_drift(lagrangian, latent_sequence):
+    if latent_sequence.shape[0] < 2:
+        return None
+    with torch.no_grad():
+        components = lagrangian.compute_components(
+            latent_sequence[:-1],
+            latent_sequence[1:],
+        )
+        energy = components["mechanical_energy"]
+        initial = energy[:1]
+        relative_drift = (energy - initial).abs() / initial.abs().clamp_min(1e-8)
+    return {
+        "rollout_energy_drift": relative_drift.mean().item(),
+        "rollout_energy_span": (energy.max() - energy.min()).item(),
+    }
+
+
 def infer_latent_shape(encoder, dataset, device):
     sample_prev, _, _ = dataset[0]
     sample_prev = sample_prev.unsqueeze(0).to(device)
-    with torch.no_grad():
+    with _temporary_eval_mode(encoder), torch.no_grad():
         latent = encoder(sample_prev)
     return tuple(latent.shape[1:])
+
+
+def evaluate_autoencoder_reconstruction(
+    autoencoder,
+    dataset,
+    device,
+    video_index=0,
+    max_frames=4,
+):
+    if max_frames <= 0:
+        return None
+
+    frames = dataset.get_video_sequence(
+        video_index=video_index,
+        max_frames=max_frames,
+    ).to(device)
+    with _temporary_eval_mode(autoencoder), torch.no_grad():
+        latents = autoencoder(frames)
+        recon = autoencoder.decode(latents)
+
+    if recon.shape != frames.shape:
+        min_frames = min(recon.shape[0], frames.shape[0])
+        log.warning(
+            "VAE reconstruction shape mismatch: input=%s recon=%s. "
+            "Comparing the first %d frames only.",
+            tuple(frames.shape),
+            tuple(recon.shape),
+            min_frames,
+        )
+        frames = frames[:min_frames]
+        recon = recon[:min_frames]
+
+    return {
+        "mse": F.mse_loss(recon, frames).item(),
+        "mae": F.l1_loss(recon, frames).item(),
+    }
 
 
 def encode_video_sequence_in_chunks(encoder, frame_sequence, device, chunk_size):
     latents = []
     chunk_size = max(1, int(chunk_size))
 
-    with torch.no_grad():
+    with _temporary_eval_mode(encoder), torch.no_grad():
         for start_idx in range(0, frame_sequence.shape[0], chunk_size):
             frame_chunk = frame_sequence[start_idx : start_idx + chunk_size].to(device)
             latents.append(encoder(frame_chunk))
@@ -354,31 +477,38 @@ def run_inference_and_save(
 
     gt_sequence_display = _to_display_range(gt_sequence)
 
-    lagrangian.eval()
-    with torch.no_grad():
-        seed_frames = gt_sequence[:2].to(device)
-        seed_latents = autoencoder(seed_frames)
-        q_prev_sim = seed_latents[0:1]
-        q_curr_sim = seed_latents[1:2]
+    with _temporary_eval_mode(lagrangian, autoencoder):
+        with torch.no_grad():
+            seed_frames = gt_sequence[:2].to(device)
+            seed_latents = autoencoder(seed_frames)
+            q_prev_sim = seed_latents[0:1]
+            q_curr_sim = seed_latents[1:2]
 
-        rollout_latents = _rollout_latents(
-            lagrangian=lagrangian,
-            q_prev=q_prev_sim,
-            q_curr=q_curr_sim,
-            alpha=solver_alpha,
-            solver_steps=solver_steps,
-            rollout_steps=max(gt_sequence.shape[0] - 2, 1),
-        )
-        if rollout_latents:
-            decoded_future = autoencoder.decode(torch.cat(rollout_latents, dim=0))
-            pred_future_display = _to_display_range(decoded_future)
-            pred_sequence_display = torch.cat(
-                [gt_sequence_display[:2], pred_future_display],
-                dim=0,
+            rollout_latents = _rollout_latents(
+                lagrangian=lagrangian,
+                q_prev=q_prev_sim,
+                q_curr=q_curr_sim,
+                alpha=solver_alpha,
+                solver_steps=solver_steps,
+                rollout_steps=max(gt_sequence.shape[0] - 2, 1),
             )
-        else:
-            pred_sequence_display = gt_sequence_display[:2]
-    lagrangian.train()
+            if rollout_latents:
+                future_latents = torch.cat(rollout_latents, dim=0)
+                pred_latent_sequence = torch.cat(
+                    [q_prev_sim, q_curr_sim, future_latents],
+                    dim=0,
+                )
+                energy_metrics = summarize_energy_drift(lagrangian, pred_latent_sequence)
+                decoded_future = autoencoder.decode(future_latents)
+                pred_future_display = _to_display_range(decoded_future)
+                pred_sequence_display = torch.cat(
+                    [gt_sequence_display[:2], pred_future_display],
+                    dim=0,
+                )
+            else:
+                pred_latent_sequence = torch.cat([q_prev_sim, q_curr_sim], dim=0)
+                energy_metrics = summarize_energy_drift(lagrangian, pred_latent_sequence)
+                pred_sequence_display = gt_sequence_display[:2]
     pred_sequence_display = pred_sequence_display[: gt_sequence_display.shape[0]]
     sparse_indices = _uniform_sample_indices(
         gt_sequence_display.shape[0], inference_sparse_frames
@@ -432,6 +562,13 @@ def run_inference_and_save(
     else:
         video_path = None
 
+    if energy_metrics is not None:
+        log.info(
+            "Rollout energy diagnostics | relative drift: %.6f | span: %.6f",
+            energy_metrics["rollout_energy_drift"],
+            energy_metrics["rollout_energy_span"],
+        )
+
     if wandb_run is not None:
         media_payload = {}
         if comparison_path is not None:
@@ -447,13 +584,34 @@ def run_inference_and_save(
             )
         if media_payload:
             wandb_run.log(media_payload, step=epoch)
+        if energy_metrics is not None:
+            wandb_run.log(
+                {
+                    "diagnostics/rollout_energy_drift": energy_metrics[
+                        "rollout_energy_drift"
+                    ],
+                    "diagnostics/rollout_energy_span": energy_metrics[
+                        "rollout_energy_span"
+                    ],
+                },
+                step=epoch,
+            )
 
     return comparison_path, video_path
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
     device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
-    log.info(f"Starting DIALGA training on {device}...")
+    if int(cfg.training.batch_size) <= 0:
+        raise ValueError("training.batch_size must be > 0.")
+    if int(cfg.training.epochs) <= 0:
+        raise ValueError("training.epochs must be > 0.")
+    if int(cfg.training.get("num_workers", 0)) < 0:
+        raise ValueError("training.num_workers must be >= 0.")
+    if int(cfg.training.get("overfit_num_workers", 0)) < 0:
+        raise ValueError("training.overfit_num_workers must be >= 0.")
+
+    log.info("Starting DIALGA training on %s...", device)
     output_dir = Path(HydraConfig.get().runtime.output_dir)
     log.info("Hydra run output directory: %s", output_dir)
     wandb_run = _init_wandb(cfg, output_dir)
@@ -480,6 +638,13 @@ def main(cfg: DictConfig):
     base_dataset = dataset
     overfit_subset_size = int(cfg.training.get("overfit_subset_size", 0))
     overfit_video_index = int(cfg.training.get("overfit_video_index", -1))
+    if overfit_video_index >= 0 and overfit_subset_size > 0:
+        log.warning(
+            "Both training.overfit_video_index=%d and training.overfit_subset_size=%d are set. "
+            "Ignoring overfit_subset_size and using the selected video trajectory.",
+            overfit_video_index,
+            overfit_subset_size,
+        )
     shuffle = True
     drop_last = True
     effective_batch_size = int(cfg.training.batch_size)
@@ -514,6 +679,8 @@ def main(cfg: DictConfig):
         )
 
     eval_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    if effective_batch_size <= 0:
+        raise ValueError("Resolved training batch size must be > 0.")
 
     loader = DataLoader(
         dataset,
@@ -528,6 +695,11 @@ def main(cfg: DictConfig):
     # --- Initialize Models ---
     # Frozen WAN VAE used for both encode and decode to avoid a duplicate model on GPU.
     encoder = WanFrozenEncoder(vae_pth=cfg.model.vae_ckpt, device=device)
+    log.warning(
+        "WanFrozenEncoder is encoding individual frames with a video VAE. "
+        "Use the reconstruction sanity check below to verify this latent is usable; "
+        "object-centric CLEVRER coordinates remain the preferred physics state."
+    )
     save_inference_images = bool(cfg.training.get("save_inference_images", True))
     save_inference_video = bool(cfg.training.get("save_inference_video", True))
     save_inference_visuals = save_inference_images or save_inference_video
@@ -546,6 +718,40 @@ def main(cfg: DictConfig):
             configured_latent_shape,
             actual_latent_shape,
         )
+
+    reconstruction_check_frames = int(
+        cfg.training.get("vae_reconstruction_check_frames", 4)
+    )
+    reconstruction_warn_mse = float(
+        cfg.training.get("vae_reconstruction_warn_mse", 0.05)
+    )
+    reconstruction_metrics = evaluate_autoencoder_reconstruction(
+        autoencoder=encoder,
+        dataset=eval_dataset,
+        device=device,
+        video_index=max(overfit_video_index, 0),
+        max_frames=reconstruction_check_frames,
+    )
+    if reconstruction_metrics is not None:
+        log.info(
+            "Single-frame VAE reconstruction check | MSE: %.6f | MAE: %.6f",
+            reconstruction_metrics["mse"],
+            reconstruction_metrics["mae"],
+        )
+        if reconstruction_metrics["mse"] > reconstruction_warn_mse:
+            log.warning(
+                "VAE reconstruction MSE %.6f exceeds warning threshold %.6f. "
+                "The latent dynamics model may be fighting an off-distribution encoder.",
+                reconstruction_metrics["mse"],
+                reconstruction_warn_mse,
+            )
+        if wandb_run is not None:
+            wandb_run.summary["diagnostics/vae_reconstruction_mse"] = (
+                reconstruction_metrics["mse"]
+            )
+            wandb_run.summary["diagnostics/vae_reconstruction_mae"] = (
+                reconstruction_metrics["mae"]
+            )
     
     # The DiT Physics Engine
     lagrangian = DiTLagrangian(
@@ -558,9 +764,29 @@ def main(cfg: DictConfig):
         num_heads=cfg.model.num_heads,
         action_dim=cfg.model.action_dim
     ).to(device)
-    lagrangian.set_gradient_checkpointing(
-        bool(cfg.training.get("gradient_checkpointing", False))
+
+    lambda_del = float(cfg.training.get("lambda_del", 1.0))
+    lambda_solver_mse = float(cfg.training.get("lambda_solver_mse", 0.0))
+    if lambda_del <= 0.0 and lambda_solver_mse <= 0.0:
+        raise ValueError("At least one of lambda_del or lambda_solver_mse must be > 0.")
+    if (overfit_video_index >= 0 or overfit_subset_size > 0) and lambda_solver_mse <= 0.0:
+        log.warning(
+            "Overfit mode is running with training.lambda_solver_mse=0.0. "
+            "This fits only the DEL constraint on ground-truth latent triples; "
+            "solver rollout accuracy is reported diagnostically but is not directly optimized. "
+            "Set training.lambda_solver_mse>0 to test rollout memorization."
+        )
+
+    requested_gradient_checkpointing = bool(
+        cfg.training.get("gradient_checkpointing", False)
     )
+    if requested_gradient_checkpointing and (lambda_del > 0.0 or lambda_solver_mse > 0.0):
+        log.warning(
+            "Disabling gradient checkpointing because DEL/solver training uses "
+            "higher-order autograd. Re-enable only for first-order ablations."
+        )
+        requested_gradient_checkpointing = False
+    lagrangian.set_gradient_checkpointing(requested_gradient_checkpointing)
 
     optimizer = AdamW(
         lagrangian.parameters(), 
@@ -571,10 +797,14 @@ def main(cfg: DictConfig):
     grad_clip_norm = float(cfg.training.get("grad_clip_norm", 1.0))
     solver_alpha = float(cfg.training.get("solver_alpha", 0.1))
     training_solver_steps = int(cfg.training.get("training_solver_steps", 1))
-    lambda_del = float(cfg.training.get("lambda_del", 1.0))
+    log_interval = int(cfg.training.get("log_interval", 10))
+    diagnostics_every = int(cfg.training.get("diagnostics_every", log_interval))
     inference_every = int(cfg.training.get("inference_every", 1))
-    solver_microbatch_size = int(
-        cfg.training.get("solver_microbatch_size", effective_batch_size)
+    if inference_every < 0:
+        raise ValueError("training.inference_every must be >= 0.")
+    solver_microbatch_size = max(
+        1,
+        int(cfg.training.get("solver_microbatch_size", effective_batch_size)),
     )
     autoregressive_rollout_steps = int(
         cfg.training.get("autoregressive_rollout_steps", 0)
@@ -582,12 +812,18 @@ def main(cfg: DictConfig):
     autoregressive_detach_between_steps = bool(
         cfg.training.get("autoregressive_detach_between_steps", True)
     )
-    sequence_encode_batch_size = int(
-        cfg.training.get("sequence_encode_batch_size", 8)
+    sequence_encode_batch_size = max(
+        1,
+        int(cfg.training.get("sequence_encode_batch_size", 8)),
     )
     total_epochs = int(cfg.training.epochs)
     warmup_epochs = int(cfg.training.get("lr_warmup_epochs", 10))
     warmup_epochs = max(0, min(warmup_epochs, total_epochs))
+    if save_inference_visuals and inference_every == 0 and save_final_inference:
+        log.info(
+            "Periodic inference is disabled because training.inference_every=0, "
+            "but final inference artifacts remain enabled via training.save_final_inference=true."
+        )
     warmup_start_factor = 0.1
     if warmup_epochs == 0:
         scheduler = CosineAnnealingLR(
@@ -624,8 +860,11 @@ def main(cfg: DictConfig):
         last_inference_epoch = None
         for epoch in range(1, cfg.training.epochs + 1):
             lagrangian.train()
-            epoch_mse_loss = 0.0
+            epoch_anchor_mse_loss = 0.0
+            epoch_solver_mse_loss = 0.0
             epoch_del_loss = 0.0
+            epoch_diag_sums = {}
+            epoch_diag_count = 0
             num_steps = 0
 
             if overfit_video_index >= 0:
@@ -641,15 +880,29 @@ def main(cfg: DictConfig):
                     chunk_size=sequence_encode_batch_size,
                 )
 
-                loss_MSE_tensor, loss_DEL_tensor = compute_autoregressive_overfit_losses(
+                loss_anchor_mse_tensor, loss_DEL_tensor = compute_ground_truth_sequence_losses(
                     lagrangian=lagrangian,
                     q_sequence=q_sequence,
-                    alpha=solver_alpha,
-                    solver_steps=training_solver_steps,
                     rollout_steps=autoregressive_rollout_steps,
-                    detach_between_steps=autoregressive_detach_between_steps,
                 )
-                total_loss = loss_MSE_tensor + (lambda_del * loss_DEL_tensor)
+
+                if lambda_solver_mse > 0.0:
+                    loss_solver_mse_tensor, _ = compute_autoregressive_overfit_losses(
+                        lagrangian=lagrangian,
+                        q_sequence=q_sequence,
+                        alpha=solver_alpha,
+                        solver_steps=training_solver_steps,
+                        rollout_steps=autoregressive_rollout_steps,
+                        detach_between_steps=autoregressive_detach_between_steps,
+                        include_del=False,
+                    )
+                else:
+                    loss_solver_mse_tensor = q_sequence.new_zeros(())
+
+                total_loss = (
+                    lambda_del * loss_DEL_tensor
+                    + lambda_solver_mse * loss_solver_mse_tensor
+                )
                 total_loss.backward()
 
                 if grad_clip_norm > 0:
@@ -658,13 +911,22 @@ def main(cfg: DictConfig):
                     )
                 optimizer.step()
 
-                epoch_mse_loss = loss_MSE_tensor.item()
+                epoch_anchor_mse_loss = loss_anchor_mse_tensor.item()
+                epoch_solver_mse_loss = loss_solver_mse_tensor.item()
                 epoch_del_loss = loss_DEL_tensor.item()
+                component_stats = summarize_lagrangian_components(
+                    lagrangian,
+                    q_sequence[0:1],
+                    q_sequence[1:2],
+                )
+                epoch_diag_sums.update(component_stats)
+                epoch_diag_count = 1
                 num_steps = 1
                 log.info(
-                    "Epoch %d autoregressive overfit | MSE: %.6f | DEL: %.6f | LR: %.6e",
+                    "Epoch %d overfit | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | LR: %.6e",
                     epoch,
-                    epoch_mse_loss,
+                    epoch_anchor_mse_loss,
+                    epoch_solver_mse_loss,
                     epoch_del_loss,
                     optimizer.param_groups[0]["lr"],
                 )
@@ -686,7 +948,8 @@ def main(cfg: DictConfig):
                     # B: Build the higher-order graph on smaller latent chunks.
                     optimizer.zero_grad(set_to_none=True)
                     batch_size = q_prev.shape[0]
-                    batch_mse_sum = 0.0
+                    batch_anchor_mse_sum = 0.0
+                    batch_solver_mse_sum = 0.0
                     batch_del_sum = 0.0
 
                     for start_idx in range(0, batch_size, solver_microbatch_size):
@@ -695,15 +958,27 @@ def main(cfg: DictConfig):
                         q_curr_mb = q_curr[start_idx:end_idx]
                         q_next_true_mb = q_next_true[start_idx:end_idx]
 
-                        q_next_pred = training_dynamic_step(
-                            lagrangian=lagrangian,
-                            q_prev=q_prev_mb,
-                            q_curr=q_curr_mb,
-                            alpha=solver_alpha,
-                            solver_steps=training_solver_steps,
-                            detach_inputs=True,
+                        anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
+                        loss_anchor_mse_mb = F.mse_loss(
+                            anchor_pred_mb,
+                            q_next_true_mb,
                         )
-                        loss_MSE_mb = F.mse_loss(q_next_pred, q_next_true_mb)
+
+                        if lambda_solver_mse > 0.0:
+                            q_next_pred = training_dynamic_step(
+                                lagrangian=lagrangian,
+                                q_prev=q_prev_mb,
+                                q_curr=q_curr_mb,
+                                alpha=solver_alpha,
+                                solver_steps=training_solver_steps,
+                                detach_inputs=True,
+                            )
+                            loss_solver_mse_mb = F.mse_loss(
+                                q_next_pred,
+                                q_next_true_mb,
+                            )
+                        else:
+                            loss_solver_mse_mb = q_prev_mb.new_zeros(())
 
                         residual_true_mb = calculate_del_residual(
                             lagrangian=lagrangian,
@@ -712,11 +987,35 @@ def main(cfg: DictConfig):
                             q_next=q_next_true_mb,
                         )
                         loss_DEL_mb = residual_true_mb.pow(2).mean()
-                        total_loss_mb = loss_MSE_mb + (lambda_del * loss_DEL_mb)
+                        total_loss_mb = (
+                            lambda_del * loss_DEL_mb
+                            + lambda_solver_mse * loss_solver_mse_mb
+                        )
                         scaled_loss = total_loss_mb * (q_prev_mb.shape[0] / batch_size)
                         scaled_loss.backward()
-                        batch_mse_sum += loss_MSE_mb.item() * q_prev_mb.shape[0]
+                        batch_anchor_mse_sum += (
+                            loss_anchor_mse_mb.item() * q_prev_mb.shape[0]
+                        )
+                        batch_solver_mse_sum += (
+                            loss_solver_mse_mb.item() * q_prev_mb.shape[0]
+                        )
                         batch_del_sum += loss_DEL_mb.item() * q_prev_mb.shape[0]
+
+                        if (
+                            diagnostics_every > 0
+                            and batch_idx % diagnostics_every == 0
+                            and start_idx == 0
+                        ):
+                            component_stats = summarize_lagrangian_components(
+                                lagrangian,
+                                q_prev_mb,
+                                q_curr_mb,
+                            )
+                            for key, value in component_stats.items():
+                                epoch_diag_sums[key] = (
+                                    epoch_diag_sums.get(key, 0.0) + value
+                                )
+                            epoch_diag_count += 1
 
                     if grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(
@@ -724,17 +1023,26 @@ def main(cfg: DictConfig):
                         )
                     optimizer.step()
 
-                    loss_MSE = batch_mse_sum / batch_size
+                    loss_anchor_mse = batch_anchor_mse_sum / batch_size
+                    loss_solver_mse = batch_solver_mse_sum / batch_size
                     loss_DEL = batch_del_sum / batch_size
-                    epoch_mse_loss += loss_MSE
+                    epoch_anchor_mse_loss += loss_anchor_mse
+                    epoch_solver_mse_loss += loss_solver_mse
                     epoch_del_loss += loss_DEL
                     num_steps += 1
 
-                    pbar.set_postfix({
-                        'MSE': f"{loss_MSE:.4f}",
-                        'DEL': f"{loss_DEL:.4f}",
-                        'LR': f"{optimizer.param_groups[0]['lr']:.2e}",
-                    })
+                    postfix = {
+                        "AnchorMSE": f"{loss_anchor_mse:.4f}",
+                        "DEL": f"{loss_DEL:.4f}",
+                        "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    }
+                    if lambda_solver_mse > 0.0:
+                        postfix["SolverMSE"] = f"{loss_solver_mse:.4f}"
+                    if epoch_diag_count > 0:
+                        postfix["Mass"] = (
+                            f"{epoch_diag_sums['mass_mean'] / epoch_diag_count:.3f}"
+                        )
+                    pbar.set_postfix(postfix)
 
             if num_steps == 0:
                 raise RuntimeError(
@@ -742,27 +1050,50 @@ def main(cfg: DictConfig):
                     "enough frame triplets for the configured batch size."
                 )
 
-            epoch_mse_avg = epoch_mse_loss / num_steps
+            epoch_anchor_mse_avg = epoch_anchor_mse_loss / num_steps
+            epoch_solver_mse_avg = epoch_solver_mse_loss / num_steps
             epoch_del_avg = epoch_del_loss / num_steps
+            del_to_anchor_ratio = epoch_del_avg / max(epoch_anchor_mse_avg, 1e-12)
+            diag_avgs = {
+                key: value / epoch_diag_count
+                for key, value in epoch_diag_sums.items()
+            } if epoch_diag_count > 0 else {}
 
             log.info(
-                "Epoch %d complete | MSE: %.6f | DEL: %.6f | LR: %.6e",
+                "Epoch %d complete | anchor MSE: %.6f | solver MSE: %.6f | "
+                "DEL: %.6f | DEL/anchor: %.6e | LR: %.6e",
                 epoch,
-                epoch_mse_avg,
+                epoch_anchor_mse_avg,
+                epoch_solver_mse_avg,
                 epoch_del_avg,
+                del_to_anchor_ratio,
                 optimizer.param_groups[0]["lr"],
             )
+            if diag_avgs:
+                log.info(
+                    "Epoch %d diagnostics | mass mean/min/max: %.6f / %.6f / %.6f | "
+                    "kinetic: %.6f | potential: %.6f | energy: %.6f",
+                    epoch,
+                    diag_avgs["mass_mean"],
+                    diag_avgs["mass_min"],
+                    diag_avgs["mass_max"],
+                    diag_avgs["kinetic_mean"],
+                    diag_avgs["potential_mean"],
+                    diag_avgs["energy_mean"],
+                )
 
             if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "train/epoch": epoch,
-                        "train/mse": epoch_mse_avg,
-                        "train/del": epoch_del_avg,
-                        "train/lr": optimizer.param_groups[0]["lr"],
-                    },
-                    step=epoch,
-                )
+                wandb_payload = {
+                    "train/epoch": epoch,
+                    "train/anchor_mse": epoch_anchor_mse_avg,
+                    "train/solver_mse": epoch_solver_mse_avg,
+                    "train/del": epoch_del_avg,
+                    "train/del_to_anchor_mse": del_to_anchor_ratio,
+                    "train/lr": optimizer.param_groups[0]["lr"],
+                }
+                for key, value in diag_avgs.items():
+                    wandb_payload[f"diagnostics/{key}"] = value
+                wandb_run.log(wandb_payload, step=epoch)
 
             scheduler.step()
                 
