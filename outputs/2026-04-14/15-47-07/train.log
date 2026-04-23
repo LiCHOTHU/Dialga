@@ -1,0 +1,5 @@
+[2026-04-14 15:47:07,852][__main__][INFO] - Starting DIALGA training on cuda...
+[2026-04-14 15:47:07,852][__main__][INFO] - Hydra run output directory: /storage/home/hcoda1/8/lwang831/workspace/Dialga/outputs/2026-04-14/15-47-07
+[2026-04-14 15:47:09,661][__main__][INFO] - Video overfit mode enabled on video_index=0 with 126 triplets | batch_size=32 | shuffle=False
+[2026-04-14 15:47:09,827][root][INFO] - loading /storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+[2026-04-14 15:47:11,290][__main__][WARNING] - Config latent shape (16, 16, 16) does not match encoder output (48, 8, 8). Using encoder output for the DiT Lagrangian.

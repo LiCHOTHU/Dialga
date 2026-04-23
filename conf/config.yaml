@@ -1,0 +1,61 @@
+defaults:
+  - _self_
+
+dataset:
+  # This can point to either extracted frame folders or the raw CLEVRER train_video tree.
+  data_dir: "/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/train_video"
+  video_num_frames: 128
+
+model:
+  vae_ckpt: "/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+  latent_channels: 16
+  latent_h: 16
+  latent_w: 16
+  patch_size: 2
+  hidden_size: 256
+  depth: 4
+  num_heads: 8
+  action_dim: 0
+
+training:
+  batch_size: 32
+  num_workers: 4
+  overfit_subset_size: 0
+  overfit_video_index: -1
+  overfit_shuffle: false
+  overfit_num_workers: 0
+  gradient_checkpointing: true
+  lr: 0.0001
+  lr_warmup_epochs: 10
+  weight_decay: 0.00001
+  epochs: 100
+  log_interval: 10
+  device: "cuda"
+  grad_clip_norm: 1.0
+  solver_alpha: 0.1
+  solver_steps: 5
+  training_solver_steps: 1
+  lambda_del: 1.0
+  solver_microbatch_size: 4
+  autoregressive_rollout_steps: 0
+  autoregressive_detach_between_steps: true
+  sequence_encode_batch_size: 1
+  inference_every: 1
+  save_inference_images: true
+  save_inference_video: true
+  save_final_inference: true
+  inference_video_index: -1
+  inference_video_max_frames: 128
+  inference_sparse_frames: 8
+  inference_video_fps: 12
+  inference_video_hold_frames: 8
+
+wandb:
+  enabled: true
+  project: "dialga"
+  entity: null
+  name: null
+  group: null
+  job_type: "train"
+  mode: "online"
+  tags: []
