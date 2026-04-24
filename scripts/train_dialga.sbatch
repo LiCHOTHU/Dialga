@@ -8,11 +8,10 @@
 #SBATCH --mem-per-gpu=48G
 #SBATCH --qos=embers
 #SBATCH --account=gts-agarg35
-#SBATCH --job-name=dialga-train
+#SBATCH --job-name=dlgbase
 #SBATCH --output=/storage/home/hcoda1/8/lwang831/workspace/Dialga/outputs/slurm/%x_%j.out
 #SBATCH --error=/storage/home/hcoda1/8/lwang831/workspace/Dialga/outputs/slurm/%x_%j.err
 
-set -euo pipefail
 
 source ~/.bashrc
 conda activate river
@@ -27,10 +26,30 @@ TRAIN_ARGS=("$@")
 
 if [[ ${#TRAIN_ARGS[@]} -eq 0 ]]; then
   TRAIN_ARGS=(
-    "training.inference_every=10"
+    "training.epochs=1"
+    "training.log_interval=200"
+    "training.val_every=1"
+    "training.val_every_steps=1000"
+    "training.val_max_batches=8"
+    "training.checkpoint_every=1"
+    "training.checkpoint_every_steps=2000"
+    "training.inference_every=1"
+    "training.inference_every_steps=1000"
     "training.save_inference_images=true"
     "training.save_inference_video=true"
+    "training.save_final_inference=true"
   )
+fi
+
+HAS_WANDB_NAME=0
+for arg in "${TRAIN_ARGS[@]}"; do
+  if [[ "${arg}" == wandb.name=* ]]; then
+    HAS_WANDB_NAME=1
+    break
+  fi
+done
+if [[ ${HAS_WANDB_NAME} -eq 0 ]]; then
+  TRAIN_ARGS+=("wandb.name=${SLURM_JOB_NAME}-${SLURM_JOB_ID}")
 fi
 
 echo "======================================"
@@ -45,6 +64,7 @@ echo "Overrides:  ${TRAIN_ARGS[*]}"
 echo "======================================"
 
 export PYTHONUNBUFFERED=1
+export WANDB__SERVICE_WAIT=300
 
 python "${SCRIPT}" "${TRAIN_ARGS[@]}"
 

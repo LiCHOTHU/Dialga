@@ -1,21 +1,23 @@
 from contextlib import contextmanager
-import os
 import logging
+import os
 from pathlib import Path
+import random
+import sys
 
-import torch
-import torch.nn.functional as F
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
+import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, random_split
 from tqdm import tqdm
 import torchvision.utils as vutils
 
 from src.data.clevrer_dataset import ClevrerTripletDataset
-from src.model import WanFrozenEncoder, DiTLagrangian
+from src.model import DiTLagrangian, ResidualStateProjector, SIGReg, WanFrozenEncoder
 
 try:
     import wandb
@@ -23,6 +25,13 @@ except ImportError:
     wandb = None
 
 log = logging.getLogger(__name__)
+
+
+def set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 @contextmanager
@@ -95,7 +104,9 @@ def forward_dynamic_step(lagrangian, q_prev, q_curr, alpha=0.1, solver_steps=5):
                 grad_outputs=torch.ones_like(residual_energy),
                 create_graph=False,
             )[0]
-            q_next_guess = (q_next_guess - alpha * solver_direction).detach().requires_grad_(True)
+            q_next_guess = (
+                q_next_guess - alpha * solver_direction
+            ).detach().requires_grad_(True)
 
     return q_next_guess.detach()
 
@@ -121,7 +132,7 @@ def training_dynamic_step(
         if not q_curr_base.requires_grad
         else q_curr_base
     )
-    q_next_guess = (2 * q_curr_solver - q_prev_solver)
+    q_next_guess = 2 * q_curr_solver - q_prev_solver
 
     l_prev = lagrangian(q_prev_solver, q_curr_solver)
     d2_prev = torch.autograd.grad(
@@ -273,11 +284,140 @@ def summarize_energy_drift(lagrangian, latent_sequence):
     }
 
 
-def infer_latent_shape(encoder, dataset, device):
+def apply_state_representation(state_projector, latent):
+    return latent if state_projector is None else state_projector(latent)
+
+
+def compute_sigreg_loss(sigreg, latent_sequence):
+    if sigreg is None:
+        return latent_sequence.new_zeros(())
+
+    if latent_sequence.dim() == 4:
+        projections = latent_sequence.unsqueeze(1).flatten(2)
+    elif latent_sequence.dim() == 5:
+        projections = latent_sequence.flatten(2)
+    else:
+        raise ValueError(
+            "Expected latent sequence with shape (T, C, H, W) or (T, B, C, H, W), got "
+            f"{tuple(latent_sequence.shape)}."
+        )
+    return sigreg(projections)
+
+
+def evaluate_validation(
+    lagrangian,
+    state_projector,
+    autoencoder,
+    val_loader,
+    device,
+    lambda_del,
+    lambda_solver_mse,
+    lambda_sigreg,
+    sigreg,
+    solver_alpha,
+    training_solver_steps,
+    solver_microbatch_size,
+    max_batches,
+):
+    if val_loader is None:
+        return None
+
+    metric_sums = {
+        "anchor_mse": 0.0,
+        "solver_mse": 0.0,
+        "del": 0.0,
+        "sigreg": 0.0,
+        "total": 0.0,
+    }
+    num_batches = 0
+
+    with _temporary_eval_mode(lagrangian, state_projector, autoencoder):
+        for batch_idx, (o_prev, o_curr, o_next_true) in enumerate(val_loader, start=1):
+            if max_batches > 0 and batch_idx > max_batches:
+                break
+
+            o_prev = o_prev.to(device)
+            o_curr = o_curr.to(device)
+            o_next_true = o_next_true.to(device)
+
+            with torch.no_grad():
+                q_prev = apply_state_representation(state_projector, autoencoder(o_prev))
+                q_curr = apply_state_representation(state_projector, autoencoder(o_curr))
+                q_next_true = apply_state_representation(state_projector, autoencoder(o_next_true))
+
+            batch_size = q_prev.shape[0]
+            batch_anchor_sum = 0.0
+            batch_solver_sum = 0.0
+            batch_del_sum = 0.0
+            batch_sigreg_sum = 0.0
+            batch_total_sum = 0.0
+
+            for start_idx in range(0, batch_size, solver_microbatch_size):
+                end_idx = min(start_idx + solver_microbatch_size, batch_size)
+                q_prev_mb = q_prev[start_idx:end_idx]
+                q_curr_mb = q_curr[start_idx:end_idx]
+                q_next_true_mb = q_next_true[start_idx:end_idx]
+
+                anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
+                loss_anchor_mse_mb = F.mse_loss(anchor_pred_mb, q_next_true_mb)
+
+                if lambda_solver_mse > 0.0:
+                    q_next_pred = training_dynamic_step(
+                        lagrangian=lagrangian,
+                        q_prev=q_prev_mb,
+                        q_curr=q_curr_mb,
+                        alpha=solver_alpha,
+                        solver_steps=training_solver_steps,
+                        detach_inputs=True,
+                    )
+                    loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
+                else:
+                    loss_solver_mse_mb = q_prev_mb.new_zeros(())
+
+                residual_true_mb = calculate_del_residual(
+                    lagrangian=lagrangian,
+                    q_prev=q_prev_mb,
+                    q_curr=q_curr_mb,
+                    q_next=q_next_true_mb,
+                )
+                loss_del_mb = residual_true_mb.pow(2).mean()
+                loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
+                    sigreg,
+                    torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
+                )
+                loss_total_mb = (
+                    lambda_del * loss_del_mb
+                    + lambda_solver_mse * loss_solver_mse_mb
+                    + loss_sigreg_mb
+                )
+
+                microbatch_size = q_prev_mb.shape[0]
+                batch_anchor_sum += loss_anchor_mse_mb.item() * microbatch_size
+                batch_solver_sum += loss_solver_mse_mb.item() * microbatch_size
+                batch_del_sum += loss_del_mb.item() * microbatch_size
+                batch_sigreg_sum += loss_sigreg_mb.item() * microbatch_size
+                batch_total_sum += loss_total_mb.item() * microbatch_size
+
+            metric_sums["anchor_mse"] += batch_anchor_sum / batch_size
+            metric_sums["solver_mse"] += batch_solver_sum / batch_size
+            metric_sums["del"] += batch_del_sum / batch_size
+            metric_sums["sigreg"] += batch_sigreg_sum / batch_size
+            metric_sums["total"] += batch_total_sum / batch_size
+            num_batches += 1
+
+    if num_batches == 0:
+        return None
+
+    metrics = {key: value / num_batches for key, value in metric_sums.items()}
+    metrics["del_to_anchor_mse"] = metrics["del"] / max(metrics["anchor_mse"], 1e-12)
+    return metrics
+
+
+def infer_latent_shape(encoder, state_projector, dataset, device):
     sample_prev, _, _ = dataset[0]
     sample_prev = sample_prev.unsqueeze(0).to(device)
-    with _temporary_eval_mode(encoder), torch.no_grad():
-        latent = encoder(sample_prev)
+    with _temporary_eval_mode(encoder, state_projector), torch.no_grad():
+        latent = apply_state_representation(state_projector, encoder(sample_prev))
     return tuple(latent.shape[1:])
 
 
@@ -372,7 +512,13 @@ def _save_video_artifact(video_frames, save_dir, stem, fps):
 def _repeat_video_frames(frame_batch, repeat_count):
     if repeat_count <= 1:
         return frame_batch
-    return torch.cat([frame_batch[i : i + 1].repeat(repeat_count, 1, 1, 1) for i in range(frame_batch.shape[0])], dim=0)
+    return torch.cat(
+        [
+            frame_batch[i : i + 1].repeat(repeat_count, 1, 1, 1)
+            for i in range(frame_batch.shape[0])
+        ],
+        dim=0,
+    )
 
 
 def _rollout_latents(lagrangian, q_prev, q_curr, alpha, solver_steps, rollout_steps):
@@ -399,6 +545,16 @@ def _uniform_sample_indices(length, sample_count):
     return torch.linspace(0, length - 1, steps=sample_count).round().long()
 
 
+def _default_run_name(output_dir):
+    slurm_job_name = os.environ.get("SLURM_JOB_NAME")
+    slurm_job_id = os.environ.get("SLURM_JOB_ID")
+    if slurm_job_name and slurm_job_id:
+        return f"{slurm_job_name}-{slurm_job_id}"
+    if slurm_job_name:
+        return slurm_job_name
+    return output_dir.name
+
+
 def _init_wandb(cfg, output_dir):
     wandb_cfg = cfg.get("wandb")
     if wandb_cfg is None or not bool(wandb_cfg.get("enabled", False)):
@@ -410,10 +566,7 @@ def _init_wandb(cfg, output_dir):
             "Install it in the training environment or set wandb.enabled=false."
         )
 
-    run_name = wandb_cfg.get("name")
-    if not run_name:
-        run_name = output_dir.name
-
+    run_name = wandb_cfg.get("name") or _default_run_name(output_dir)
     run = wandb.init(
         project=wandb_cfg.get("project", "dialga"),
         entity=wandb_cfg.get("entity"),
@@ -426,11 +579,47 @@ def _init_wandb(cfg, output_dir):
         config=OmegaConf.to_container(cfg, resolve=True),
     )
     run.summary["hydra_output_dir"] = str(output_dir)
+    if os.environ.get("SLURM_JOB_ID"):
+        run.summary["slurm_job_id"] = os.environ["SLURM_JOB_ID"]
+    if os.environ.get("SLURM_JOB_NAME"):
+        run.summary["slurm_job_name"] = os.environ["SLURM_JOB_NAME"]
     return run
+
+
+def _save_checkpoint(
+    output_dir,
+    name,
+    lagrangian,
+    state_projector,
+    optimizer,
+    scheduler,
+    cfg,
+    epoch,
+    metrics,
+):
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / name
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": lagrangian.state_dict(),
+            "state_projector_state_dict": (
+                None if state_projector is None else state_projector.state_dict()
+            ),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+            "metrics": metrics,
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        },
+        checkpoint_path,
+    )
+    return checkpoint_path
 
 
 def run_inference_and_save(
     lagrangian,
+    state_projector,
     autoencoder,
     eval_dataset,
     epoch,
@@ -438,6 +627,8 @@ def run_inference_and_save(
     device,
     save_dir,
     wandb_run=None,
+    global_step=None,
+    artifact_tag=None,
 ):
     """
     Saves sparse-sampled GT vs predicted frames plus a side-by-side rollout video.
@@ -446,6 +637,14 @@ def run_inference_and_save(
         return
 
     save_dir.mkdir(parents=True, exist_ok=True)
+    metrics_step = int(global_step) if global_step is not None else int(epoch)
+    if artifact_tag is None:
+        artifact_tag = f"epoch_{epoch:03d}"
+        if global_step is not None:
+            artifact_tag = f"{artifact_tag}_step_{int(global_step):07d}"
+    caption_label = f"epoch {epoch}"
+    if global_step is not None:
+        caption_label = f"{caption_label}, step {int(global_step)}"
 
     solver_alpha = float(cfg.training.get("solver_alpha", 0.1))
     solver_steps = int(cfg.training.get("solver_steps", 5))
@@ -477,10 +676,13 @@ def run_inference_and_save(
 
     gt_sequence_display = _to_display_range(gt_sequence)
 
-    with _temporary_eval_mode(lagrangian, autoencoder):
+    with _temporary_eval_mode(lagrangian, state_projector, autoencoder):
         with torch.no_grad():
             seed_frames = gt_sequence[:2].to(device)
-            seed_latents = autoencoder(seed_frames)
+            seed_latents = apply_state_representation(
+                state_projector,
+                autoencoder(seed_frames),
+            )
             q_prev_sim = seed_latents[0:1]
             q_curr_sim = seed_latents[1:2]
 
@@ -519,7 +721,7 @@ def run_inference_and_save(
             [gt_sequence_display[sparse_indices], pred_sequence_display[sparse_indices]],
             dim=0,
         )
-        comparison_path = save_dir / f"epoch_{epoch:03d}_comparison.png"
+        comparison_path = save_dir / f"{artifact_tag}_comparison.png"
         vutils.save_image(
             comparison_grid,
             str(comparison_path),
@@ -548,7 +750,7 @@ def run_inference_and_save(
         video_path = _save_video_artifact(
             video_frames,
             save_dir,
-            stem=f"epoch_{epoch:03d}_rollout",
+            stem=f"{artifact_tag}_rollout",
             fps=inference_video_fps,
         )
         if video_path is not None:
@@ -572,18 +774,21 @@ def run_inference_and_save(
     if wandb_run is not None:
         media_payload = {}
         if comparison_path is not None:
-            media_payload["media/comparison"] = wandb.Image(
+            media_payload["media/predicted_comparison"] = wandb.Image(
                 str(comparison_path),
-                caption=f"Epoch {epoch}: top row GT sparse samples, bottom row predicted sparse samples",
+                caption=(
+                    f"{caption_label}: top row GT sparse samples, bottom row predicted sparse samples"
+                ),
             )
         if video_path is not None:
-            media_payload["media/rollout"] = wandb.Video(
+            media_payload["media/predicted_rollout"] = wandb.Video(
                 str(video_path),
-                caption=f"Epoch {epoch}: left GT sequence, right predicted sequence",
+                caption=f"{caption_label}: left GT sequence, right predicted sequence",
                 fps=inference_video_fps,
+                format=video_path.suffix.lstrip("."),
             )
         if media_payload:
-            wandb_run.log(media_payload, step=epoch)
+            wandb_run.log(media_payload, step=metrics_step)
         if energy_metrics is not None:
             wandb_run.log(
                 {
@@ -594,13 +799,19 @@ def run_inference_and_save(
                         "rollout_energy_span"
                     ],
                 },
-                step=epoch,
+                step=metrics_step,
             )
 
     return comparison_path, video_path
 
+
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
+    seed = int(cfg.training.get("seed", 0))
+    set_seed(seed)
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
     device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
     if int(cfg.training.batch_size) <= 0:
         raise ValueError("training.batch_size must be > 0.")
@@ -612,14 +823,15 @@ def main(cfg: DictConfig):
         raise ValueError("training.overfit_num_workers must be >= 0.")
 
     log.info("Starting DIALGA training on %s...", device)
+    log.info("Using seed %d", seed)
     output_dir = Path(HydraConfig.get().runtime.output_dir)
+    inference_dir = output_dir / "inference"
     log.info("Hydra run output directory: %s", output_dir)
     wandb_run = _init_wandb(cfg, output_dir)
 
     if not os.path.isfile(cfg.model.vae_ckpt):
         raise FileNotFoundError(f"VAE checkpoint not found: {cfg.model.vae_ckpt}")
 
-    # --- Load Data ---
     data_dir = (
         cfg.dataset.get("data_dir")
         or cfg.dataset.get("frames_dir")
@@ -678,6 +890,38 @@ def main(cfg: DictConfig):
             shuffle,
         )
 
+    val_loader = None
+    val_fraction = float(cfg.training.get("val_fraction", 0.0))
+    if overfit_video_index >= 0 or overfit_subset_size > 0:
+        if val_fraction > 0.0:
+            log.info("Skipping held-out validation split in overfit mode.")
+    elif val_fraction > 0.0 and len(dataset) > 1:
+        val_size = max(1, int(round(len(dataset) * val_fraction)))
+        val_size = min(val_size, len(dataset) - 1)
+        train_size = len(dataset) - val_size
+        split_generator = torch.Generator().manual_seed(seed)
+        dataset, val_dataset = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=split_generator,
+        )
+        val_batch_size = max(1, int(cfg.training.get("val_batch_size", effective_batch_size)))
+        val_num_workers = int(cfg.training.get("val_num_workers", 0))
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=val_num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=val_num_workers > 0,
+        )
+        log.info(
+            "Using held-out validation split | train triplets: %d | val triplets: %d",
+            train_size,
+            val_size,
+        )
+
     eval_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
     if effective_batch_size <= 0:
         raise ValueError("Resolved training batch size must be > 0.")
@@ -692,20 +936,56 @@ def main(cfg: DictConfig):
         persistent_workers=num_workers > 0,
     )
 
-    # --- Initialize Models ---
-    # Frozen WAN VAE used for both encode and decode to avoid a duplicate model on GPU.
     encoder = WanFrozenEncoder(vae_pth=cfg.model.vae_ckpt, device=device)
     log.warning(
         "WanFrozenEncoder is encoding individual frames with a video VAE. "
         "Use the reconstruction sanity check below to verify this latent is usable; "
         "object-centric CLEVRER coordinates remain the preferred physics state."
     )
+    representation_mode = str(cfg.model.get("representation", "wan_frozen"))
+    encoder_latent_shape = infer_latent_shape(encoder, None, dataset, device)
+    if representation_mode == "wan_frozen":
+        state_projector = None
+    elif representation_mode == "wan_projected_sigreg":
+        state_projector = ResidualStateProjector(
+            channels=encoder_latent_shape[0],
+            hidden_channels=int(cfg.model.get("state_projector_hidden_channels", 128)),
+        ).to(device)
+    else:
+        raise ValueError(
+            "Unsupported model.representation='{}'. Use 'wan_frozen' or "
+            "'wan_projected_sigreg'.".format(representation_mode)
+        )
+
+    lambda_sigreg = float(cfg.training.get("lambda_sigreg", 0.0))
+    if lambda_sigreg > 0.0 and state_projector is None:
+        raise ValueError(
+            "training.lambda_sigreg > 0 requires a trainable state representation. "
+            "Set model.representation=wan_projected_sigreg."
+        )
+    if state_projector is not None and lambda_sigreg <= 0.0:
+        log.warning(
+            "model.representation=%s is enabled but training.lambda_sigreg=0.0. "
+            "The projector will only be shaped indirectly through the DEL losses.",
+            representation_mode,
+        )
+    sigreg = None if lambda_sigreg <= 0.0 else SIGReg(
+        knots=int(cfg.training.get("sigreg_knots", 17)),
+        num_proj=int(cfg.training.get("sigreg_num_proj", 256)),
+    ).to(device)
+    log.info("State representation mode: %s", representation_mode)
+    if state_projector is not None:
+        log.warning(
+            "LeWM-style state projection is active. Inference videos decode the projected "
+            "latents directly, so visual reconstructions should be treated as approximate."
+        )
+
     save_inference_images = bool(cfg.training.get("save_inference_images", True))
     save_inference_video = bool(cfg.training.get("save_inference_video", True))
     save_inference_visuals = save_inference_images or save_inference_video
     save_final_inference = bool(cfg.training.get("save_final_inference", True))
 
-    actual_latent_shape = infer_latent_shape(encoder, dataset, device)
+    actual_latent_shape = infer_latent_shape(encoder, state_projector, dataset, device)
     configured_latent_shape = (
         cfg.model.latent_channels,
         cfg.model.latent_h,
@@ -752,8 +1032,7 @@ def main(cfg: DictConfig):
             wandb_run.summary["diagnostics/vae_reconstruction_mae"] = (
                 reconstruction_metrics["mae"]
             )
-    
-    # The DiT Physics Engine
+
     lagrangian = DiTLagrangian(
         latent_channels=actual_latent_shape[0],
         latent_h=actual_latent_shape[1],
@@ -762,7 +1041,7 @@ def main(cfg: DictConfig):
         hidden_size=cfg.model.hidden_size,
         depth=cfg.model.depth,
         num_heads=cfg.model.num_heads,
-        action_dim=cfg.model.action_dim
+        action_dim=cfg.model.action_dim,
     ).to(device)
 
     lambda_del = float(cfg.training.get("lambda_del", 1.0))
@@ -788,10 +1067,13 @@ def main(cfg: DictConfig):
         requested_gradient_checkpointing = False
     lagrangian.set_gradient_checkpointing(requested_gradient_checkpointing)
 
+    trainable_parameters = list(lagrangian.parameters())
+    if state_projector is not None:
+        trainable_parameters.extend(state_projector.parameters())
     optimizer = AdamW(
-        lagrangian.parameters(), 
-        lr=cfg.training.lr, 
-        weight_decay=cfg.training.weight_decay
+        trainable_parameters,
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.weight_decay,
     )
 
     grad_clip_norm = float(cfg.training.get("grad_clip_norm", 1.0))
@@ -800,8 +1082,29 @@ def main(cfg: DictConfig):
     log_interval = int(cfg.training.get("log_interval", 10))
     diagnostics_every = int(cfg.training.get("diagnostics_every", log_interval))
     inference_every = int(cfg.training.get("inference_every", 1))
+    inference_every_steps = int(cfg.training.get("inference_every_steps", 0))
+    val_every = int(cfg.training.get("val_every", 1))
+    val_every_steps = int(cfg.training.get("val_every_steps", 0))
+    val_max_batches = int(cfg.training.get("val_max_batches", 0))
+    checkpoint_every = int(cfg.training.get("checkpoint_every", 0))
+    checkpoint_every_steps = int(cfg.training.get("checkpoint_every_steps", 0))
+    save_last_checkpoint = bool(cfg.training.get("save_last_checkpoint", True))
+    if lambda_sigreg < 0:
+        raise ValueError("training.lambda_sigreg must be >= 0.")
     if inference_every < 0:
         raise ValueError("training.inference_every must be >= 0.")
+    if inference_every_steps < 0:
+        raise ValueError("training.inference_every_steps must be >= 0.")
+    if val_every < 0:
+        raise ValueError("training.val_every must be >= 0.")
+    if val_every_steps < 0:
+        raise ValueError("training.val_every_steps must be >= 0.")
+    if val_max_batches < 0:
+        raise ValueError("training.val_max_batches must be >= 0.")
+    if checkpoint_every < 0:
+        raise ValueError("training.checkpoint_every must be >= 0.")
+    if checkpoint_every_steps < 0:
+        raise ValueError("training.checkpoint_every_steps must be >= 0.")
     solver_microbatch_size = max(
         1,
         int(cfg.training.get("solver_microbatch_size", effective_batch_size)),
@@ -855,14 +1158,21 @@ def main(cfg: DictConfig):
             total_iters=max(warmup_epochs, 1),
         )
 
-    # --- Training Loop ---
+    last_epoch_metrics = None
     try:
         last_inference_epoch = None
+        last_validation_step = None
+        global_step = 0
+        is_interactive = sys.stdout.isatty()
         for epoch in range(1, cfg.training.epochs + 1):
             lagrangian.train()
+            if state_projector is not None:
+                state_projector.train()
+            epoch_total_loss = 0.0
             epoch_anchor_mse_loss = 0.0
             epoch_solver_mse_loss = 0.0
             epoch_del_loss = 0.0
+            epoch_sigreg_loss = 0.0
             epoch_diag_sums = {}
             epoch_diag_count = 0
             num_steps = 0
@@ -879,6 +1189,7 @@ def main(cfg: DictConfig):
                     device=device,
                     chunk_size=sequence_encode_batch_size,
                 )
+                q_sequence = apply_state_representation(state_projector, q_sequence)
 
                 loss_anchor_mse_tensor, loss_DEL_tensor = compute_ground_truth_sequence_losses(
                     lagrangian=lagrangian,
@@ -899,21 +1210,26 @@ def main(cfg: DictConfig):
                 else:
                     loss_solver_mse_tensor = q_sequence.new_zeros(())
 
+                loss_sigreg_tensor = lambda_sigreg * compute_sigreg_loss(sigreg, q_sequence)
+
                 total_loss = (
                     lambda_del * loss_DEL_tensor
                     + lambda_solver_mse * loss_solver_mse_tensor
+                    + loss_sigreg_tensor
                 )
                 total_loss.backward()
 
                 if grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
-                        lagrangian.parameters(), max_norm=grad_clip_norm
+                        trainable_parameters, max_norm=grad_clip_norm
                     )
                 optimizer.step()
 
                 epoch_anchor_mse_loss = loss_anchor_mse_tensor.item()
                 epoch_solver_mse_loss = loss_solver_mse_tensor.item()
                 epoch_del_loss = loss_DEL_tensor.item()
+                epoch_sigreg_loss = loss_sigreg_tensor.item()
+                epoch_total_loss = total_loss.item()
                 component_stats = summarize_lagrangian_components(
                     lagrangian,
                     q_sequence[0:1],
@@ -922,41 +1238,56 @@ def main(cfg: DictConfig):
                 epoch_diag_sums.update(component_stats)
                 epoch_diag_count = 1
                 num_steps = 1
+                global_step += 1
                 log.info(
-                    "Epoch %d overfit | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | LR: %.6e",
+                    "Epoch %d overfit | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f | LR: %.6e",
                     epoch,
                     epoch_anchor_mse_loss,
                     epoch_solver_mse_loss,
                     epoch_del_loss,
+                    epoch_sigreg_loss,
                     optimizer.param_groups[0]["lr"],
                 )
             else:
-                # Wrapped in tqdm for precise step tracking
-                pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.training.epochs}")
+                pbar = tqdm(
+                    loader,
+                    desc=f"Epoch {epoch}/{cfg.training.epochs}",
+                    disable=not is_interactive,
+                    dynamic_ncols=is_interactive,
+                )
 
-                for batch_idx, (o_prev, o_curr, o_next_true) in enumerate(pbar):
+                for batch_idx, (o_prev, o_curr, o_next_true) in enumerate(pbar, start=1):
                     o_prev = o_prev.to(device)
                     o_curr = o_curr.to(device)
                     o_next_true = o_next_true.to(device)
 
-                    # A: Encode strictly without tracking gradients
                     with torch.no_grad():
                         q_prev = encoder(o_prev)
                         q_curr = encoder(o_curr)
                         q_next_true = encoder(o_next_true)
 
-                    # B: Build the higher-order graph on smaller latent chunks.
                     optimizer.zero_grad(set_to_none=True)
                     batch_size = q_prev.shape[0]
                     batch_anchor_mse_sum = 0.0
                     batch_solver_mse_sum = 0.0
                     batch_del_sum = 0.0
+                    batch_sigreg_sum = 0.0
+                    batch_total_sum = 0.0
 
                     for start_idx in range(0, batch_size, solver_microbatch_size):
                         end_idx = min(start_idx + solver_microbatch_size, batch_size)
-                        q_prev_mb = q_prev[start_idx:end_idx]
-                        q_curr_mb = q_curr[start_idx:end_idx]
-                        q_next_true_mb = q_next_true[start_idx:end_idx]
+                        q_prev_mb = apply_state_representation(
+                            state_projector,
+                            q_prev[start_idx:end_idx],
+                        )
+                        q_curr_mb = apply_state_representation(
+                            state_projector,
+                            q_curr[start_idx:end_idx],
+                        )
+                        q_next_true_mb = apply_state_representation(
+                            state_projector,
+                            q_next_true[start_idx:end_idx],
+                        )
 
                         anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
                         loss_anchor_mse_mb = F.mse_loss(
@@ -987,9 +1318,14 @@ def main(cfg: DictConfig):
                             q_next=q_next_true_mb,
                         )
                         loss_DEL_mb = residual_true_mb.pow(2).mean()
+                        loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
+                            sigreg,
+                            torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
+                        )
                         total_loss_mb = (
                             lambda_del * loss_DEL_mb
                             + lambda_solver_mse * loss_solver_mse_mb
+                            + loss_sigreg_mb
                         )
                         scaled_loss = total_loss_mb * (q_prev_mb.shape[0] / batch_size)
                         scaled_loss.backward()
@@ -1000,6 +1336,8 @@ def main(cfg: DictConfig):
                             loss_solver_mse_mb.item() * q_prev_mb.shape[0]
                         )
                         batch_del_sum += loss_DEL_mb.item() * q_prev_mb.shape[0]
+                        batch_sigreg_sum += loss_sigreg_mb.item() * q_prev_mb.shape[0]
+                        batch_total_sum += total_loss_mb.item() * q_prev_mb.shape[0]
 
                         if (
                             diagnostics_every > 0
@@ -1019,21 +1357,28 @@ def main(cfg: DictConfig):
 
                     if grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(
-                            lagrangian.parameters(), max_norm=grad_clip_norm
+                            trainable_parameters, max_norm=grad_clip_norm
                         )
                     optimizer.step()
 
                     loss_anchor_mse = batch_anchor_mse_sum / batch_size
                     loss_solver_mse = batch_solver_mse_sum / batch_size
                     loss_DEL = batch_del_sum / batch_size
+                    loss_sigreg = batch_sigreg_sum / batch_size
+                    loss_total = batch_total_sum / batch_size
                     epoch_anchor_mse_loss += loss_anchor_mse
                     epoch_solver_mse_loss += loss_solver_mse
                     epoch_del_loss += loss_DEL
+                    epoch_sigreg_loss += loss_sigreg
+                    epoch_total_loss += loss_total
                     num_steps += 1
+                    global_step += 1
 
                     postfix = {
+                        "Total": f"{loss_total:.4f}",
                         "AnchorMSE": f"{loss_anchor_mse:.4f}",
                         "DEL": f"{loss_DEL:.4f}",
+                        "SIGReg": f"{loss_sigreg:.4f}",
                         "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
                     }
                     if lambda_solver_mse > 0.0:
@@ -1044,28 +1389,184 @@ def main(cfg: DictConfig):
                         )
                     pbar.set_postfix(postfix)
 
+                    if not is_interactive and log_interval > 0 and batch_idx % log_interval == 0:
+                        log.info(
+                            "Epoch %d step %d | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f | LR: %.6e",
+                            epoch,
+                            batch_idx,
+                            loss_total,
+                            loss_anchor_mse,
+                            loss_solver_mse,
+                            loss_DEL,
+                            loss_sigreg,
+                            optimizer.param_groups[0]["lr"],
+                        )
+
+                    if wandb_run is not None and log_interval > 0 and global_step % log_interval == 0:
+                        running_anchor_mse = epoch_anchor_mse_loss / num_steps
+                        running_solver_mse = epoch_solver_mse_loss / num_steps
+                        running_del = epoch_del_loss / num_steps
+                        running_sigreg = epoch_sigreg_loss / num_steps
+                        wandb_payload = {
+                            "train/epoch": epoch,
+                            "train/global_step": global_step,
+                            "train_step/total": loss_total,
+                            "train_step/anchor_mse": loss_anchor_mse,
+                            "train_step/solver_mse": loss_solver_mse,
+                            "train_step/del": loss_DEL,
+                            "train_step/sigreg": loss_sigreg,
+                            "train_step/lr": optimizer.param_groups[0]["lr"],
+                            "train_running/total": epoch_total_loss / num_steps,
+                            "train_running/anchor_mse": running_anchor_mse,
+                            "train_running/solver_mse": running_solver_mse,
+                            "train_running/del": running_del,
+                            "train_running/sigreg": running_sigreg,
+                            "train_running/del_to_anchor_mse": (
+                                running_del / max(running_anchor_mse, 1e-12)
+                            ),
+                        }
+                        if epoch_diag_count > 0:
+                            wandb_payload.update(
+                                {
+                                    f"diagnostics/{key}": value / epoch_diag_count
+                                    for key, value in epoch_diag_sums.items()
+                                }
+                        )
+                        wandb_run.log(wandb_payload, step=global_step)
+
+                    if (
+                        val_loader is not None
+                        and val_every_steps > 0
+                        and global_step % val_every_steps == 0
+                        and last_validation_step != global_step
+                    ):
+                        val_metrics = evaluate_validation(
+                            lagrangian=lagrangian,
+                            state_projector=state_projector,
+                            autoencoder=encoder,
+                            val_loader=val_loader,
+                            device=device,
+                            lambda_del=lambda_del,
+                            lambda_solver_mse=lambda_solver_mse,
+                            lambda_sigreg=lambda_sigreg,
+                            sigreg=sigreg,
+                            solver_alpha=solver_alpha,
+                            training_solver_steps=training_solver_steps,
+                            solver_microbatch_size=solver_microbatch_size,
+                            max_batches=val_max_batches,
+                        )
+                        if val_metrics is not None:
+                            log.info(
+                                "Val step %d | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f",
+                                global_step,
+                                val_metrics["total"],
+                                val_metrics["anchor_mse"],
+                                val_metrics["solver_mse"],
+                                val_metrics["del"],
+                                val_metrics["sigreg"],
+                            )
+                            if wandb_run is not None:
+                                wandb_run.log(
+                                    {
+                                        "val/total": val_metrics["total"],
+                                        "val/anchor_mse": val_metrics["anchor_mse"],
+                                        "val/solver_mse": val_metrics["solver_mse"],
+                                        "val/del": val_metrics["del"],
+                                        "val/sigreg": val_metrics["sigreg"],
+                                        "val/del_to_anchor_mse": val_metrics["del_to_anchor_mse"],
+                                        "val/global_step": global_step,
+                                        "val/epoch": epoch,
+                                    },
+                                    step=global_step,
+                                )
+                            last_validation_step = global_step
+
+                    if (
+                        save_inference_visuals
+                        and inference_every_steps > 0
+                        and global_step % inference_every_steps == 0
+                    ):
+                        run_inference_and_save(
+                            lagrangian=lagrangian,
+                            state_projector=state_projector,
+                            autoencoder=encoder,
+                            eval_dataset=eval_dataset,
+                            epoch=epoch,
+                            cfg=cfg,
+                            device=device,
+                            save_dir=inference_dir,
+                            wandb_run=wandb_run,
+                            global_step=global_step,
+                            artifact_tag=f"step_{global_step:07d}",
+                        )
+                        last_inference_epoch = epoch
+
+                    if (
+                        checkpoint_every_steps > 0
+                        and global_step % checkpoint_every_steps == 0
+                    ):
+                        step_metrics = {
+                            "train/epoch": epoch,
+                            "train/global_step": global_step,
+                            "train_step/anchor_mse": loss_anchor_mse,
+                            "train_step/solver_mse": loss_solver_mse,
+                            "train_step/del": loss_DEL,
+                            "train_step/sigreg": loss_sigreg,
+                            "train_step/lr": optimizer.param_groups[0]["lr"],
+                        }
+                        checkpoint_path = _save_checkpoint(
+                            output_dir=output_dir,
+                            name=f"step_{global_step:07d}.pt",
+                            lagrangian=lagrangian,
+                            state_projector=state_projector,
+                            optimizer=optimizer,
+                            scheduler=scheduler,
+                            cfg=cfg,
+                            epoch=epoch,
+                            metrics=step_metrics,
+                        )
+                        log.info("Saved step checkpoint to %s", checkpoint_path)
+
             if num_steps == 0:
                 raise RuntimeError(
                     "The dataloader produced zero batches. Check that the dataset contains "
                     "enough frame triplets for the configured batch size."
                 )
 
+            epoch_total_avg = epoch_total_loss / num_steps
             epoch_anchor_mse_avg = epoch_anchor_mse_loss / num_steps
             epoch_solver_mse_avg = epoch_solver_mse_loss / num_steps
             epoch_del_avg = epoch_del_loss / num_steps
+            epoch_sigreg_avg = epoch_sigreg_loss / num_steps
             del_to_anchor_ratio = epoch_del_avg / max(epoch_anchor_mse_avg, 1e-12)
-            diag_avgs = {
-                key: value / epoch_diag_count
-                for key, value in epoch_diag_sums.items()
-            } if epoch_diag_count > 0 else {}
+            diag_avgs = (
+                {
+                    key: value / epoch_diag_count
+                    for key, value in epoch_diag_sums.items()
+                }
+                if epoch_diag_count > 0
+                else {}
+            )
+            last_epoch_metrics = {
+                "train/total": epoch_total_avg,
+                "train/anchor_mse": epoch_anchor_mse_avg,
+                "train/solver_mse": epoch_solver_mse_avg,
+                "train/del": epoch_del_avg,
+                "train/sigreg": epoch_sigreg_avg,
+                "train/del_to_anchor_mse": del_to_anchor_ratio,
+                "train/lr": optimizer.param_groups[0]["lr"],
+                **{f"diagnostics/{key}": value for key, value in diag_avgs.items()},
+            }
 
             log.info(
-                "Epoch %d complete | anchor MSE: %.6f | solver MSE: %.6f | "
-                "DEL: %.6f | DEL/anchor: %.6e | LR: %.6e",
+                "Epoch %d complete | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | "
+                "DEL: %.6f | SIGReg: %.6f | DEL/anchor: %.6e | LR: %.6e",
                 epoch,
+                epoch_total_avg,
                 epoch_anchor_mse_avg,
                 epoch_solver_mse_avg,
                 epoch_del_avg,
+                epoch_sigreg_avg,
                 del_to_anchor_ratio,
                 optimizer.param_groups[0]["lr"],
             )
@@ -1085,19 +1586,74 @@ def main(cfg: DictConfig):
             if wandb_run is not None:
                 wandb_payload = {
                     "train/epoch": epoch,
-                    "train/anchor_mse": epoch_anchor_mse_avg,
-                    "train/solver_mse": epoch_solver_mse_avg,
-                    "train/del": epoch_del_avg,
-                    "train/del_to_anchor_mse": del_to_anchor_ratio,
-                    "train/lr": optimizer.param_groups[0]["lr"],
+                    "train/global_step": global_step,
+                    **last_epoch_metrics,
                 }
-                for key, value in diag_avgs.items():
-                    wandb_payload[f"diagnostics/{key}"] = value
-                wandb_run.log(wandb_payload, step=epoch)
+                wandb_run.log(wandb_payload, step=global_step)
+
+            if (
+                val_loader is not None
+                and val_every > 0
+                and epoch % val_every == 0
+                and last_validation_step != global_step
+            ):
+                val_metrics = evaluate_validation(
+                    lagrangian=lagrangian,
+                    state_projector=state_projector,
+                    autoencoder=encoder,
+                    val_loader=val_loader,
+                    device=device,
+                    lambda_del=lambda_del,
+                    lambda_solver_mse=lambda_solver_mse,
+                    lambda_sigreg=lambda_sigreg,
+                    sigreg=sigreg,
+                    solver_alpha=solver_alpha,
+                    training_solver_steps=training_solver_steps,
+                    solver_microbatch_size=solver_microbatch_size,
+                    max_batches=val_max_batches,
+                )
+                if val_metrics is not None:
+                    log.info(
+                        "Epoch %d val | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f",
+                        epoch,
+                        val_metrics["total"],
+                        val_metrics["anchor_mse"],
+                        val_metrics["solver_mse"],
+                        val_metrics["del"],
+                        val_metrics["sigreg"],
+                    )
+                    if wandb_run is not None:
+                        wandb_run.log(
+                            {
+                                "val/total": val_metrics["total"],
+                                "val/anchor_mse": val_metrics["anchor_mse"],
+                                "val/solver_mse": val_metrics["solver_mse"],
+                                "val/del": val_metrics["del"],
+                                "val/sigreg": val_metrics["sigreg"],
+                                "val/del_to_anchor_mse": val_metrics["del_to_anchor_mse"],
+                                "val/global_step": global_step,
+                                "val/epoch": epoch,
+                            },
+                            step=global_step,
+                        )
+                    last_validation_step = global_step
+
+            if checkpoint_every > 0 and epoch % checkpoint_every == 0:
+                checkpoint_path = _save_checkpoint(
+                    output_dir=output_dir,
+                    name=f"epoch_{epoch:03d}.pt",
+                    lagrangian=lagrangian,
+                    state_projector=state_projector,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    cfg=cfg,
+                    epoch=epoch,
+                    metrics=last_epoch_metrics,
+                )
+                log.info("Saved checkpoint to %s", checkpoint_path)
 
             scheduler.step()
-                
-            # Run inference and save a predicted frame at the end of the epoch
+
             if (
                 save_inference_visuals
                 and inference_every > 0
@@ -1105,13 +1661,15 @@ def main(cfg: DictConfig):
             ):
                 run_inference_and_save(
                     lagrangian=lagrangian,
+                    state_projector=state_projector,
                     autoencoder=encoder,
                     eval_dataset=eval_dataset,
                     epoch=epoch,
                     cfg=cfg,
                     device=device,
-                    save_dir=output_dir,
+                    save_dir=inference_dir,
                     wandb_run=wandb_run,
+                    global_step=global_step,
                 )
                 last_inference_epoch = epoch
 
@@ -1122,21 +1680,38 @@ def main(cfg: DictConfig):
         ):
             log.info(
                 "Saving final inference artifacts to %s after training.",
-                output_dir,
+                inference_dir,
             )
             run_inference_and_save(
                 lagrangian=lagrangian,
+                state_projector=state_projector,
                 autoencoder=encoder,
                 eval_dataset=eval_dataset,
                 epoch=cfg.training.epochs,
                 cfg=cfg,
                 device=device,
-                save_dir=output_dir,
+                save_dir=inference_dir,
                 wandb_run=wandb_run,
+                global_step=global_step,
             )
+
+        if save_last_checkpoint:
+            checkpoint_path = _save_checkpoint(
+                output_dir=output_dir,
+                name="last.pt",
+                lagrangian=lagrangian,
+                state_projector=state_projector,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                cfg=cfg,
+                epoch=cfg.training.epochs,
+                metrics=last_epoch_metrics,
+            )
+            log.info("Saved final checkpoint to %s", checkpoint_path)
     finally:
         if wandb_run is not None:
             wandb_run.finish()
+
 
 if __name__ == "__main__":
     main()

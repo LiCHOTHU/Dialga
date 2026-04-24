@@ -8,6 +8,8 @@ dataset:
 
 model:
   vae_ckpt: "/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+  representation: "wan_frozen"
+  state_projector_hidden_channels: 128
   latent_channels: 16
   latent_h: 16
   latent_w: 16
@@ -20,6 +22,13 @@ model:
 training:
   batch_size: 32
   num_workers: 4
+  val_fraction: 0.01
+  val_batch_size: 32
+  val_num_workers: 2
+  val_every: 1
+  val_every_steps: 1000
+  val_max_batches: 8
+  seed: 0
   overfit_subset_size: 0
   overfit_video_index: -1
   overfit_shuffle: false
@@ -39,14 +48,21 @@ training:
   lambda_del: 1.0
   # Keep solver-MSE opt-in; default training uses DEL on ground-truth triples.
   lambda_solver_mse: 0.0
+  lambda_sigreg: 0.0
+  sigreg_knots: 17
+  sigreg_num_proj: 256
   solver_microbatch_size: 1
   autoregressive_rollout_steps: 0
   autoregressive_detach_between_steps: true
   sequence_encode_batch_size: 1
   diagnostics_every: 10
+  checkpoint_every: 10
+  checkpoint_every_steps: 2000
+  save_last_checkpoint: true
   vae_reconstruction_check_frames: 4
   vae_reconstruction_warn_mse: 0.05
   inference_every: 1
+  inference_every_steps: 1000
   save_inference_images: true
   save_inference_video: true
   save_final_inference: true
