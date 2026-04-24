@@ -34,8 +34,9 @@ def _load_frozen_vae(vae_pth, device):
     return vae
 
 
-def _decode_latent_with_vae(vae, latent):
-    with torch.no_grad():
+def _decode_latent_with_vae(vae, latent, enable_grad=False):
+    grad_context = torch.enable_grad if enable_grad else torch.no_grad
+    with grad_context():
         if latent.dim() == 4:
             latent = latent.unsqueeze(2)
 
@@ -74,5 +75,5 @@ class WanFrozenEncoder(nn.Module):
 
         return latent
 
-    def decode(self, latent):
-        return _decode_latent_with_vae(self.vae, latent)
+    def decode(self, latent, enable_grad=False):
+        return _decode_latent_with_vae(self.vae, latent, enable_grad=enable_grad)

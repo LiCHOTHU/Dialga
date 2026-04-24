@@ -38,6 +38,7 @@ if [[ ${#TRAIN_ARGS[@]} -eq 0 ]]; then
     "training.save_inference_images=true"
     "training.save_inference_video=true"
     "training.save_final_inference=true"
+    "training.lambda_solver_mse=0.1"
   )
 fi
 

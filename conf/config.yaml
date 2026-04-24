@@ -8,8 +8,16 @@ dataset:
 
 model:
   vae_ckpt: "/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+  latent_source: "wan_vae"
   representation: "wan_frozen"
   state_projector_hidden_channels: 128
+  input_image_size: 128
+  lewm_patch_size: 16
+  lewm_embed_dim: 192
+  lewm_latent_channels: 48
+  lewm_encoder_depth: 4
+  lewm_num_heads: 6
+  lewm_mlp_ratio: 4.0
   latent_channels: 16
   latent_h: 16
   latent_w: 16
@@ -22,6 +30,10 @@ model:
 training:
   batch_size: 32
   num_workers: 4
+  train_subset_size: 0
+  sequence_window_length: 0
+  sequence_windows_per_video: 4
+  sequence_max_videos: 0
   val_fraction: 0.01
   val_batch_size: 32
   val_num_workers: 2
@@ -46,8 +58,10 @@ training:
   solver_steps: 5
   training_solver_steps: 1
   lambda_del: 1.0
-  # Keep solver-MSE opt-in; default training uses DEL on ground-truth triples.
-  lambda_solver_mse: 0.0
+  # Hybrid default: keep DEL supervision, but also directly supervise predicted next latents.
+  lambda_solver_mse: 0.1
+  lambda_recon: 0.0
+  lambda_pred_recon: 1.0
   lambda_sigreg: 0.0
   sigreg_knots: 17
   sigreg_num_proj: 256

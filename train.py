@@ -17,7 +17,14 @@ from tqdm import tqdm
 import torchvision.utils as vutils
 
 from src.data.clevrer_dataset import ClevrerTripletDataset
-from src.model import DiTLagrangian, ResidualStateProjector, SIGReg, WanFrozenEncoder
+from src.data.clevrer_sequence import ClevrerSequenceWindowDataset
+from src.model import (
+    DiTLagrangian,
+    LeWMPatchAutoencoder,
+    ResidualStateProjector,
+    SIGReg,
+    WanFrozenEncoder,
+)
 
 try:
     import wandb
@@ -254,6 +261,74 @@ def compute_ground_truth_sequence_losses(lagrangian, q_sequence, rollout_steps=0
     return anchor_mse_sum / normalizer, del_sum / normalizer
 
 
+def compute_batched_sequence_losses(
+    lagrangian,
+    q_sequence,
+    alpha,
+    solver_steps,
+    detach_between_steps,
+    autoencoder=None,
+    target_frames=None,
+    enable_decode_grad=False,
+):
+    if q_sequence.dim() != 5:
+        raise ValueError(
+            f"Expected batched latent sequence with shape (B, T, C, H, W), got {tuple(q_sequence.shape)}."
+        )
+    if q_sequence.shape[1] < 3:
+        raise RuntimeError("Need at least 3 frames in each sequence window.")
+
+    anchor_pred = 2 * q_sequence[:, 1:-1] - q_sequence[:, :-2]
+    anchor_loss = F.mse_loss(anchor_pred, q_sequence[:, 2:])
+
+    del_terms = []
+    for step_idx in range(1, q_sequence.shape[1] - 1):
+        residual = calculate_del_residual(
+            lagrangian=lagrangian,
+            q_prev=q_sequence[:, step_idx - 1],
+            q_curr=q_sequence[:, step_idx],
+            q_next=q_sequence[:, step_idx + 1],
+        )
+        del_terms.append(residual.pow(2).mean())
+    del_loss = torch.stack(del_terms).mean()
+
+    solver_terms = []
+    pred_recon_terms = []
+    q_prev_roll = q_sequence[:, 0]
+    q_curr_roll = q_sequence[:, 1]
+    for step_idx in range(q_sequence.shape[1] - 2):
+        q_next_pred = training_dynamic_step(
+            lagrangian=lagrangian,
+            q_prev=q_prev_roll,
+            q_curr=q_curr_roll,
+            alpha=alpha,
+            solver_steps=solver_steps,
+            detach_inputs=detach_between_steps,
+        )
+        solver_terms.append(F.mse_loss(q_next_pred, q_sequence[:, step_idx + 2]))
+        if autoencoder is not None and target_frames is not None:
+            pred_frame = decode_latent(
+                autoencoder,
+                q_next_pred,
+                enable_grad=enable_decode_grad,
+            )
+            pred_recon_terms.append(F.mse_loss(pred_frame, target_frames[:, step_idx + 2]))
+        if detach_between_steps:
+            q_prev_roll = q_curr_roll.detach()
+            q_curr_roll = q_next_pred.detach()
+        else:
+            q_prev_roll = q_curr_roll
+            q_curr_roll = q_next_pred
+    solver_loss = torch.stack(solver_terms).mean()
+    pred_recon_loss = (
+        q_sequence.new_zeros(())
+        if not pred_recon_terms
+        else torch.stack(pred_recon_terms).mean()
+    )
+
+    return anchor_loss, solver_loss, del_loss, pred_recon_loss
+
+
 def summarize_lagrangian_components(lagrangian, q_prev, q_curr):
     with torch.no_grad():
         components = lagrangian.compute_components(q_prev, q_curr)
@@ -304,14 +379,67 @@ def compute_sigreg_loss(sigreg, latent_sequence):
     return sigreg(projections)
 
 
+def module_is_trainable(module):
+    return module is not None and any(param.requires_grad for param in module.parameters())
+
+
+def compute_reconstruction_loss(autoencoder, latent, frames):
+    recon = autoencoder.decode(latent)
+    if recon.shape != frames.shape:
+        min_frames = min(recon.shape[0], frames.shape[0])
+        recon = recon[:min_frames]
+        frames = frames[:min_frames]
+    return F.mse_loss(recon, frames), recon
+
+
+def decode_latent(autoencoder, latent, enable_grad=False):
+    try:
+        return autoencoder.decode(latent, enable_grad=enable_grad)
+    except TypeError:
+        return autoencoder.decode(latent)
+
+
+def unwrap_dataset(dataset):
+    current = dataset
+    while isinstance(current, Subset):
+        current = current.dataset
+    if hasattr(current, "base_dataset"):
+        return current.base_dataset
+    return current
+
+
+def encode_frame_sequence_batch(autoencoder, frames, trainable):
+    batch_size, time_steps = frames.shape[:2]
+    flat_frames = frames.flatten(0, 1)
+    if trainable:
+        latent = autoencoder(flat_frames)
+    else:
+        with torch.no_grad():
+            latent = autoencoder(flat_frames)
+    return latent.view(batch_size, time_steps, *latent.shape[1:])
+
+
+def apply_state_representation_sequence(state_projector, latent_sequence):
+    if state_projector is None:
+        return latent_sequence
+    batch_size, time_steps = latent_sequence.shape[:2]
+    flat = latent_sequence.flatten(0, 1)
+    flat = state_projector(flat)
+    return flat.view(batch_size, time_steps, *flat.shape[1:])
+
+
 def evaluate_validation(
     lagrangian,
     state_projector,
     autoencoder,
     val_loader,
     device,
+    sequence_mode,
+    autoencoder_trainable,
     lambda_del,
     lambda_solver_mse,
+    lambda_recon,
+    lambda_pred_recon,
     lambda_sigreg,
     sigreg,
     solver_alpha,
@@ -325,6 +453,8 @@ def evaluate_validation(
     metric_sums = {
         "anchor_mse": 0.0,
         "solver_mse": 0.0,
+        "recon": 0.0,
+        "pred_recon": 0.0,
         "del": 0.0,
         "sigreg": 0.0,
         "total": 0.0,
@@ -332,77 +462,158 @@ def evaluate_validation(
     num_batches = 0
 
     with _temporary_eval_mode(lagrangian, state_projector, autoencoder):
-        for batch_idx, (o_prev, o_curr, o_next_true) in enumerate(val_loader, start=1):
+        for batch_idx, batch in enumerate(val_loader, start=1):
             if max_batches > 0 and batch_idx > max_batches:
                 break
 
-            o_prev = o_prev.to(device)
-            o_curr = o_curr.to(device)
-            o_next_true = o_next_true.to(device)
+            if sequence_mode:
+                frames = batch.to(device)
+                q_sequence_base = encode_frame_sequence_batch(autoencoder, frames, autoencoder_trainable)
+                q_sequence = apply_state_representation_sequence(state_projector, q_sequence_base)
 
-            with torch.no_grad():
-                q_prev = apply_state_representation(state_projector, autoencoder(o_prev))
-                q_curr = apply_state_representation(state_projector, autoencoder(o_curr))
-                q_next_true = apply_state_representation(state_projector, autoencoder(o_next_true))
+                if lambda_recon > 0.0:
+                    loss_recon, _ = compute_reconstruction_loss(
+                        autoencoder,
+                        q_sequence_base.flatten(0, 1),
+                        frames.flatten(0, 1),
+                    )
+                else:
+                    loss_recon = q_sequence.new_zeros(())
 
-            batch_size = q_prev.shape[0]
-            batch_anchor_sum = 0.0
-            batch_solver_sum = 0.0
-            batch_del_sum = 0.0
-            batch_sigreg_sum = 0.0
-            batch_total_sum = 0.0
+                loss_anchor, loss_solver, loss_del, loss_pred_recon = compute_batched_sequence_losses(
+                    lagrangian=lagrangian,
+                    q_sequence=q_sequence,
+                    alpha=solver_alpha,
+                    solver_steps=training_solver_steps,
+                    detach_between_steps=True,
+                    autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
+                    target_frames=frames if lambda_pred_recon > 0.0 else None,
+                    enable_decode_grad=False,
+                )
+                loss_sigreg = lambda_sigreg * compute_sigreg_loss(
+                    sigreg,
+                    q_sequence.transpose(0, 1),
+                )
+                loss_total = (
+                    lambda_del * loss_del
+                    + lambda_solver_mse * loss_solver
+                    + lambda_recon * loss_recon
+                    + lambda_pred_recon * loss_pred_recon
+                    + loss_sigreg
+                )
 
-            for start_idx in range(0, batch_size, solver_microbatch_size):
-                end_idx = min(start_idx + solver_microbatch_size, batch_size)
-                q_prev_mb = q_prev[start_idx:end_idx]
-                q_curr_mb = q_curr[start_idx:end_idx]
-                q_next_true_mb = q_next_true[start_idx:end_idx]
+                metric_sums["anchor_mse"] += loss_anchor.item()
+                metric_sums["solver_mse"] += loss_solver.item()
+                metric_sums["recon"] += loss_recon.item()
+                metric_sums["pred_recon"] += loss_pred_recon.item()
+                metric_sums["del"] += loss_del.item()
+                metric_sums["sigreg"] += loss_sigreg.item()
+                metric_sums["total"] += loss_total.item()
+            else:
+                o_prev, o_curr, o_next_true = batch
+                o_prev = o_prev.to(device)
+                o_curr = o_curr.to(device)
+                o_next_true = o_next_true.to(device)
 
-                anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
-                loss_anchor_mse_mb = F.mse_loss(anchor_pred_mb, q_next_true_mb)
+                with torch.no_grad():
+                    q_prev_base = autoencoder(o_prev)
+                    q_curr_base = autoencoder(o_curr)
+                    q_next_true_base = autoencoder(o_next_true)
+                    q_prev = apply_state_representation(state_projector, q_prev_base)
+                    q_curr = apply_state_representation(state_projector, q_curr_base)
+                    q_next_true = apply_state_representation(state_projector, q_next_true_base)
 
-                if lambda_solver_mse > 0.0:
-                    q_next_pred = training_dynamic_step(
+                    if lambda_recon > 0.0:
+                        loss_recon_prev, _ = compute_reconstruction_loss(autoencoder, q_prev_base, o_prev)
+                        loss_recon_curr, _ = compute_reconstruction_loss(autoencoder, q_curr_base, o_curr)
+                        loss_recon_next, _ = compute_reconstruction_loss(autoencoder, q_next_true_base, o_next_true)
+                        batch_recon_loss = (loss_recon_prev + loss_recon_curr + loss_recon_next) / 3.0
+                    else:
+                        batch_recon_loss = q_prev.new_zeros(())
+
+                batch_size = q_prev.shape[0]
+                batch_anchor_sum = 0.0
+                batch_solver_sum = 0.0
+                batch_recon_sum = float(batch_recon_loss.item())
+                batch_pred_recon_sum = 0.0
+                batch_del_sum = 0.0
+                batch_sigreg_sum = 0.0
+                batch_total_sum = 0.0
+
+                for start_idx in range(0, batch_size, solver_microbatch_size):
+                    end_idx = min(start_idx + solver_microbatch_size, batch_size)
+                    q_prev_mb = q_prev[start_idx:end_idx]
+                    q_curr_mb = q_curr[start_idx:end_idx]
+                    q_next_true_mb = q_next_true[start_idx:end_idx]
+
+                    anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
+                    loss_anchor_mse_mb = F.mse_loss(anchor_pred_mb, q_next_true_mb)
+
+                    if lambda_solver_mse > 0.0:
+                        q_next_pred = training_dynamic_step(
+                            lagrangian=lagrangian,
+                            q_prev=q_prev_mb,
+                            q_curr=q_curr_mb,
+                            alpha=solver_alpha,
+                            solver_steps=training_solver_steps,
+                            detach_inputs=True,
+                        )
+                        loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
+                    else:
+                        q_next_pred = None
+                        loss_solver_mse_mb = q_prev_mb.new_zeros(())
+
+                    if lambda_pred_recon > 0.0:
+                        if q_next_pred is None:
+                            q_next_pred = training_dynamic_step(
+                                lagrangian=lagrangian,
+                                q_prev=q_prev_mb,
+                                q_curr=q_curr_mb,
+                                alpha=solver_alpha,
+                                solver_steps=training_solver_steps,
+                                detach_inputs=True,
+                            )
+                        pred_frame_mb = decode_latent(autoencoder, q_next_pred, enable_grad=False)
+                        loss_pred_recon_mb = F.mse_loss(
+                            pred_frame_mb,
+                            o_next_true[start_idx:end_idx],
+                        )
+                    else:
+                        loss_pred_recon_mb = q_prev_mb.new_zeros(())
+
+                    residual_true_mb = calculate_del_residual(
                         lagrangian=lagrangian,
                         q_prev=q_prev_mb,
                         q_curr=q_curr_mb,
-                        alpha=solver_alpha,
-                        solver_steps=training_solver_steps,
-                        detach_inputs=True,
+                        q_next=q_next_true_mb,
                     )
-                    loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
-                else:
-                    loss_solver_mse_mb = q_prev_mb.new_zeros(())
+                    loss_del_mb = residual_true_mb.pow(2).mean()
+                    loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
+                        sigreg,
+                        torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
+                    )
+                    loss_total_mb = (
+                        lambda_del * loss_del_mb
+                        + lambda_solver_mse * loss_solver_mse_mb
+                        + lambda_pred_recon * loss_pred_recon_mb
+                        + loss_sigreg_mb
+                    )
 
-                residual_true_mb = calculate_del_residual(
-                    lagrangian=lagrangian,
-                    q_prev=q_prev_mb,
-                    q_curr=q_curr_mb,
-                    q_next=q_next_true_mb,
-                )
-                loss_del_mb = residual_true_mb.pow(2).mean()
-                loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
-                    sigreg,
-                    torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
-                )
-                loss_total_mb = (
-                    lambda_del * loss_del_mb
-                    + lambda_solver_mse * loss_solver_mse_mb
-                    + loss_sigreg_mb
-                )
+                    microbatch_size = q_prev_mb.shape[0]
+                    batch_anchor_sum += loss_anchor_mse_mb.item() * microbatch_size
+                    batch_solver_sum += loss_solver_mse_mb.item() * microbatch_size
+                    batch_del_sum += loss_del_mb.item() * microbatch_size
+                    batch_pred_recon_sum += loss_pred_recon_mb.item() * microbatch_size
+                    batch_sigreg_sum += loss_sigreg_mb.item() * microbatch_size
+                    batch_total_sum += loss_total_mb.item() * microbatch_size
 
-                microbatch_size = q_prev_mb.shape[0]
-                batch_anchor_sum += loss_anchor_mse_mb.item() * microbatch_size
-                batch_solver_sum += loss_solver_mse_mb.item() * microbatch_size
-                batch_del_sum += loss_del_mb.item() * microbatch_size
-                batch_sigreg_sum += loss_sigreg_mb.item() * microbatch_size
-                batch_total_sum += loss_total_mb.item() * microbatch_size
-
-            metric_sums["anchor_mse"] += batch_anchor_sum / batch_size
-            metric_sums["solver_mse"] += batch_solver_sum / batch_size
-            metric_sums["del"] += batch_del_sum / batch_size
-            metric_sums["sigreg"] += batch_sigreg_sum / batch_size
-            metric_sums["total"] += batch_total_sum / batch_size
+                metric_sums["anchor_mse"] += batch_anchor_sum / batch_size
+                metric_sums["solver_mse"] += batch_solver_sum / batch_size
+                metric_sums["recon"] += batch_recon_sum
+                metric_sums["pred_recon"] += batch_pred_recon_sum / batch_size
+                metric_sums["del"] += batch_del_sum / batch_size
+                metric_sums["sigreg"] += batch_sigreg_sum / batch_size
+                metric_sums["total"] += batch_total_sum / batch_size + lambda_recon * batch_recon_sum
             num_batches += 1
 
     if num_batches == 0:
@@ -414,7 +625,15 @@ def evaluate_validation(
 
 
 def infer_latent_shape(encoder, state_projector, dataset, device):
-    sample_prev, _, _ = dataset[0]
+    sample = dataset[0]
+    if torch.is_tensor(sample):
+        if sample.dim() != 4:
+            raise ValueError(
+                f"Expected sequence sample with shape (T, C, H, W), got {tuple(sample.shape)}."
+            )
+        sample_prev = sample[0]
+    else:
+        sample_prev, _, _ = sample
     sample_prev = sample_prev.unsqueeze(0).to(device)
     with _temporary_eval_mode(encoder, state_projector), torch.no_grad():
         latent = apply_state_representation(state_projector, encoder(sample_prev))
@@ -442,7 +661,7 @@ def evaluate_autoencoder_reconstruction(
     if recon.shape != frames.shape:
         min_frames = min(recon.shape[0], frames.shape[0])
         log.warning(
-            "VAE reconstruction shape mismatch: input=%s recon=%s. "
+            "Autoencoder reconstruction shape mismatch: input=%s recon=%s. "
             "Comparing the first %d frames only.",
             tuple(frames.shape),
             tuple(recon.shape),
@@ -590,6 +809,7 @@ def _save_checkpoint(
     output_dir,
     name,
     lagrangian,
+    autoencoder,
     state_projector,
     optimizer,
     scheduler,
@@ -604,6 +824,9 @@ def _save_checkpoint(
         {
             "epoch": epoch,
             "model_state_dict": lagrangian.state_dict(),
+            "autoencoder_state_dict": (
+                None if not module_is_trainable(autoencoder) else autoencoder.state_dict()
+            ),
             "state_projector_state_dict": (
                 None if state_projector is None else state_projector.state_dict()
             ),
@@ -812,7 +1035,13 @@ def main(cfg: DictConfig):
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 
-    device = torch.device(cfg.training.device if torch.cuda.is_available() else "cpu")
+    requested_device = str(cfg.training.device)
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(
+            "training.device is set to cuda, but CUDA is not available in this job. "
+            "Refusing to silently fall back to CPU."
+        )
+    device = torch.device(requested_device if torch.cuda.is_available() else "cpu")
     if int(cfg.training.batch_size) <= 0:
         raise ValueError("training.batch_size must be > 0.")
     if int(cfg.training.epochs) <= 0:
@@ -829,7 +1058,8 @@ def main(cfg: DictConfig):
     log.info("Hydra run output directory: %s", output_dir)
     wandb_run = _init_wandb(cfg, output_dir)
 
-    if not os.path.isfile(cfg.model.vae_ckpt):
+    latent_source = str(cfg.model.get("latent_source", "wan_vae"))
+    if latent_source == "wan_vae" and not os.path.isfile(cfg.model.vae_ckpt):
         raise FileNotFoundError(f"VAE checkpoint not found: {cfg.model.vae_ckpt}")
 
     data_dir = (
@@ -843,13 +1073,33 @@ def main(cfg: DictConfig):
             "cfg.dataset.videos_dir."
         )
 
-    dataset = ClevrerTripletDataset(
-        data_dir=data_dir,
-        video_num_frames=int(cfg.dataset.get("video_num_frames", 128)),
-    )
+    sequence_mode = int(cfg.training.get("sequence_window_length", 0)) > 0
+    if sequence_mode:
+        dataset = ClevrerSequenceWindowDataset(
+            data_dir=data_dir,
+            window_length=int(cfg.training.get("sequence_window_length", 6)),
+            max_frames=int(cfg.dataset.get("video_num_frames", 128)),
+            windows_per_video=int(cfg.training.get("sequence_windows_per_video", 4)),
+            max_videos=int(cfg.training.get("sequence_max_videos", 0)),
+            seed=seed,
+        )
+        log.info(
+            "Sequence training mode enabled | window_length=%d | windows_per_video=%d | max_videos=%d",
+            int(cfg.training.get("sequence_window_length", 6)),
+            int(cfg.training.get("sequence_windows_per_video", 4)),
+            int(cfg.training.get("sequence_max_videos", 0)),
+        )
+    else:
+        dataset = ClevrerTripletDataset(
+            data_dir=data_dir,
+            video_num_frames=int(cfg.dataset.get("video_num_frames", 128)),
+        )
     base_dataset = dataset
+    train_subset_size = int(cfg.training.get("train_subset_size", 0))
     overfit_subset_size = int(cfg.training.get("overfit_subset_size", 0))
     overfit_video_index = int(cfg.training.get("overfit_video_index", -1))
+    if sequence_mode and (overfit_video_index >= 0 or overfit_subset_size > 0):
+        raise ValueError("Sequence training mode does not support overfit_* options.")
     if overfit_video_index >= 0 and overfit_subset_size > 0:
         log.warning(
             "Both training.overfit_video_index=%d and training.overfit_subset_size=%d are set. "
@@ -889,6 +1139,16 @@ def main(cfg: DictConfig):
             effective_batch_size,
             shuffle,
         )
+    elif train_subset_size > 0:
+        subset_size = min(train_subset_size, len(dataset))
+        subset_generator = torch.Generator().manual_seed(seed)
+        subset_indices = torch.randperm(len(dataset), generator=subset_generator)[:subset_size].tolist()
+        dataset = Subset(dataset, subset_indices)
+        log.info(
+            "Training subset mode enabled with %d sampled %s.",
+            subset_size,
+            "windows" if sequence_mode else "triplets",
+        )
 
     val_loader = None
     val_fraction = float(cfg.training.get("val_fraction", 0.0))
@@ -922,7 +1182,7 @@ def main(cfg: DictConfig):
             val_size,
         )
 
-    eval_dataset = dataset.dataset if isinstance(dataset, Subset) else dataset
+    eval_dataset = unwrap_dataset(dataset)
     if effective_batch_size <= 0:
         raise ValueError("Resolved training batch size must be > 0.")
 
@@ -936,32 +1196,65 @@ def main(cfg: DictConfig):
         persistent_workers=num_workers > 0,
     )
 
-    encoder = WanFrozenEncoder(vae_pth=cfg.model.vae_ckpt, device=device)
-    log.warning(
-        "WanFrozenEncoder is encoding individual frames with a video VAE. "
-        "Use the reconstruction sanity check below to verify this latent is usable; "
-        "object-centric CLEVRER coordinates remain the preferred physics state."
-    )
+    if latent_source == "wan_vae":
+        autoencoder = WanFrozenEncoder(vae_pth=cfg.model.vae_ckpt, device=device)
+        log.warning(
+            "WanFrozenEncoder is encoding individual frames with a video VAE. "
+            "Use the reconstruction sanity check below to verify this latent is usable; "
+            "object-centric CLEVRER coordinates remain the preferred physics state."
+        )
+    elif latent_source == "lewm_patch":
+        autoencoder = LeWMPatchAutoencoder(
+            image_size=int(cfg.model.get("input_image_size", 128)),
+            patch_size=int(cfg.model.get("lewm_patch_size", 16)),
+            embed_dim=int(cfg.model.get("lewm_embed_dim", 192)),
+            latent_channels=int(cfg.model.get("lewm_latent_channels", 48)),
+            depth=int(cfg.model.get("lewm_encoder_depth", 4)),
+            num_heads=int(cfg.model.get("lewm_num_heads", 6)),
+            mlp_ratio=float(cfg.model.get("lewm_mlp_ratio", 4.0)),
+        ).to(device)
+        log.info("Using optional LeWM-inspired patch autoencoder backend.")
+    else:
+        raise ValueError(
+            "Unsupported model.latent_source='{}'. Use 'wan_vae' or 'lewm_patch'.".format(
+                latent_source
+            )
+        )
+
+    autoencoder_trainable = module_is_trainable(autoencoder)
     representation_mode = str(cfg.model.get("representation", "wan_frozen"))
-    encoder_latent_shape = infer_latent_shape(encoder, None, dataset, device)
-    if representation_mode == "wan_frozen":
+    if representation_mode in {"wan_frozen", "identity"}:
         state_projector = None
-    elif representation_mode == "wan_projected_sigreg":
+    elif representation_mode in {"wan_projected_sigreg", "projected_sigreg"}:
+        base_latent_shape = infer_latent_shape(autoencoder, None, dataset, device)
         state_projector = ResidualStateProjector(
-            channels=encoder_latent_shape[0],
+            channels=base_latent_shape[0],
             hidden_channels=int(cfg.model.get("state_projector_hidden_channels", 128)),
         ).to(device)
     else:
         raise ValueError(
-            "Unsupported model.representation='{}'. Use 'wan_frozen' or "
-            "'wan_projected_sigreg'.".format(representation_mode)
+            "Unsupported model.representation='{}'. Use 'identity' / 'wan_frozen' or "
+            "'projected_sigreg' / 'wan_projected_sigreg'.".format(representation_mode)
+        )
+
+    lambda_recon = float(cfg.training.get("lambda_recon", 0.0))
+    lambda_pred_recon = float(cfg.training.get("lambda_pred_recon", 0.0))
+    if autoencoder_trainable and lambda_recon <= 0.0:
+        raise ValueError(
+            "model.latent_source={} is trainable and requires training.lambda_recon>0."
+            .format(latent_source)
+        )
+    if not autoencoder_trainable and lambda_recon > 0.0:
+        log.warning(
+            "training.lambda_recon>0 was set, but the selected latent source is frozen. "
+            "The reconstruction term will not update the encoder."
         )
 
     lambda_sigreg = float(cfg.training.get("lambda_sigreg", 0.0))
     if lambda_sigreg > 0.0 and state_projector is None:
         raise ValueError(
             "training.lambda_sigreg > 0 requires a trainable state representation. "
-            "Set model.representation=wan_projected_sigreg."
+            "Set model.representation=projected_sigreg."
         )
     if state_projector is not None and lambda_sigreg <= 0.0:
         log.warning(
@@ -973,7 +1266,7 @@ def main(cfg: DictConfig):
         knots=int(cfg.training.get("sigreg_knots", 17)),
         num_proj=int(cfg.training.get("sigreg_num_proj", 256)),
     ).to(device)
-    log.info("State representation mode: %s", representation_mode)
+    log.info("Latent source: %s | state representation mode: %s", latent_source, representation_mode)
     if state_projector is not None:
         log.warning(
             "LeWM-style state projection is active. Inference videos decode the projected "
@@ -985,7 +1278,7 @@ def main(cfg: DictConfig):
     save_inference_visuals = save_inference_images or save_inference_video
     save_final_inference = bool(cfg.training.get("save_final_inference", True))
 
-    actual_latent_shape = infer_latent_shape(encoder, state_projector, dataset, device)
+    actual_latent_shape = infer_latent_shape(autoencoder, state_projector, dataset, device)
     configured_latent_shape = (
         cfg.model.latent_channels,
         cfg.model.latent_h,
@@ -1006,7 +1299,7 @@ def main(cfg: DictConfig):
         cfg.training.get("vae_reconstruction_warn_mse", 0.05)
     )
     reconstruction_metrics = evaluate_autoencoder_reconstruction(
-        autoencoder=encoder,
+        autoencoder=autoencoder,
         dataset=eval_dataset,
         device=device,
         video_index=max(overfit_video_index, 0),
@@ -1014,22 +1307,22 @@ def main(cfg: DictConfig):
     )
     if reconstruction_metrics is not None:
         log.info(
-            "Single-frame VAE reconstruction check | MSE: %.6f | MAE: %.6f",
+            "Single-frame autoencoder reconstruction check | MSE: %.6f | MAE: %.6f",
             reconstruction_metrics["mse"],
             reconstruction_metrics["mae"],
         )
         if reconstruction_metrics["mse"] > reconstruction_warn_mse:
             log.warning(
-                "VAE reconstruction MSE %.6f exceeds warning threshold %.6f. "
+                "Autoencoder reconstruction MSE %.6f exceeds warning threshold %.6f. "
                 "The latent dynamics model may be fighting an off-distribution encoder.",
                 reconstruction_metrics["mse"],
                 reconstruction_warn_mse,
             )
         if wandb_run is not None:
-            wandb_run.summary["diagnostics/vae_reconstruction_mse"] = (
+            wandb_run.summary["diagnostics/autoencoder_reconstruction_mse"] = (
                 reconstruction_metrics["mse"]
             )
-            wandb_run.summary["diagnostics/vae_reconstruction_mae"] = (
+            wandb_run.summary["diagnostics/autoencoder_reconstruction_mae"] = (
                 reconstruction_metrics["mae"]
             )
 
@@ -1046,14 +1339,15 @@ def main(cfg: DictConfig):
 
     lambda_del = float(cfg.training.get("lambda_del", 1.0))
     lambda_solver_mse = float(cfg.training.get("lambda_solver_mse", 0.0))
+    solver_supervision_enabled = lambda_solver_mse > 0.0
     if lambda_del <= 0.0 and lambda_solver_mse <= 0.0:
         raise ValueError("At least one of lambda_del or lambda_solver_mse must be > 0.")
-    if (overfit_video_index >= 0 or overfit_subset_size > 0) and lambda_solver_mse <= 0.0:
+    if not solver_supervision_enabled:
         log.warning(
-            "Overfit mode is running with training.lambda_solver_mse=0.0. "
-            "This fits only the DEL constraint on ground-truth latent triples; "
-            "solver rollout accuracy is reported diagnostically but is not directly optimized. "
-            "Set training.lambda_solver_mse>0 to test rollout memorization."
+            "training.lambda_solver_mse=0.0 disables direct predictive supervision. "
+            "In this codebase, DEL-only training can converge to a trivial near-zero residual solution "
+            "while rollout videos remain poor. Use training.lambda_solver_mse>0 for any run where next-frame "
+            "or rollout quality matters. When this term is disabled, the logged solver_mse will stay at 0 by design."
         )
 
     requested_gradient_checkpointing = bool(
@@ -1068,6 +1362,8 @@ def main(cfg: DictConfig):
     lagrangian.set_gradient_checkpointing(requested_gradient_checkpointing)
 
     trainable_parameters = list(lagrangian.parameters())
+    if autoencoder_trainable:
+        trainable_parameters.extend(autoencoder.parameters())
     if state_projector is not None:
         trainable_parameters.extend(state_projector.parameters())
     optimizer = AdamW(
@@ -1091,6 +1387,8 @@ def main(cfg: DictConfig):
     save_last_checkpoint = bool(cfg.training.get("save_last_checkpoint", True))
     if lambda_sigreg < 0:
         raise ValueError("training.lambda_sigreg must be >= 0.")
+    if lambda_pred_recon < 0:
+        raise ValueError("training.lambda_pred_recon must be >= 0.")
     if inference_every < 0:
         raise ValueError("training.inference_every must be >= 0.")
     if inference_every_steps < 0:
@@ -1166,11 +1464,15 @@ def main(cfg: DictConfig):
         is_interactive = sys.stdout.isatty()
         for epoch in range(1, cfg.training.epochs + 1):
             lagrangian.train()
+            if autoencoder_trainable:
+                autoencoder.train()
             if state_projector is not None:
                 state_projector.train()
             epoch_total_loss = 0.0
             epoch_anchor_mse_loss = 0.0
             epoch_solver_mse_loss = 0.0
+            epoch_recon_loss = 0.0
+            epoch_pred_recon_loss = 0.0
             epoch_del_loss = 0.0
             epoch_sigreg_loss = 0.0
             epoch_diag_sums = {}
@@ -1183,13 +1485,23 @@ def main(cfg: DictConfig):
                     video_index=overfit_video_index,
                     max_frames=int(cfg.dataset.get("video_num_frames", 128)),
                 )
-                q_sequence = encode_video_sequence_in_chunks(
-                    encoder=encoder,
-                    frame_sequence=overfit_sequence,
-                    device=device,
-                    chunk_size=sequence_encode_batch_size,
-                )
-                q_sequence = apply_state_representation(state_projector, q_sequence)
+                if autoencoder_trainable:
+                    overfit_sequence = overfit_sequence.to(device)
+                    q_sequence_base = autoencoder(overfit_sequence)
+                    loss_recon_tensor, _ = compute_reconstruction_loss(
+                        autoencoder,
+                        q_sequence_base,
+                        overfit_sequence,
+                    )
+                else:
+                    q_sequence_base = encode_video_sequence_in_chunks(
+                        encoder=autoencoder,
+                        frame_sequence=overfit_sequence,
+                        device=device,
+                        chunk_size=sequence_encode_batch_size,
+                    )
+                    loss_recon_tensor = q_sequence_base.new_zeros(())
+                q_sequence = apply_state_representation(state_projector, q_sequence_base)
 
                 loss_anchor_mse_tensor, loss_DEL_tensor = compute_ground_truth_sequence_losses(
                     lagrangian=lagrangian,
@@ -1215,6 +1527,7 @@ def main(cfg: DictConfig):
                 total_loss = (
                     lambda_del * loss_DEL_tensor
                     + lambda_solver_mse * loss_solver_mse_tensor
+                    + lambda_recon * loss_recon_tensor
                     + loss_sigreg_tensor
                 )
                 total_loss.backward()
@@ -1227,6 +1540,7 @@ def main(cfg: DictConfig):
 
                 epoch_anchor_mse_loss = loss_anchor_mse_tensor.item()
                 epoch_solver_mse_loss = loss_solver_mse_tensor.item()
+                epoch_recon_loss = loss_recon_tensor.item()
                 epoch_del_loss = loss_DEL_tensor.item()
                 epoch_sigreg_loss = loss_sigreg_tensor.item()
                 epoch_total_loss = total_loss.item()
@@ -1240,10 +1554,11 @@ def main(cfg: DictConfig):
                 num_steps = 1
                 global_step += 1
                 log.info(
-                    "Epoch %d overfit | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f | LR: %.6e",
+                    "Epoch %d overfit | anchor MSE: %.6f | solver MSE: %.6f | recon: %.6f | DEL: %.6f | SIGReg: %.6f | LR: %.6e",
                     epoch,
                     epoch_anchor_mse_loss,
                     epoch_solver_mse_loss,
+                    epoch_recon_loss,
                     epoch_del_loss,
                     epoch_sigreg_loss,
                     optimizer.param_groups[0]["lr"],
@@ -1256,98 +1571,62 @@ def main(cfg: DictConfig):
                     dynamic_ncols=is_interactive,
                 )
 
-                for batch_idx, (o_prev, o_curr, o_next_true) in enumerate(pbar, start=1):
-                    o_prev = o_prev.to(device)
-                    o_curr = o_curr.to(device)
-                    o_next_true = o_next_true.to(device)
-
-                    with torch.no_grad():
-                        q_prev = encoder(o_prev)
-                        q_curr = encoder(o_curr)
-                        q_next_true = encoder(o_next_true)
-
+                for batch_idx, batch in enumerate(pbar, start=1):
                     optimizer.zero_grad(set_to_none=True)
-                    batch_size = q_prev.shape[0]
-                    batch_anchor_mse_sum = 0.0
-                    batch_solver_mse_sum = 0.0
-                    batch_del_sum = 0.0
-                    batch_sigreg_sum = 0.0
-                    batch_total_sum = 0.0
 
-                    for start_idx in range(0, batch_size, solver_microbatch_size):
-                        end_idx = min(start_idx + solver_microbatch_size, batch_size)
-                        q_prev_mb = apply_state_representation(
-                            state_projector,
-                            q_prev[start_idx:end_idx],
+                    if sequence_mode:
+                        frames = batch.to(device)
+                        batch_size = frames.shape[0]
+                        q_sequence_base = encode_frame_sequence_batch(
+                            autoencoder,
+                            frames,
+                            autoencoder_trainable,
                         )
-                        q_curr_mb = apply_state_representation(
+                        q_sequence = apply_state_representation_sequence(
                             state_projector,
-                            q_curr[start_idx:end_idx],
-                        )
-                        q_next_true_mb = apply_state_representation(
-                            state_projector,
-                            q_next_true[start_idx:end_idx],
+                            q_sequence_base,
                         )
 
-                        anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
-                        loss_anchor_mse_mb = F.mse_loss(
-                            anchor_pred_mb,
-                            q_next_true_mb,
-                        )
-
-                        if lambda_solver_mse > 0.0:
-                            q_next_pred = training_dynamic_step(
-                                lagrangian=lagrangian,
-                                q_prev=q_prev_mb,
-                                q_curr=q_curr_mb,
-                                alpha=solver_alpha,
-                                solver_steps=training_solver_steps,
-                                detach_inputs=True,
-                            )
-                            loss_solver_mse_mb = F.mse_loss(
-                                q_next_pred,
-                                q_next_true_mb,
+                        if lambda_recon > 0.0:
+                            loss_recon_tensor, _ = compute_reconstruction_loss(
+                                autoencoder,
+                                q_sequence_base.flatten(0, 1),
+                                frames.flatten(0, 1),
                             )
                         else:
-                            loss_solver_mse_mb = q_prev_mb.new_zeros(())
+                            loss_recon_tensor = q_sequence.new_zeros(())
 
-                        residual_true_mb = calculate_del_residual(
+                        loss_anchor_tensor, loss_solver_tensor, loss_del_tensor, loss_pred_recon_tensor = compute_batched_sequence_losses(
                             lagrangian=lagrangian,
-                            q_prev=q_prev_mb,
-                            q_curr=q_curr_mb,
-                            q_next=q_next_true_mb,
+                            q_sequence=q_sequence,
+                            alpha=solver_alpha,
+                            solver_steps=training_solver_steps,
+                            detach_between_steps=autoregressive_detach_between_steps,
+                            autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
+                            target_frames=frames if lambda_pred_recon > 0.0 else None,
+                            enable_decode_grad=True,
                         )
-                        loss_DEL_mb = residual_true_mb.pow(2).mean()
-                        loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
+                        loss_sigreg_tensor = lambda_sigreg * compute_sigreg_loss(
                             sigreg,
-                            torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
+                            q_sequence.transpose(0, 1),
                         )
-                        total_loss_mb = (
-                            lambda_del * loss_DEL_mb
-                            + lambda_solver_mse * loss_solver_mse_mb
-                            + loss_sigreg_mb
+                        loss_total_tensor = (
+                            lambda_del * loss_del_tensor
+                            + lambda_solver_mse * loss_solver_tensor
+                            + lambda_recon * loss_recon_tensor
+                            + lambda_pred_recon * loss_pred_recon_tensor
+                            + loss_sigreg_tensor
                         )
-                        scaled_loss = total_loss_mb * (q_prev_mb.shape[0] / batch_size)
-                        scaled_loss.backward()
-                        batch_anchor_mse_sum += (
-                            loss_anchor_mse_mb.item() * q_prev_mb.shape[0]
-                        )
-                        batch_solver_mse_sum += (
-                            loss_solver_mse_mb.item() * q_prev_mb.shape[0]
-                        )
-                        batch_del_sum += loss_DEL_mb.item() * q_prev_mb.shape[0]
-                        batch_sigreg_sum += loss_sigreg_mb.item() * q_prev_mb.shape[0]
-                        batch_total_sum += total_loss_mb.item() * q_prev_mb.shape[0]
+                        loss_total_tensor.backward()
 
                         if (
                             diagnostics_every > 0
                             and batch_idx % diagnostics_every == 0
-                            and start_idx == 0
                         ):
                             component_stats = summarize_lagrangian_components(
                                 lagrangian,
-                                q_prev_mb,
-                                q_curr_mb,
+                                q_sequence[:, 0],
+                                q_sequence[:, 1],
                             )
                             for key, value in component_stats.items():
                                 epoch_diag_sums[key] = (
@@ -1355,19 +1634,192 @@ def main(cfg: DictConfig):
                                 )
                             epoch_diag_count += 1
 
+                        loss_anchor_mse = loss_anchor_tensor.item()
+                        loss_solver_mse = loss_solver_tensor.item()
+                        loss_recon = loss_recon_tensor.item()
+                        loss_pred_recon = loss_pred_recon_tensor.item()
+                        loss_DEL = loss_del_tensor.item()
+                        loss_sigreg = loss_sigreg_tensor.item()
+                        loss_total = loss_total_tensor.item()
+                    else:
+                        o_prev, o_curr, o_next_true = batch
+                        o_prev = o_prev.to(device)
+                        o_curr = o_curr.to(device)
+                        o_next_true = o_next_true.to(device)
+
+                        if autoencoder_trainable:
+                            q_prev = None
+                            q_curr = None
+                            q_next_true = None
+                        else:
+                            with torch.no_grad():
+                                q_prev = autoencoder(o_prev)
+                                q_curr = autoencoder(o_curr)
+                                q_next_true = autoencoder(o_next_true)
+
+                        batch_size = o_prev.shape[0]
+                        batch_anchor_mse_sum = 0.0
+                        batch_solver_mse_sum = 0.0
+                        batch_recon_sum = 0.0
+                        batch_pred_recon_sum = 0.0
+                        batch_del_sum = 0.0
+                        batch_sigreg_sum = 0.0
+                        batch_total_sum = 0.0
+
+                        for start_idx in range(0, batch_size, solver_microbatch_size):
+                            end_idx = min(start_idx + solver_microbatch_size, batch_size)
+                            if autoencoder_trainable:
+                                o_prev_mb = o_prev[start_idx:end_idx]
+                                o_curr_mb = o_curr[start_idx:end_idx]
+                                o_next_true_frame_mb = o_next_true[start_idx:end_idx]
+
+                                q_prev_base_mb = autoencoder(o_prev_mb)
+                                q_curr_base_mb = autoencoder(o_curr_mb)
+                                q_next_true_base_mb = autoencoder(o_next_true_frame_mb)
+
+                                loss_recon_prev_mb, _ = compute_reconstruction_loss(
+                                    autoencoder,
+                                    q_prev_base_mb,
+                                    o_prev_mb,
+                                )
+                                loss_recon_curr_mb, _ = compute_reconstruction_loss(
+                                    autoencoder,
+                                    q_curr_base_mb,
+                                    o_curr_mb,
+                                )
+                                loss_recon_next_mb, _ = compute_reconstruction_loss(
+                                    autoencoder,
+                                    q_next_true_base_mb,
+                                    o_next_true_frame_mb,
+                                )
+                                loss_recon_mb = (
+                                    loss_recon_prev_mb + loss_recon_curr_mb + loss_recon_next_mb
+                                ) / 3.0
+
+                                q_prev_mb = apply_state_representation(state_projector, q_prev_base_mb)
+                                q_curr_mb = apply_state_representation(state_projector, q_curr_base_mb)
+                                q_next_true_mb = apply_state_representation(state_projector, q_next_true_base_mb)
+                            else:
+                                loss_recon_mb = o_prev.new_zeros(())
+                                q_prev_mb = apply_state_representation(
+                                    state_projector,
+                                    q_prev[start_idx:end_idx],
+                                )
+                                q_curr_mb = apply_state_representation(
+                                    state_projector,
+                                    q_curr[start_idx:end_idx],
+                                )
+                                q_next_true_mb = apply_state_representation(
+                                    state_projector,
+                                    q_next_true[start_idx:end_idx],
+                                )
+
+                            anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
+                            loss_anchor_mse_mb = F.mse_loss(
+                                anchor_pred_mb,
+                                q_next_true_mb,
+                            )
+
+                            if lambda_solver_mse > 0.0:
+                                q_next_pred = training_dynamic_step(
+                                    lagrangian=lagrangian,
+                                    q_prev=q_prev_mb,
+                                    q_curr=q_curr_mb,
+                                    alpha=solver_alpha,
+                                    solver_steps=training_solver_steps,
+                                    detach_inputs=True,
+                                )
+                                loss_solver_mse_mb = F.mse_loss(
+                                    q_next_pred,
+                                    q_next_true_mb,
+                                )
+                            else:
+                                q_next_pred = None
+                                loss_solver_mse_mb = q_prev_mb.new_zeros(())
+
+                            if lambda_pred_recon > 0.0:
+                                if q_next_pred is None:
+                                    q_next_pred = training_dynamic_step(
+                                        lagrangian=lagrangian,
+                                        q_prev=q_prev_mb,
+                                        q_curr=q_curr_mb,
+                                        alpha=solver_alpha,
+                                        solver_steps=training_solver_steps,
+                                        detach_inputs=True,
+                                    )
+                                loss_pred_recon_mb = F.mse_loss(
+                                    decode_latent(autoencoder, q_next_pred, enable_grad=True),
+                                    o_next_true[start_idx:end_idx],
+                                )
+                            else:
+                                loss_pred_recon_mb = q_prev_mb.new_zeros(())
+
+                            residual_true_mb = calculate_del_residual(
+                                lagrangian=lagrangian,
+                                q_prev=q_prev_mb,
+                                q_curr=q_curr_mb,
+                                q_next=q_next_true_mb,
+                            )
+                            loss_DEL_mb = residual_true_mb.pow(2).mean()
+                            loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
+                                sigreg,
+                                torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
+                            )
+                            total_loss_mb = (
+                                lambda_del * loss_DEL_mb
+                                + lambda_solver_mse * loss_solver_mse_mb
+                                + lambda_recon * loss_recon_mb
+                                + lambda_pred_recon * loss_pred_recon_mb
+                                + loss_sigreg_mb
+                            )
+                            scaled_loss = total_loss_mb * (q_prev_mb.shape[0] / batch_size)
+                            scaled_loss.backward()
+                            batch_anchor_mse_sum += (
+                                loss_anchor_mse_mb.item() * q_prev_mb.shape[0]
+                            )
+                            batch_solver_mse_sum += (
+                                loss_solver_mse_mb.item() * q_prev_mb.shape[0]
+                            )
+                            batch_recon_sum += loss_recon_mb.item() * q_prev_mb.shape[0]
+                            batch_pred_recon_sum += loss_pred_recon_mb.item() * q_prev_mb.shape[0]
+                            batch_del_sum += loss_DEL_mb.item() * q_prev_mb.shape[0]
+                            batch_sigreg_sum += loss_sigreg_mb.item() * q_prev_mb.shape[0]
+                            batch_total_sum += total_loss_mb.item() * q_prev_mb.shape[0]
+
+                            if (
+                                diagnostics_every > 0
+                                and batch_idx % diagnostics_every == 0
+                                and start_idx == 0
+                            ):
+                                component_stats = summarize_lagrangian_components(
+                                    lagrangian,
+                                    q_prev_mb,
+                                    q_curr_mb,
+                                )
+                                for key, value in component_stats.items():
+                                    epoch_diag_sums[key] = (
+                                        epoch_diag_sums.get(key, 0.0) + value
+                                    )
+                                epoch_diag_count += 1
+
+                        loss_anchor_mse = batch_anchor_mse_sum / batch_size
+                        loss_solver_mse = batch_solver_mse_sum / batch_size
+                        loss_recon = batch_recon_sum / batch_size
+                        loss_pred_recon = batch_pred_recon_sum / batch_size
+                        loss_DEL = batch_del_sum / batch_size
+                        loss_sigreg = batch_sigreg_sum / batch_size
+                        loss_total = batch_total_sum / batch_size
+
                     if grad_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(
                             trainable_parameters, max_norm=grad_clip_norm
                         )
                     optimizer.step()
 
-                    loss_anchor_mse = batch_anchor_mse_sum / batch_size
-                    loss_solver_mse = batch_solver_mse_sum / batch_size
-                    loss_DEL = batch_del_sum / batch_size
-                    loss_sigreg = batch_sigreg_sum / batch_size
-                    loss_total = batch_total_sum / batch_size
                     epoch_anchor_mse_loss += loss_anchor_mse
                     epoch_solver_mse_loss += loss_solver_mse
+                    epoch_recon_loss += loss_recon
+                    epoch_pred_recon_loss += loss_pred_recon
                     epoch_del_loss += loss_DEL
                     epoch_sigreg_loss += loss_sigreg
                     epoch_total_loss += loss_total
@@ -1377,6 +1829,8 @@ def main(cfg: DictConfig):
                     postfix = {
                         "Total": f"{loss_total:.4f}",
                         "AnchorMSE": f"{loss_anchor_mse:.4f}",
+                        "Recon": f"{loss_recon:.4f}",
+                        "PredRec": f"{loss_pred_recon:.4f}",
                         "DEL": f"{loss_DEL:.4f}",
                         "SIGReg": f"{loss_sigreg:.4f}",
                         "LR": f"{optimizer.param_groups[0]['lr']:.2e}",
@@ -1391,12 +1845,14 @@ def main(cfg: DictConfig):
 
                     if not is_interactive and log_interval > 0 and batch_idx % log_interval == 0:
                         log.info(
-                            "Epoch %d step %d | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f | LR: %.6e",
+                            "Epoch %d step %d | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | recon: %.6f | pred_recon: %.6f | DEL: %.6f | SIGReg: %.6f | LR: %.6e",
                             epoch,
                             batch_idx,
                             loss_total,
                             loss_anchor_mse,
                             loss_solver_mse,
+                            loss_recon,
+                            loss_pred_recon,
                             loss_DEL,
                             loss_sigreg,
                             optimizer.param_groups[0]["lr"],
@@ -1405,6 +1861,8 @@ def main(cfg: DictConfig):
                     if wandb_run is not None and log_interval > 0 and global_step % log_interval == 0:
                         running_anchor_mse = epoch_anchor_mse_loss / num_steps
                         running_solver_mse = epoch_solver_mse_loss / num_steps
+                        running_recon = epoch_recon_loss / num_steps
+                        running_pred_recon = epoch_pred_recon_loss / num_steps
                         running_del = epoch_del_loss / num_steps
                         running_sigreg = epoch_sigreg_loss / num_steps
                         wandb_payload = {
@@ -1413,12 +1871,16 @@ def main(cfg: DictConfig):
                             "train_step/total": loss_total,
                             "train_step/anchor_mse": loss_anchor_mse,
                             "train_step/solver_mse": loss_solver_mse,
+                            "train_step/recon": loss_recon,
+                            "train_step/pred_recon": loss_pred_recon,
                             "train_step/del": loss_DEL,
                             "train_step/sigreg": loss_sigreg,
                             "train_step/lr": optimizer.param_groups[0]["lr"],
                             "train_running/total": epoch_total_loss / num_steps,
                             "train_running/anchor_mse": running_anchor_mse,
                             "train_running/solver_mse": running_solver_mse,
+                            "train_running/recon": running_recon,
+                            "train_running/pred_recon": running_pred_recon,
                             "train_running/del": running_del,
                             "train_running/sigreg": running_sigreg,
                             "train_running/del_to_anchor_mse": (
@@ -1443,11 +1905,15 @@ def main(cfg: DictConfig):
                         val_metrics = evaluate_validation(
                             lagrangian=lagrangian,
                             state_projector=state_projector,
-                            autoencoder=encoder,
+                            autoencoder=autoencoder,
                             val_loader=val_loader,
                             device=device,
+                            sequence_mode=sequence_mode,
+                            autoencoder_trainable=autoencoder_trainable,
                             lambda_del=lambda_del,
                             lambda_solver_mse=lambda_solver_mse,
+                            lambda_recon=lambda_recon,
+                            lambda_pred_recon=lambda_pred_recon,
                             lambda_sigreg=lambda_sigreg,
                             sigreg=sigreg,
                             solver_alpha=solver_alpha,
@@ -1457,11 +1923,13 @@ def main(cfg: DictConfig):
                         )
                         if val_metrics is not None:
                             log.info(
-                                "Val step %d | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f",
+                                "Val step %d | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | recon: %.6f | pred_recon: %.6f | DEL: %.6f | SIGReg: %.6f",
                                 global_step,
                                 val_metrics["total"],
                                 val_metrics["anchor_mse"],
                                 val_metrics["solver_mse"],
+                                val_metrics["recon"],
+                                val_metrics["pred_recon"],
                                 val_metrics["del"],
                                 val_metrics["sigreg"],
                             )
@@ -1471,6 +1939,8 @@ def main(cfg: DictConfig):
                                         "val/total": val_metrics["total"],
                                         "val/anchor_mse": val_metrics["anchor_mse"],
                                         "val/solver_mse": val_metrics["solver_mse"],
+                                        "val/recon": val_metrics["recon"],
+                                        "val/pred_recon": val_metrics["pred_recon"],
                                         "val/del": val_metrics["del"],
                                         "val/sigreg": val_metrics["sigreg"],
                                         "val/del_to_anchor_mse": val_metrics["del_to_anchor_mse"],
@@ -1489,7 +1959,7 @@ def main(cfg: DictConfig):
                         run_inference_and_save(
                             lagrangian=lagrangian,
                             state_projector=state_projector,
-                            autoencoder=encoder,
+                            autoencoder=autoencoder,
                             eval_dataset=eval_dataset,
                             epoch=epoch,
                             cfg=cfg,
@@ -1510,6 +1980,8 @@ def main(cfg: DictConfig):
                             "train/global_step": global_step,
                             "train_step/anchor_mse": loss_anchor_mse,
                             "train_step/solver_mse": loss_solver_mse,
+                            "train_step/recon": loss_recon,
+                            "train_step/pred_recon": loss_pred_recon,
                             "train_step/del": loss_DEL,
                             "train_step/sigreg": loss_sigreg,
                             "train_step/lr": optimizer.param_groups[0]["lr"],
@@ -1518,6 +1990,7 @@ def main(cfg: DictConfig):
                             output_dir=output_dir,
                             name=f"step_{global_step:07d}.pt",
                             lagrangian=lagrangian,
+                            autoencoder=autoencoder,
                             state_projector=state_projector,
                             optimizer=optimizer,
                             scheduler=scheduler,
@@ -1536,6 +2009,8 @@ def main(cfg: DictConfig):
             epoch_total_avg = epoch_total_loss / num_steps
             epoch_anchor_mse_avg = epoch_anchor_mse_loss / num_steps
             epoch_solver_mse_avg = epoch_solver_mse_loss / num_steps
+            epoch_recon_avg = epoch_recon_loss / num_steps
+            epoch_pred_recon_avg = epoch_pred_recon_loss / num_steps
             epoch_del_avg = epoch_del_loss / num_steps
             epoch_sigreg_avg = epoch_sigreg_loss / num_steps
             del_to_anchor_ratio = epoch_del_avg / max(epoch_anchor_mse_avg, 1e-12)
@@ -1551,6 +2026,8 @@ def main(cfg: DictConfig):
                 "train/total": epoch_total_avg,
                 "train/anchor_mse": epoch_anchor_mse_avg,
                 "train/solver_mse": epoch_solver_mse_avg,
+                "train/recon": epoch_recon_avg,
+                "train/pred_recon": epoch_pred_recon_avg,
                 "train/del": epoch_del_avg,
                 "train/sigreg": epoch_sigreg_avg,
                 "train/del_to_anchor_mse": del_to_anchor_ratio,
@@ -1559,12 +2036,14 @@ def main(cfg: DictConfig):
             }
 
             log.info(
-                "Epoch %d complete | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | "
+                "Epoch %d complete | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | recon: %.6f | pred_recon: %.6f | "
                 "DEL: %.6f | SIGReg: %.6f | DEL/anchor: %.6e | LR: %.6e",
                 epoch,
                 epoch_total_avg,
                 epoch_anchor_mse_avg,
                 epoch_solver_mse_avg,
+                epoch_recon_avg,
+                epoch_pred_recon_avg,
                 epoch_del_avg,
                 epoch_sigreg_avg,
                 del_to_anchor_ratio,
@@ -1600,11 +2079,15 @@ def main(cfg: DictConfig):
                 val_metrics = evaluate_validation(
                     lagrangian=lagrangian,
                     state_projector=state_projector,
-                    autoencoder=encoder,
+                    autoencoder=autoencoder,
                     val_loader=val_loader,
                     device=device,
+                    sequence_mode=sequence_mode,
+                    autoencoder_trainable=autoencoder_trainable,
                     lambda_del=lambda_del,
                     lambda_solver_mse=lambda_solver_mse,
+                    lambda_recon=lambda_recon,
+                    lambda_pred_recon=lambda_pred_recon,
                     lambda_sigreg=lambda_sigreg,
                     sigreg=sigreg,
                     solver_alpha=solver_alpha,
@@ -1614,11 +2097,13 @@ def main(cfg: DictConfig):
                 )
                 if val_metrics is not None:
                     log.info(
-                        "Epoch %d val | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | DEL: %.6f | SIGReg: %.6f",
+                        "Epoch %d val | total: %.6f | anchor MSE: %.6f | solver MSE: %.6f | recon: %.6f | pred_recon: %.6f | DEL: %.6f | SIGReg: %.6f",
                         epoch,
                         val_metrics["total"],
                         val_metrics["anchor_mse"],
                         val_metrics["solver_mse"],
+                        val_metrics["recon"],
+                        val_metrics["pred_recon"],
                         val_metrics["del"],
                         val_metrics["sigreg"],
                     )
@@ -1628,6 +2113,8 @@ def main(cfg: DictConfig):
                                 "val/total": val_metrics["total"],
                                 "val/anchor_mse": val_metrics["anchor_mse"],
                                 "val/solver_mse": val_metrics["solver_mse"],
+                                "val/recon": val_metrics["recon"],
+                                "val/pred_recon": val_metrics["pred_recon"],
                                 "val/del": val_metrics["del"],
                                 "val/sigreg": val_metrics["sigreg"],
                                 "val/del_to_anchor_mse": val_metrics["del_to_anchor_mse"],
@@ -1643,6 +2130,7 @@ def main(cfg: DictConfig):
                     output_dir=output_dir,
                     name=f"epoch_{epoch:03d}.pt",
                     lagrangian=lagrangian,
+                    autoencoder=autoencoder,
                     state_projector=state_projector,
                     optimizer=optimizer,
                     scheduler=scheduler,
@@ -1662,7 +2150,7 @@ def main(cfg: DictConfig):
                 run_inference_and_save(
                     lagrangian=lagrangian,
                     state_projector=state_projector,
-                    autoencoder=encoder,
+                    autoencoder=autoencoder,
                     eval_dataset=eval_dataset,
                     epoch=epoch,
                     cfg=cfg,
@@ -1685,7 +2173,7 @@ def main(cfg: DictConfig):
             run_inference_and_save(
                 lagrangian=lagrangian,
                 state_projector=state_projector,
-                autoencoder=encoder,
+                autoencoder=autoencoder,
                 eval_dataset=eval_dataset,
                 epoch=cfg.training.epochs,
                 cfg=cfg,
@@ -1700,6 +2188,7 @@ def main(cfg: DictConfig):
                 output_dir=output_dir,
                 name="last.pt",
                 lagrangian=lagrangian,
+                autoencoder=autoencoder,
                 state_projector=state_projector,
                 optimizer=optimizer,
                 scheduler=scheduler,
