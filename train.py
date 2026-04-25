@@ -20,6 +20,7 @@ from src.data.clevrer_dataset import ClevrerTripletDataset
 from src.data.clevrer_sequence import ClevrerSequenceWindowDataset
 from src.model import (
     DiTLagrangian,
+    LatentNextStatePredictor,
     LeWMPatchAutoencoder,
     ResidualStateProjector,
     SIGReg,
@@ -329,6 +330,56 @@ def compute_batched_sequence_losses(
     return anchor_loss, solver_loss, del_loss, pred_recon_loss
 
 
+def rollout_with_predictor(predictor, q_sequence):
+    predictions = [q_sequence[:, 0], q_sequence[:, 1]]
+    q_prev = q_sequence[:, 0]
+    q_curr = q_sequence[:, 1]
+    for _ in range(q_sequence.shape[1] - 2):
+        q_next = predictor(q_prev, q_curr)
+        predictions.append(q_next)
+        q_prev, q_curr = q_curr, q_next
+    return torch.stack(predictions, dim=1)
+
+
+def compute_direct_predictor_sequence_losses(
+    predictor,
+    q_sequence,
+    autoencoder=None,
+    target_frames=None,
+    enable_decode_grad=False,
+):
+    anchor_loss = F.mse_loss(2 * q_sequence[:, 1:-1] - q_sequence[:, :-2], q_sequence[:, 2:])
+
+    teacher_terms = []
+    for step_idx in range(q_sequence.shape[1] - 2):
+        teacher_terms.append(
+            F.mse_loss(
+                predictor(q_sequence[:, step_idx], q_sequence[:, step_idx + 1]),
+                q_sequence[:, step_idx + 2],
+            )
+        )
+    teacher_loss = torch.stack(teacher_terms).mean()
+
+    rollout = rollout_with_predictor(predictor, q_sequence)
+    rollout_loss = F.mse_loss(rollout[:, 2:], q_sequence[:, 2:])
+
+    pred_recon_terms = []
+    if autoencoder is not None and target_frames is not None:
+        for step_idx in range(q_sequence.shape[1] - 2):
+            pred_frame = decode_latent(
+                autoencoder,
+                rollout[:, step_idx + 2],
+                enable_grad=enable_decode_grad,
+            )
+            pred_recon_terms.append(F.mse_loss(pred_frame, target_frames[:, step_idx + 2]))
+    pred_recon_loss = (
+        q_sequence.new_zeros(())
+        if not pred_recon_terms
+        else torch.stack(pred_recon_terms).mean()
+    )
+    return anchor_loss, teacher_loss, rollout_loss, pred_recon_loss
+
+
 def summarize_lagrangian_components(lagrangian, q_prev, q_curr):
     with torch.no_grad():
         components = lagrangian.compute_components(q_prev, q_curr)
@@ -408,6 +459,13 @@ def unwrap_dataset(dataset):
     return current
 
 
+def sample_dataset_sequence(dataset):
+    sample = dataset[0]
+    if torch.is_tensor(sample):
+        return sample
+    return None
+
+
 def encode_frame_sequence_batch(autoencoder, frames, trainable):
     batch_size, time_steps = frames.shape[:2]
     flat_frames = frames.flatten(0, 1)
@@ -429,7 +487,8 @@ def apply_state_representation_sequence(state_projector, latent_sequence):
 
 
 def evaluate_validation(
-    lagrangian,
+    dynamics_model,
+    dynamics_mode,
     state_projector,
     autoencoder,
     val_loader,
@@ -461,7 +520,7 @@ def evaluate_validation(
     }
     num_batches = 0
 
-    with _temporary_eval_mode(lagrangian, state_projector, autoencoder):
+    with _temporary_eval_mode(dynamics_model, state_projector, autoencoder):
         for batch_idx, batch in enumerate(val_loader, start=1):
             if max_batches > 0 and batch_idx > max_batches:
                 break
@@ -480,22 +539,33 @@ def evaluate_validation(
                 else:
                     loss_recon = q_sequence.new_zeros(())
 
-                loss_anchor, loss_solver, loss_del, loss_pred_recon = compute_batched_sequence_losses(
-                    lagrangian=lagrangian,
-                    q_sequence=q_sequence,
-                    alpha=solver_alpha,
-                    solver_steps=training_solver_steps,
-                    detach_between_steps=True,
-                    autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
-                    target_frames=frames if lambda_pred_recon > 0.0 else None,
-                    enable_decode_grad=False,
-                )
+                if dynamics_mode == "lagrangian":
+                    loss_anchor, loss_solver, loss_del, loss_pred_recon = compute_batched_sequence_losses(
+                        lagrangian=dynamics_model,
+                        q_sequence=q_sequence,
+                        alpha=solver_alpha,
+                        solver_steps=training_solver_steps,
+                        detach_between_steps=True,
+                        autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
+                        target_frames=frames if lambda_pred_recon > 0.0 else None,
+                        enable_decode_grad=False,
+                    )
+                else:
+                    loss_anchor, teacher_loss, rollout_loss, loss_pred_recon = compute_direct_predictor_sequence_losses(
+                        predictor=dynamics_model,
+                        q_sequence=q_sequence,
+                        autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
+                        target_frames=frames if lambda_pred_recon > 0.0 else None,
+                        enable_decode_grad=False,
+                    )
+                    loss_solver = 0.5 * (teacher_loss + rollout_loss)
+                    loss_del = q_sequence.new_zeros(())
                 loss_sigreg = lambda_sigreg * compute_sigreg_loss(
                     sigreg,
                     q_sequence.transpose(0, 1),
                 )
                 loss_total = (
-                    lambda_del * loss_del
+                    (0.0 if dynamics_mode == "direct_predictor" else lambda_del) * loss_del
                     + lambda_solver_mse * loss_solver
                     + lambda_recon * loss_recon
                     + lambda_pred_recon * loss_pred_recon
@@ -549,24 +619,28 @@ def evaluate_validation(
                     anchor_pred_mb = 2 * q_curr_mb - q_prev_mb
                     loss_anchor_mse_mb = F.mse_loss(anchor_pred_mb, q_next_true_mb)
 
-                    if lambda_solver_mse > 0.0:
-                        q_next_pred = training_dynamic_step(
-                            lagrangian=lagrangian,
-                            q_prev=q_prev_mb,
-                            q_curr=q_curr_mb,
-                            alpha=solver_alpha,
-                            solver_steps=training_solver_steps,
-                            detach_inputs=True,
-                        )
-                        loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
+                    if dynamics_mode == "lagrangian":
+                        if lambda_solver_mse > 0.0:
+                            q_next_pred = training_dynamic_step(
+                                lagrangian=dynamics_model,
+                                q_prev=q_prev_mb,
+                                q_curr=q_curr_mb,
+                                alpha=solver_alpha,
+                                solver_steps=training_solver_steps,
+                                detach_inputs=True,
+                            )
+                            loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
+                        else:
+                            q_next_pred = None
+                            loss_solver_mse_mb = q_prev_mb.new_zeros(())
                     else:
-                        q_next_pred = None
-                        loss_solver_mse_mb = q_prev_mb.new_zeros(())
+                        q_next_pred = dynamics_model(q_prev_mb, q_curr_mb)
+                        loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
 
                     if lambda_pred_recon > 0.0:
                         if q_next_pred is None:
                             q_next_pred = training_dynamic_step(
-                                lagrangian=lagrangian,
+                                lagrangian=dynamics_model,
                                 q_prev=q_prev_mb,
                                 q_curr=q_curr_mb,
                                 alpha=solver_alpha,
@@ -581,19 +655,22 @@ def evaluate_validation(
                     else:
                         loss_pred_recon_mb = q_prev_mb.new_zeros(())
 
-                    residual_true_mb = calculate_del_residual(
-                        lagrangian=lagrangian,
-                        q_prev=q_prev_mb,
-                        q_curr=q_curr_mb,
-                        q_next=q_next_true_mb,
-                    )
-                    loss_del_mb = residual_true_mb.pow(2).mean()
+                    if dynamics_mode == "lagrangian":
+                        residual_true_mb = calculate_del_residual(
+                            lagrangian=dynamics_model,
+                            q_prev=q_prev_mb,
+                            q_curr=q_curr_mb,
+                            q_next=q_next_true_mb,
+                        )
+                        loss_del_mb = residual_true_mb.pow(2).mean()
+                    else:
+                        loss_del_mb = q_prev_mb.new_zeros(())
                     loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
                         sigreg,
                         torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
                     )
                     loss_total_mb = (
-                        lambda_del * loss_del_mb
+                        (0.0 if dynamics_mode == "direct_predictor" else lambda_del) * loss_del_mb
                         + lambda_solver_mse * loss_solver_mse_mb
                         + lambda_pred_recon * loss_pred_recon_mb
                         + loss_sigreg_mb
@@ -740,19 +817,22 @@ def _repeat_video_frames(frame_batch, repeat_count):
     )
 
 
-def _rollout_latents(lagrangian, q_prev, q_curr, alpha, solver_steps, rollout_steps):
+def _rollout_latents(dynamics_model, dynamics_mode, q_prev, q_curr, alpha, solver_steps, rollout_steps):
     rollout = []
     q_prev_roll = q_prev.detach()
     q_curr_roll = q_curr.detach()
 
     for _ in range(rollout_steps):
-        q_next_roll = forward_dynamic_step(
-            lagrangian=lagrangian,
-            q_prev=q_prev_roll,
-            q_curr=q_curr_roll,
-            alpha=alpha,
-            solver_steps=solver_steps,
-        ).detach()
+        if dynamics_mode == "lagrangian":
+            q_next_roll = forward_dynamic_step(
+                lagrangian=dynamics_model,
+                q_prev=q_prev_roll,
+                q_curr=q_curr_roll,
+                alpha=alpha,
+                solver_steps=solver_steps,
+            ).detach()
+        else:
+            q_next_roll = dynamics_model(q_prev_roll, q_curr_roll).detach()
         rollout.append(q_next_roll)
         q_prev_roll, q_curr_roll = q_curr_roll, q_next_roll
 
@@ -841,9 +921,11 @@ def _save_checkpoint(
 
 
 def run_inference_and_save(
-    lagrangian,
+    dynamics_model,
+    dynamics_mode,
     state_projector,
     autoencoder,
+    debug_dataset,
     eval_dataset,
     epoch,
     cfg,
@@ -888,10 +970,14 @@ def run_inference_and_save(
         cfg.training.get("inference_video_hold_frames", 8)
     )
 
-    gt_sequence = eval_dataset.get_video_sequence(
-        video_index=inference_video_index,
-        max_frames=inference_video_max_frames,
-    )
+    gt_sequence = sample_dataset_sequence(debug_dataset)
+    if gt_sequence is not None:
+        gt_sequence = gt_sequence[:inference_video_max_frames]
+    else:
+        gt_sequence = eval_dataset.get_video_sequence(
+            video_index=inference_video_index,
+            max_frames=inference_video_max_frames,
+        )
     if gt_sequence.shape[0] < 2:
         raise RuntimeError(
             "Need at least 2 frames in the evaluation video sequence for rollout."
@@ -899,7 +985,7 @@ def run_inference_and_save(
 
     gt_sequence_display = _to_display_range(gt_sequence)
 
-    with _temporary_eval_mode(lagrangian, state_projector, autoencoder):
+    with _temporary_eval_mode(dynamics_model, state_projector, autoencoder):
         with torch.no_grad():
             seed_frames = gt_sequence[:2].to(device)
             seed_latents = apply_state_representation(
@@ -910,7 +996,8 @@ def run_inference_and_save(
             q_curr_sim = seed_latents[1:2]
 
             rollout_latents = _rollout_latents(
-                lagrangian=lagrangian,
+                dynamics_model=dynamics_model,
+                dynamics_mode=dynamics_mode,
                 q_prev=q_prev_sim,
                 q_curr=q_curr_sim,
                 alpha=solver_alpha,
@@ -923,7 +1010,11 @@ def run_inference_and_save(
                     [q_prev_sim, q_curr_sim, future_latents],
                     dim=0,
                 )
-                energy_metrics = summarize_energy_drift(lagrangian, pred_latent_sequence)
+                energy_metrics = (
+                    summarize_energy_drift(dynamics_model, pred_latent_sequence)
+                    if dynamics_mode == "lagrangian"
+                    else None
+                )
                 decoded_future = autoencoder.decode(future_latents)
                 pred_future_display = _to_display_range(decoded_future)
                 pred_sequence_display = torch.cat(
@@ -932,7 +1023,11 @@ def run_inference_and_save(
                 )
             else:
                 pred_latent_sequence = torch.cat([q_prev_sim, q_curr_sim], dim=0)
-                energy_metrics = summarize_energy_drift(lagrangian, pred_latent_sequence)
+                energy_metrics = (
+                    summarize_energy_drift(dynamics_model, pred_latent_sequence)
+                    if dynamics_mode == "lagrangian"
+                    else None
+                )
                 pred_sequence_display = gt_sequence_display[:2]
     pred_sequence_display = pred_sequence_display[: gt_sequence_display.shape[0]]
     sparse_indices = _uniform_sample_indices(
@@ -1177,7 +1272,7 @@ def main(cfg: DictConfig):
             persistent_workers=val_num_workers > 0,
         )
         log.info(
-            "Using held-out validation split | train triplets: %d | val triplets: %d",
+            "Using held-out validation split | train samples: %d | val samples: %d",
             train_size,
             val_size,
         )
@@ -1287,7 +1382,7 @@ def main(cfg: DictConfig):
     if actual_latent_shape != configured_latent_shape:
         log.warning(
             "Config latent shape %s does not match encoder output %s. "
-            "Using encoder output for the DiT Lagrangian.",
+            "Using encoder output for the selected latent dynamics model.",
             configured_latent_shape,
             actual_latent_shape,
         )
@@ -1326,16 +1421,33 @@ def main(cfg: DictConfig):
                 reconstruction_metrics["mae"]
             )
 
-    lagrangian = DiTLagrangian(
-        latent_channels=actual_latent_shape[0],
-        latent_h=actual_latent_shape[1],
-        latent_w=actual_latent_shape[2],
-        patch_size=cfg.model.patch_size,
-        hidden_size=cfg.model.hidden_size,
-        depth=cfg.model.depth,
-        num_heads=cfg.model.num_heads,
-        action_dim=cfg.model.action_dim,
-    ).to(device)
+    dynamics_mode = str(cfg.model.get("dynamics_model", "lagrangian"))
+    if dynamics_mode == "lagrangian":
+        lagrangian = DiTLagrangian(
+            latent_channels=actual_latent_shape[0],
+            latent_h=actual_latent_shape[1],
+            latent_w=actual_latent_shape[2],
+            patch_size=cfg.model.patch_size,
+            hidden_size=cfg.model.hidden_size,
+            depth=cfg.model.depth,
+            num_heads=cfg.model.num_heads,
+            action_dim=cfg.model.action_dim,
+        ).to(device)
+        lagrangian.set_gradient_checkpointing(False)
+    elif dynamics_mode == "direct_predictor":
+        lagrangian = LatentNextStatePredictor(
+            latent_channels=actual_latent_shape[0],
+            hidden_channels=int(cfg.model.get("predictor_hidden_channels", 256)),
+            num_blocks=int(cfg.model.get("predictor_num_blocks", 4)),
+        ).to(device)
+    else:
+        raise ValueError(
+            "Unsupported model.dynamics_model='{}'. Use 'lagrangian' or 'direct_predictor'.".format(
+                dynamics_mode
+            )
+        )
+    if dynamics_mode == "direct_predictor" and not sequence_mode:
+        raise ValueError("model.dynamics_model=direct_predictor currently requires sequence training mode.")
 
     lambda_del = float(cfg.training.get("lambda_del", 1.0))
     lambda_solver_mse = float(cfg.training.get("lambda_solver_mse", 0.0))
@@ -1349,17 +1461,23 @@ def main(cfg: DictConfig):
             "while rollout videos remain poor. Use training.lambda_solver_mse>0 for any run where next-frame "
             "or rollout quality matters. When this term is disabled, the logged solver_mse will stay at 0 by design."
         )
-
-    requested_gradient_checkpointing = bool(
-        cfg.training.get("gradient_checkpointing", False)
-    )
-    if requested_gradient_checkpointing and (lambda_del > 0.0 or lambda_solver_mse > 0.0):
+    if dynamics_mode == "direct_predictor" and lambda_del > 0.0:
         log.warning(
-            "Disabling gradient checkpointing because DEL/solver training uses "
-            "higher-order autograd. Re-enable only for first-order ablations."
+            "model.dynamics_model=direct_predictor ignores the DEL loss. "
+            "Set training.lambda_del=0 for cleaner logs."
         )
-        requested_gradient_checkpointing = False
-    lagrangian.set_gradient_checkpointing(requested_gradient_checkpointing)
+
+    if dynamics_mode == "lagrangian":
+        requested_gradient_checkpointing = bool(
+            cfg.training.get("gradient_checkpointing", False)
+        )
+        if requested_gradient_checkpointing and (lambda_del > 0.0 or lambda_solver_mse > 0.0):
+            log.warning(
+                "Disabling gradient checkpointing because DEL/solver training uses "
+                "higher-order autograd. Re-enable only for first-order ablations."
+            )
+            requested_gradient_checkpointing = False
+        lagrangian.set_gradient_checkpointing(requested_gradient_checkpointing)
 
     trainable_parameters = list(lagrangian.parameters())
     if autoencoder_trainable:
@@ -1425,8 +1543,11 @@ def main(cfg: DictConfig):
             "Periodic inference is disabled because training.inference_every=0, "
             "but final inference artifacts remain enabled via training.save_final_inference=true."
         )
+    use_scheduler = bool(cfg.training.get("use_scheduler", True))
     warmup_start_factor = 0.1
-    if warmup_epochs == 0:
+    if not use_scheduler:
+        scheduler = None
+    elif warmup_epochs == 0:
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max=max(total_epochs, 1),
@@ -1596,22 +1717,38 @@ def main(cfg: DictConfig):
                         else:
                             loss_recon_tensor = q_sequence.new_zeros(())
 
-                        loss_anchor_tensor, loss_solver_tensor, loss_del_tensor, loss_pred_recon_tensor = compute_batched_sequence_losses(
-                            lagrangian=lagrangian,
-                            q_sequence=q_sequence,
-                            alpha=solver_alpha,
-                            solver_steps=training_solver_steps,
-                            detach_between_steps=autoregressive_detach_between_steps,
-                            autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
-                            target_frames=frames if lambda_pred_recon > 0.0 else None,
-                            enable_decode_grad=True,
-                        )
+                        if dynamics_mode == "lagrangian":
+                            loss_anchor_tensor, loss_solver_tensor, loss_del_tensor, loss_pred_recon_tensor = compute_batched_sequence_losses(
+                                lagrangian=lagrangian,
+                                q_sequence=q_sequence,
+                                alpha=solver_alpha,
+                                solver_steps=training_solver_steps,
+                                detach_between_steps=autoregressive_detach_between_steps,
+                                autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
+                                target_frames=frames if lambda_pred_recon > 0.0 else None,
+                                enable_decode_grad=True,
+                            )
+                        else:
+                            (
+                                loss_anchor_tensor,
+                                teacher_loss_tensor,
+                                rollout_loss_tensor,
+                                loss_pred_recon_tensor,
+                            ) = compute_direct_predictor_sequence_losses(
+                                predictor=lagrangian,
+                                q_sequence=q_sequence,
+                                autoencoder=autoencoder if lambda_pred_recon > 0.0 else None,
+                                target_frames=frames if lambda_pred_recon > 0.0 else None,
+                                enable_decode_grad=True,
+                            )
+                            loss_solver_tensor = 0.5 * (teacher_loss_tensor + rollout_loss_tensor)
+                            loss_del_tensor = q_sequence.new_zeros(())
                         loss_sigreg_tensor = lambda_sigreg * compute_sigreg_loss(
                             sigreg,
                             q_sequence.transpose(0, 1),
                         )
                         loss_total_tensor = (
-                            lambda_del * loss_del_tensor
+                            (0.0 if dynamics_mode == "direct_predictor" else lambda_del) * loss_del_tensor
                             + lambda_solver_mse * loss_solver_tensor
                             + lambda_recon * loss_recon_tensor
                             + lambda_pred_recon * loss_pred_recon_tensor
@@ -1620,7 +1757,8 @@ def main(cfg: DictConfig):
                         loss_total_tensor.backward()
 
                         if (
-                            diagnostics_every > 0
+                            dynamics_mode == "lagrangian"
+                            and diagnostics_every > 0
                             and batch_idx % diagnostics_every == 0
                         ):
                             component_stats = summarize_lagrangian_components(
@@ -1720,25 +1858,8 @@ def main(cfg: DictConfig):
                                 q_next_true_mb,
                             )
 
-                            if lambda_solver_mse > 0.0:
-                                q_next_pred = training_dynamic_step(
-                                    lagrangian=lagrangian,
-                                    q_prev=q_prev_mb,
-                                    q_curr=q_curr_mb,
-                                    alpha=solver_alpha,
-                                    solver_steps=training_solver_steps,
-                                    detach_inputs=True,
-                                )
-                                loss_solver_mse_mb = F.mse_loss(
-                                    q_next_pred,
-                                    q_next_true_mb,
-                                )
-                            else:
-                                q_next_pred = None
-                                loss_solver_mse_mb = q_prev_mb.new_zeros(())
-
-                            if lambda_pred_recon > 0.0:
-                                if q_next_pred is None:
+                            if dynamics_mode == "lagrangian":
+                                if lambda_solver_mse > 0.0:
                                     q_next_pred = training_dynamic_step(
                                         lagrangian=lagrangian,
                                         q_prev=q_prev_mb,
@@ -1747,26 +1868,56 @@ def main(cfg: DictConfig):
                                         solver_steps=training_solver_steps,
                                         detach_inputs=True,
                                     )
-                                loss_pred_recon_mb = F.mse_loss(
-                                    decode_latent(autoencoder, q_next_pred, enable_grad=True),
-                                    o_next_true[start_idx:end_idx],
-                                )
-                            else:
-                                loss_pred_recon_mb = q_prev_mb.new_zeros(())
+                                    loss_solver_mse_mb = F.mse_loss(
+                                        q_next_pred,
+                                        q_next_true_mb,
+                                    )
+                                else:
+                                    q_next_pred = None
+                                    loss_solver_mse_mb = q_prev_mb.new_zeros(())
 
-                            residual_true_mb = calculate_del_residual(
-                                lagrangian=lagrangian,
-                                q_prev=q_prev_mb,
-                                q_curr=q_curr_mb,
-                                q_next=q_next_true_mb,
-                            )
-                            loss_DEL_mb = residual_true_mb.pow(2).mean()
+                                if lambda_pred_recon > 0.0:
+                                    if q_next_pred is None:
+                                        q_next_pred = training_dynamic_step(
+                                            lagrangian=lagrangian,
+                                            q_prev=q_prev_mb,
+                                            q_curr=q_curr_mb,
+                                            alpha=solver_alpha,
+                                            solver_steps=training_solver_steps,
+                                            detach_inputs=True,
+                                        )
+                                    loss_pred_recon_mb = F.mse_loss(
+                                        decode_latent(autoencoder, q_next_pred, enable_grad=True),
+                                        o_next_true[start_idx:end_idx],
+                                    )
+                                else:
+                                    loss_pred_recon_mb = q_prev_mb.new_zeros(())
+
+                                residual_true_mb = calculate_del_residual(
+                                    lagrangian=lagrangian,
+                                    q_prev=q_prev_mb,
+                                    q_curr=q_curr_mb,
+                                    q_next=q_next_true_mb,
+                                )
+                                loss_DEL_mb = residual_true_mb.pow(2).mean()
+                            else:
+                                q_next_pred = lagrangian(q_prev_mb, q_curr_mb)
+                                loss_solver_mse_mb = F.mse_loss(q_next_pred, q_next_true_mb)
+                                loss_pred_recon_mb = (
+                                    q_prev_mb.new_zeros(())
+                                    if lambda_pred_recon <= 0.0
+                                    else F.mse_loss(
+                                        decode_latent(autoencoder, q_next_pred, enable_grad=True),
+                                        o_next_true[start_idx:end_idx],
+                                    )
+                                )
+                                loss_DEL_mb = q_prev_mb.new_zeros(())
                             loss_sigreg_mb = lambda_sigreg * compute_sigreg_loss(
                                 sigreg,
                                 torch.stack([q_prev_mb, q_curr_mb, q_next_true_mb], dim=0),
                             )
                             total_loss_mb = (
-                                lambda_del * loss_DEL_mb
+                                (0.0 if dynamics_mode == "direct_predictor" else lambda_del) * loss_DEL_mb
                                 + lambda_solver_mse * loss_solver_mse_mb
                                 + lambda_recon * loss_recon_mb
                                 + lambda_pred_recon * loss_pred_recon_mb
@@ -1787,7 +1938,8 @@ def main(cfg: DictConfig):
                             batch_total_sum += total_loss_mb.item() * q_prev_mb.shape[0]
 
                             if (
-                                diagnostics_every > 0
+                                dynamics_mode == "lagrangian"
+                                and diagnostics_every > 0
                                 and batch_idx % diagnostics_every == 0
                                 and start_idx == 0
                             ):
@@ -1903,7 +2055,8 @@ def main(cfg: DictConfig):
                         and last_validation_step != global_step
                     ):
                         val_metrics = evaluate_validation(
-                            lagrangian=lagrangian,
+                            dynamics_model=lagrangian,
+                            dynamics_mode=dynamics_mode,
                             state_projector=state_projector,
                             autoencoder=autoencoder,
                             val_loader=val_loader,
@@ -1957,9 +2110,11 @@ def main(cfg: DictConfig):
                         and global_step % inference_every_steps == 0
                     ):
                         run_inference_and_save(
-                            lagrangian=lagrangian,
+                            dynamics_model=lagrangian,
+                            dynamics_mode=dynamics_mode,
                             state_projector=state_projector,
                             autoencoder=autoencoder,
+                            debug_dataset=dataset,
                             eval_dataset=eval_dataset,
                             epoch=epoch,
                             cfg=cfg,
@@ -2077,7 +2232,8 @@ def main(cfg: DictConfig):
                 and last_validation_step != global_step
             ):
                 val_metrics = evaluate_validation(
-                    lagrangian=lagrangian,
+                    dynamics_model=lagrangian,
+                    dynamics_mode=dynamics_mode,
                     state_projector=state_projector,
                     autoencoder=autoencoder,
                     val_loader=val_loader,
@@ -2140,7 +2296,8 @@ def main(cfg: DictConfig):
                 )
                 log.info("Saved checkpoint to %s", checkpoint_path)
 
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
 
             if (
                 save_inference_visuals
@@ -2148,9 +2305,11 @@ def main(cfg: DictConfig):
                 and epoch % inference_every == 0
             ):
                 run_inference_and_save(
-                    lagrangian=lagrangian,
+                    dynamics_model=lagrangian,
+                    dynamics_mode=dynamics_mode,
                     state_projector=state_projector,
                     autoencoder=autoencoder,
+                    debug_dataset=dataset,
                     eval_dataset=eval_dataset,
                     epoch=epoch,
                     cfg=cfg,
@@ -2171,9 +2330,11 @@ def main(cfg: DictConfig):
                 inference_dir,
             )
             run_inference_and_save(
-                lagrangian=lagrangian,
+                dynamics_model=lagrangian,
+                dynamics_mode=dynamics_mode,
                 state_projector=state_projector,
                 autoencoder=autoencoder,
+                debug_dataset=dataset,
                 eval_dataset=eval_dataset,
                 epoch=cfg.training.epochs,
                 cfg=cfg,
