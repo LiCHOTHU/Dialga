@@ -2,185 +2,217 @@
 
 Discrete Integration And Lagrangian Generative Architecture.
 
-## What Problem This Repo Solves
+## Problem
 
-The repository studies how to learn dynamics from video with an explicit physics bias instead of treating next-frame prediction as a generic black-box visual mapping.
-
-The core question is:
+This repo studies a simple question:
 
 - can we learn a latent state from CLEVRER videos,
-- fit a discrete Lagrangian on that state,
-- and use the resulting discrete Euler-Lagrange structure to improve rollout behavior and physical consistency?
+- predict its future evolution,
+- and then test whether adding Lagrangian structure improves prediction quality?
 
-The code currently has two related pipelines:
+The important lesson from the current code and experiments is that these are really **two separate goals**:
 
-1. A latent-video pipeline in `train.py`.
-   This is the main path for learning on CLEVRER video triplets with a frozen WAN VAE encoder, a learnable latent Lagrangian, optional DEL solver supervision, and an optional LeWM-style `SIGReg` state-regularization path.
-2. An object-state pipeline in `scripts/train_dynamics.py`.
-   This trains directly on CLEVRER annotation trajectories using object positions, velocities, and attributes.
+1. learn a latent video dynamics model that actually predicts future frames,
+2. test whether Lagrangian structure helps once the latent representation is already usable.
 
-## What The Code Currently Does
+The repo now reflects that split.
 
-### Latent-video pipeline
+## Current Status
 
-The latent path uses:
+The latent-video path is the main active path.
 
-- `src/model/autoencoder.py`: a frozen WAN VAE encoder/decoder wrapper
-- `src/model/lagrangian_net.py`: a DiT-style discrete Lagrangian network over latent states
-- `src/model/state_representation.py`: an optional residual state projector plus `SIGReg`
-- `train.py`: training, validation, inference video export, WandB logging, and checkpointing
+Current findings from the finished runs:
 
-The input data is CLEVRER frame triplets `(o_{t-1}, o_t, o_{t+1})` loaded from raw `.mp4` files or extracted frame folders via `src/data/clevrer_dataset.py`.
+- Best overall predictor so far: `lewm_patch + direct_predictor + identity`
+- Best structured model so far: `lewm_patch + lagrangian + identity`
+- `wan_vae` is now treated as an ablation path rather than the main direction.
+- `SIGReg` is implemented correctly, but it is not currently the main source of improvement.
 
-### Object-state pipeline
+So the practical recommendation is:
 
-The object-state path uses:
+- use `direct_predictor` for debugging and overfitting checks,
+- use `lagrangian` when testing whether structure helps,
+- keep `lewm_patch` as the main encoder,
+- keep `identity` as the default representation.
 
-- `src/data/clevrer_states.py`: CLEVRER annotation loader
-- `src/dynamics/lagrangian.py`: object-wise Lagrangian with learned masses and potentials
-- `src/dynamics/integrator.py`: leapfrog integrator
-- `scripts/train_dynamics.py`: rollout-MSE training on annotation trajectories
-- `scripts/eval_rollout.py`: checkpoint evaluation
+## Main Pipelines
 
-This path is useful when you want to debug the mechanics directly in state space without the difficulty of image encoding.
+### 1. Latent-video pipeline
 
-## Math Behind The Current Code
+Main file:
 
-### 1. Frozen video encoder and optional state representation
+- `train.py`
 
-The latent trainer first encodes each frame with a frozen WAN VAE:
+Main components:
+
+- `src/model/lewm_autoencoder.py`
+  - learned patch-based encoder/decoder
+- `src/model/direct_predictor.py`
+  - simple residual next-latent predictor
+- `src/model/lagrangian_net.py`
+  - structured latent Lagrangian model
+- `src/model/state_representation.py`
+  - optional residual projector + `SIGReg`
+- `src/data/clevrer_sequence.py`
+  - short contiguous video-window dataset
+
+### 2. Object-state pipeline
+
+Files:
+
+- `scripts/train_dynamics.py`
+- `scripts/eval_rollout.py`
+- `src/data/clevrer_states.py`
+- `src/dynamics/`
+
+This is still the cleaner physics path conceptually, but it depends on CLEVRER annotations being available locally.
+
+## Current Model Options
+
+### Encoder (`model.latent_source`)
+
+- `lewm_patch`
+  - recommended main encoder now
+- `wan_vae`
+  - frozen WAN VAE ablation
+- `dino_vits14`
+  - experimental frozen DINOv2 path
+
+### Dynamics model (`model.dynamics_model`)
+
+- `direct_predictor`
+  - recommended simplest baseline
+- `lagrangian`
+  - structured model to test whether the Lagrangian inductive bias helps
+
+### Representation (`model.representation`)
+
+- `identity`
+  - recommended default
+- `projected_sigreg`
+  - optional trainable residual projection regularized by `SIGReg`
+
+`identity` means the encoder output is used directly as the latent state.
+
+## Math
+
+### Latent state
+
+For an observation frame `o_t`, the encoder produces a latent map:
 
 $$
-\tilde{q}_t = E_{\text{WAN}}(o_t)
+z_t = E(o_t)
 $$
 
-By default, the state is just the frozen latent:
+If `representation=identity`, then
 
 $$
-q_t = \tilde{q}_t
+q_t = z_t
 $$
 
-If `model.representation=wan_projected_sigreg`, the code inserts a trainable residual projector:
+If `representation=projected_sigreg`, then
 
 $$
-q_t = S_\psi(\tilde{q}_t) = \tilde{q}_t + r_\psi(\tilde{q}_t)
+q_t = S_\psi(z_t) = z_t + r_\psi(z_t)
 $$
 
-where `r_psi` is a small 1x1-conv residual adapter initialized to zero, so training starts from the baseline identity mapping.
+where `r_psi` is a small residual adapter.
 
-### 2. Discrete Lagrangian model in latent space
+### Direct predictor
 
-The main model in `src/model/lagrangian_net.py` learns a discrete Lagrangian between adjacent latent states:
+The simplest predictor learns:
+
+$$
+\hat q_{t+1} = P_\phi(q_{t-1}, q_t)
+$$
+
+Its training objective is dominated by predictive losses:
+
+$$
+\mathcal{L}_{\text{pred}} = \|\hat q_{t+1} - q_{t+1}\|_2^2
+$$
+
+and a decoded image-space prediction term:
+
+$$
+\mathcal{L}_{\text{pred-recon}} = \|D(\hat q_{t+1}) - o_{t+1}\|_2^2
+$$
+
+If the encoder is trainable, we also use a standard reconstruction term:
+
+$$
+\mathcal{L}_{\text{recon}} = \|D(q_t) - o_t\|_2^2
+$$
+
+### Lagrangian model
+
+The structured latent model learns a discrete Lagrangian between adjacent latent states:
 
 $$
 L_\theta(q_{t-1}, q_t) = T_\theta(q_t - q_{t-1}) - V_\theta\left(\frac{q_{t-1}+q_t}{2}\right)
 $$
 
-Internally, the code:
+The current head predicts:
 
-- embeds the midpoint latent with a patch embedding,
-- runs a small transformer,
-- predicts a positive scalar mass from the CLS token,
-- predicts patch-wise potentials from patch tokens,
-- forms kinetic, potential, and mechanical energy.
+- one positive scalar mass from the CLS token,
+- additive patch-wise potential over midpoint features.
 
-### 3. Discrete Euler-Lagrange residual
-
-Training uses the discrete Euler-Lagrange residual over latent triples:
+The discrete Euler-Lagrange residual is:
 
 $$
-R_\theta(q_{t-1}, q_t, q_{t+1})
-= D_2 L_\theta(q_{t-1}, q_t) + D_1 L_\theta(q_t, q_{t+1})
+R_\theta(q_{t-1}, q_t, q_{t+1}) = D_2 L_\theta(q_{t-1}, q_t) + D_1 L_\theta(q_t, q_{t+1})
 $$
 
-In the code this is computed by autograd in `calculate_del_residual()`.
-
-The main DEL loss is:
+and the DEL regularizer is:
 
 $$
 \mathcal{L}_{\text{DEL}} = \|R_\theta(q_{t-1}, q_t, q_{t+1})\|_2^2
 $$
 
-### 4. Optional solver-rollout supervision
+In the current practical setup, DEL is used as a **weak structural regularizer**, not the main learning signal.
 
-`train.py` also has an optional differentiable solver update that iteratively adjusts a candidate `q_{t+1}` by descending the squared DEL residual energy. If enabled, it adds a rollout supervision term:
+### Total latent objective
 
-$$
-\mathcal{L}_{\text{solver}} = \|\hat{q}_{t+1} - q_{t+1}\|_2^2
-$$
-
-where `hat{q}_{t+1}` is the solver-refined next latent.
-
-### 5. Optional LeWM-style `SIGReg`
-
-If `training.lambda_sigreg > 0`, the code regularizes the projected latent state with `SIGReg`:
+The current trainer uses some subset of:
 
 $$
-\operatorname{SIGReg}(Z) = \frac{1}{M}\sum_{m=1}^{M} T(Zu^{(m)})
+\mathcal{L} =
+\lambda_{\text{solver}}\mathcal{L}_{\text{pred}} +
+\lambda_{\text{pred-recon}}\mathcal{L}_{\text{pred-recon}} +
+\lambda_{\text{recon}}\mathcal{L}_{\text{recon}} +
+\lambda_{\text{DEL}}\mathcal{L}_{\text{DEL}} +
+\lambda_{\text{sigreg}}\operatorname{SIGReg}(Z)
 $$
 
-where:
+where `SIGReg` is the isotropy / anti-degeneracy regularizer on random 1D latent projections.
 
-- `Z` is a time/batch stack of flattened latent states,
-- `u^{(m)}` are random unit directions,
-- `T` is the Epps-Pulley normality statistic used in the LeWM codebase.
+## Recommended Settings
 
-This encourages the learned state representation to stay diverse and approximately Gaussian across random 1D projections.
+### Recommended debug baseline
 
-### 6. Total latent training objective
+Use this when asking: “can the latent stack predict future frames at all?”
 
-The current `train.py` objective is:
+- `model.latent_source=lewm_patch`
+- `model.dynamics_model=direct_predictor`
+- `model.representation=identity`
 
-$$
-\mathcal{L}
-= \lambda_{\text{DEL}}\,\mathcal{L}_{\text{DEL}}
-+ \lambda_{\text{solver}}\,\mathcal{L}_{\text{solver}}
-+ \lambda_{\text{sigreg}}\,\operatorname{SIGReg}(Z)
-$$
+### Recommended structured experiment
 
-The code also logs a constant-velocity anchor error
+Use this when asking: “does Lagrangian structure help compared with the direct predictor?”
 
-$$
-\mathcal{L}_{\text{anchor}} = \|2q_t - q_{t-1} - q_{t+1}\|_2^2
-$$
+- `model.latent_source=lewm_patch`
+- `model.dynamics_model=lagrangian`
+- `model.representation=identity`
 
-but that anchor term is diagnostic only and is not directly optimized.
+### WAN path
 
-### 7. Object-state Lagrangian
-
-The object-state path in `src/dynamics/lagrangian.py` uses explicit object positions `q`, velocities `q_dot`, attributes, and masks. Its learned Lagrangian is:
-
-$$
-L(q, \dot{q}) = T(q, \dot{q}) - V_{\text{ext}}(q) - V_{\text{pair}}(q)
-$$
-
-with:
-
-- learned positive masses from object attributes,
-- external per-object potential,
-- pairwise interaction potential,
-- leapfrog rollout for simulation,
-- rollout position MSE as the main training loss.
-
-## Repository Layout
-
-```text
-train.py                      # main latent-video trainer
-scripts/train_dialga.sbatch   # Slurm launcher for train.py
-scripts/overfit_video.py      # single-video latent overfit sanity check
-scripts/train_dynamics.py     # object-state trainer
-scripts/eval_rollout.py       # object-state evaluator
-src/model/                    # WAN encoder, latent Lagrangian, state projector
-src/dynamics/                 # object-state dynamics modules
-src/data/                     # CLEVRER video and annotation loaders
-tests/                        # unit tests for integrator / Lagrangian code
-```
+Treat `wan_vae` as an ablation. It is still usable, but it is no longer the main recommended encoder.
 
 ## Setup
 
 ### Environment
 
-This repo assumes a Python environment with at least:
+The repo expects at least:
 
 - `torch`
 - `torchvision`
@@ -188,11 +220,12 @@ This repo assumes a Python environment with at least:
 - `omegaconf`
 - `wandb`
 - `imageio`
-- `pytest`
+- `timm`
+- `transformers`
 
-The latent-video path also requires the WAN VAE import from `actaim`.
+If you want to run the WAN VAE path, `src/model/autoencoder.py` expects the WAN VAE import from `actaim`.
 
-`src/model/autoencoder.py` looks for a sibling workspace:
+It looks for a sibling workspace:
 
 ```text
 ../ActAIM3
@@ -204,217 +237,164 @@ and imports:
 from actaim.models.wan.vae.vae2_2 import Wan2_2_VAE
 ```
 
-So either:
+### Data
 
-1. keep `ActAIM3` next to this repo, or
-2. install `actaim` in the active environment.
-
-### CLEVRER data
-
-The default video path in the latent trainer is:
+Default CLEVRER video path:
 
 ```text
 /storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/train_video
 ```
 
-The object-state pipeline expects CLEVRER annotations under:
-
-```text
-$SCRATCH/Dialga/CLEVRER/annotations
-```
-
-You can override both through Hydra or script arguments.
-
-### WAN VAE checkpoint
-
-The default WAN checkpoint path is:
-
-```text
-/storage/cedar/cedar0/cedarp-agarg35-0/liquan.w/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
-```
-
-Override it with `model.vae_ckpt=...` or `--vae-ckpt ...`.
+Object-state experiments additionally require CLEVRER annotation JSON files.
 
 ## Running The Code
 
-### 1. Single-video overfit sanity check
+### 1. Overfit sanity check on a very small set
 
-This is the fastest way to verify that the frozen WAN VAE latents are learnable at all.
-
-```bash
-python scripts/overfit_video.py \
-  --video-index 0 \
-  --epochs 200 \
-  --output-dir output/video_overfit_00000
-```
-
-Outputs include:
-
-- checkpoints
-- `comparison.png`
-- rollout `.mp4` or `.gif`
-- `final_metrics.json`
-
-### 2. Latent-video training locally
-
-Baseline frozen latent representation:
+Recommended first check:
 
 ```bash
 python train.py \
-  hydra.run.dir=output/local-frz \
-  wandb.enabled=true \
-  model.representation=wan_frozen \
-  training.lambda_del=1.0 \
-  training.lambda_solver_mse=0.0 \
-  training.lambda_sigreg=0.0
+  hydra.run.dir=output/overfit2_direct_local \
+  wandb.enabled=false \
+  training.device=cuda \
+  training.epochs=120 \
+  training.lr=0.0005 \
+  training.lr_warmup_epochs=0 \
+  training.use_scheduler=false \
+  training.sequence_window_length=6 \
+  training.sequence_windows_per_video=1 \
+  training.sequence_max_videos=2 \
+  training.train_subset_size=2 \
+  training.val_fraction=0.0 \
+  training.batch_size=1 \
+  training.num_workers=0 \
+  training.log_interval=5 \
+  training.inference_every=5 \
+  training.inference_every_steps=0 \
+  model.latent_source=wan_vae \
+  model.dynamics_model=direct_predictor \
+  model.representation=identity \
+  training.lambda_del=0.0 \
+  training.lambda_solver_mse=1.0 \
+  training.lambda_pred_recon=5.0
 ```
 
-LeWM-style representation with `SIGReg`:
+This saves to:
+
+```text
+output/overfit2_direct_local/
+```
+
+### 2. Main LeWM direct baseline
 
 ```bash
 python train.py \
-  hydra.run.dir=output/local-sigreg \
-  wandb.enabled=true \
-  model.representation=wan_projected_sigreg \
-  training.lambda_del=1.0 \
-  training.lambda_solver_mse=0.0 \
-  training.lambda_sigreg=0.01 \
-  training.sigreg_num_proj=256
+  hydra.run.dir=output/lewm_direct \
+  model.latent_source=lewm_patch \
+  model.dynamics_model=direct_predictor \
+  model.representation=identity \
+  training.lambda_del=0.0 \
+  training.lambda_solver_mse=1.0 \
+  training.lambda_recon=1.0 \
+  training.lambda_pred_recon=5.0
 ```
 
-Projector ablation without `SIGReg`:
+### 3. Main LeWM Lagrangian experiment
 
 ```bash
 python train.py \
-  hydra.run.dir=output/local-proj \
-  wandb.enabled=true \
-  model.representation=wan_projected_sigreg \
-  training.lambda_del=1.0 \
-  training.lambda_solver_mse=0.0 \
-  training.lambda_sigreg=0.0
+  hydra.run.dir=output/lewm_lagrangian \
+  model.latent_source=lewm_patch \
+  model.dynamics_model=lagrangian \
+  model.representation=identity \
+  training.lambda_del=0.1 \
+  training.lambda_solver_mse=1.0 \
+  training.lambda_recon=1.0 \
+  training.lambda_pred_recon=5.0
 ```
 
-Hybrid training with solver supervision:
+### 4. Slurm launch
+
+Generic launcher:
 
 ```bash
-python train.py \
-  hydra.run.dir=output/local-hyb \
-  wandb.enabled=true \
-  model.representation=wan_frozen \
-  training.lambda_del=1.0 \
-  training.lambda_solver_mse=0.1 \
-  training.lambda_sigreg=0.0
-```
-
-### 3. Latent-video training on Slurm
-
-The repo includes `scripts/train_dialga.sbatch`.
-
-Example baseline launch:
-
-```bash
-sbatch --job-name="frzdel" scripts/train_dialga.sbatch \
+sbatch --job-name="lewm" scripts/train_dialga.sbatch \
   'hydra.run.dir=output/${oc.env:SLURM_JOB_NAME}-${oc.env:SLURM_JOB_ID}' \
-  "model.representation=wan_frozen" \
-  "training.lambda_del=1.0" \
-  "training.lambda_solver_mse=0.0" \
-  "training.lambda_sigreg=0.0" \
-  "wandb.group=repr-key" \
-  "wandb.name=repr-frz-del-e1"
+  "model.latent_source=lewm_patch" \
+  "model.dynamics_model=direct_predictor" \
+  "model.representation=identity" \
+  "wandb.name=lewm-direct"
 ```
 
-Example `SIGReg` launch:
+The repo intentionally keeps only the generic launcher now. One-off experiment-specific Slurm scripts were removed to keep the repo smaller and easier to maintain.
 
-```bash
-sbatch --job-name="sg010d" scripts/train_dialga.sbatch \
-  'hydra.run.dir=output/${oc.env:SLURM_JOB_NAME}-${oc.env:SLURM_JOB_ID}' \
-  "model.representation=wan_projected_sigreg" \
-  "training.lambda_del=1.0" \
-  "training.lambda_solver_mse=0.0" \
-  "training.lambda_sigreg=0.01" \
-  "training.sigreg_num_proj=256" \
-  "wandb.group=repr-key" \
-  "wandb.name=repr-sg010-del-e1"
-```
+### 5. Object-state path
 
-### 4. Object-state training
-
-Train the annotation-based object-state model:
+Train:
 
 ```bash
 python scripts/train_dynamics.py
 ```
 
-Useful overrides:
-
-```bash
-python scripts/train_dynamics.py \
-  dataset.annotation_dir=/path/to/annotations \
-  dataset.video_dir=/path/to/train_video \
-  training.epochs=50 \
-  training.batch_size=8
-```
-
-Evaluate an object-state checkpoint:
+Evaluate:
 
 ```bash
 python scripts/eval_rollout.py \
   evaluation.checkpoint_path=/path/to/checkpoint.pt
 ```
 
-## Outputs And Logging
-
-### Latent-video path
+## Outputs
 
 Each latent run writes to its Hydra output directory, typically under `output/...`.
 
-You should expect:
+Expected contents:
 
 - `checkpoints/`
 - `inference/`
 - `.hydra/`
-- WandB run files if `wandb.enabled=true`
+- WandB run files
 
-During long runs, `train.py` now logs:
+Important logged metrics:
 
-- step-level `train_step/*`
-- running `train_running/*`
-- epoch-level `train/*`
-- periodic `val/*`
+- `train/total`
+- `train/solver_mse`
+- `train/recon`
+- `train/pred_recon`
+- `val/total`
+- `val/solver_mse`
+- `val/recon`
+- `val/pred_recon`
+
+Important media keys in WandB:
+
 - `media/predicted_comparison`
 - `media/predicted_rollout`
 
-Inference media is saved locally and also sent to WandB.
-
-### Object-state path
-
-The object-state trainer writes Hydra outputs and checkpoints under:
-
-```text
-$SCRATCH/Dialga/runs/object_dynamics/...
-```
-
-## Tests
-
-Run the unit tests with:
-
-```bash
-pytest tests
-```
-
-These cover:
-
-- integrator behavior
-- energy conservation on simple systems
-- permutation behavior of the object-state Lagrangian
-
 ## Current Caveats
 
-- The latent-video path uses a frozen WAN video VAE on single frames. This works in practice, but it is still a compromise.
-- If `model.representation=wan_projected_sigreg`, the inference video is decoded from projected latents, so the reconstruction is approximate and should be treated as a qualitative diagnostic.
-- The object-state pipeline is cleaner physically, but it depends on CLEVRER annotations rather than learning state directly from pixels.
-- `src/perception/sam2_tracker.py` is still a stub; a full perception-to-state-to-render loop is not yet wired end to end.
+- `lewm_patch + direct_predictor` is currently the strongest predictive baseline.
+- `lewm_patch + lagrangian` is the strongest structured model so far, but it still has not clearly beaten the direct predictor on prediction quality.
+- `SIGReg` is currently an ablation, not a recommended default.
+- `wan_vae` is now an ablation path, not the mainline encoder.
+- The object-state pipeline is still the cleaner physics path conceptually, but it requires annotation files that may not be present in every environment.
+- `src/perception/sam2_tracker.py` is still a stub.
+
+## Repo Layout
+
+```text
+train.py                      # main latent-video trainer
+scripts/train_dialga.sbatch   # generic Slurm launcher
+scripts/overfit_video.py      # legacy simple overfit script
+scripts/train_dynamics.py     # object-state trainer
+scripts/eval_rollout.py       # object-state evaluator
+scripts/probe_encoder.py      # probing utility
+src/model/                    # encoders, dynamics models, state projector
+src/data/                     # CLEVRER loaders
+src/dynamics/                 # object-state dynamics modules
+tests/                        # physics/integrator unit tests
+```
 
 ## Citation
 
-If you use this repository, please cite the corresponding work or project notes used in your experiments.
+If you use this repository, please cite the corresponding work or internal project notes that match your experiments.

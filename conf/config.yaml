@@ -19,6 +19,11 @@ model:
   predictor_hidden_channels: 256
   predictor_num_blocks: 4
   input_image_size: 128
+  dino_model_name: "dinov2_vits14"
+  dino_input_size: 126
+  dino_latent_channels: 64
+  dinov2_variant: "dinov2_vits14"
+  dinov2_image_size: 224
   lewm_patch_size: 16
   lewm_embed_dim: 192
   lewm_latent_channels: 48
@@ -71,7 +76,7 @@ training:
   # Practical default after debugging: keep a small DEL term, but let direct prediction dominate.
   lambda_solver_mse: 1.0
   lambda_recon: 0.0
-  lambda_pred_recon: 5.0
+  lambda_pred_recon: 0.0
   lambda_sigreg: 0.0
   sigreg_knots: 17
   sigreg_num_proj: 256

@@ -20,6 +20,8 @@ from src.data.clevrer_dataset import ClevrerTripletDataset
 from src.data.clevrer_sequence import ClevrerSequenceWindowDataset
 from src.model import (
     DiTLagrangian,
+    DinoV2FrozenEncoder,
+    FrozenDINOAutoencoder,
     LatentNextStatePredictor,
     LeWMPatchAutoencoder,
     ResidualStateProjector,
@@ -410,6 +412,41 @@ def summarize_energy_drift(lagrangian, latent_sequence):
     }
 
 
+def compute_latent_velocity(latent_sequence):
+    """Mean absolute step-to-step displacement across the latent sequence.
+
+    latent_sequence: (T, B, C, H, W) or (B, T, C, H, W).
+    Returns a scalar. Trending toward zero means latent is collapsing to static.
+    """
+    with torch.no_grad():
+        if latent_sequence.dim() == 5 and latent_sequence.shape[1] >= 2:
+            # (B, T, C, H, W)
+            diff = (latent_sequence[:, 1:] - latent_sequence[:, :-1]).abs()
+        elif latent_sequence.dim() == 4 and latent_sequence.shape[0] >= 2:
+            # (T, C, H, W) single example
+            diff = (latent_sequence[1:] - latent_sequence[:-1]).abs()
+        else:
+            return None
+        return diff.mean().item()
+
+
+def compute_solver_residual_norm(lagrangian, q_prev, q_curr, q_next_pred):
+    """DEL residual norm evaluated at the solver-predicted next state.
+
+    Large value → solver is not finding the DEL minimum.
+    Near zero with poor rollout → Lagrangian minimum is at the wrong place.
+    """
+    with torch.no_grad():
+        q_curr_probe = q_curr.detach().requires_grad_(True)
+        l_prev = lagrangian(q_prev.detach(), q_curr_probe)
+        d2_prev = torch.autograd.grad(l_prev.sum(), q_curr_probe, create_graph=False)[0]
+        q_curr_probe2 = q_curr.detach().requires_grad_(True)
+        l_curr = lagrangian(q_curr_probe2, q_next_pred.detach())
+        d1_curr = torch.autograd.grad(l_curr.sum(), q_curr_probe2, create_graph=False)[0]
+        residual = d2_prev + d1_curr
+        return residual.norm(dim=list(range(1, residual.dim()))).mean().item()
+
+
 def apply_state_representation(state_projector, latent):
     return latent if state_projector is None else state_projector(latent)
 
@@ -726,6 +763,8 @@ def evaluate_autoencoder_reconstruction(
 ):
     if max_frames <= 0:
         return None
+    if not getattr(autoencoder, "can_decode", True):
+        return None
 
     frames = dataset.get_video_sequence(
         video_index=video_index,
@@ -939,6 +978,9 @@ def run_inference_and_save(
     Saves sparse-sampled GT vs predicted frames plus a side-by-side rollout video.
     """
     if autoencoder is None:
+        return
+    if not getattr(autoencoder, "can_decode", True):
+        log.info("Skipping inference visualization: encoder has no decoder.")
         return
 
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1309,9 +1351,29 @@ def main(cfg: DictConfig):
             mlp_ratio=float(cfg.model.get("lewm_mlp_ratio", 4.0)),
         ).to(device)
         log.info("Using optional LeWM-inspired patch autoencoder backend.")
+    elif latent_source == "dino_vits14":
+        autoencoder = FrozenDINOAutoencoder(
+            model_name=str(cfg.model.get("dino_model_name", "dinov2_vits14")),
+            input_size=int(cfg.model.get("dino_input_size", 126)),
+            latent_channels=int(cfg.model.get("dino_latent_channels", 64)),
+        ).to(device)
+        log.info("Using frozen DINOv2 encoder backend.")
+    elif latent_source == "dinov2":
+        autoencoder = DinoV2FrozenEncoder(
+            variant=str(cfg.model.get("dinov2_variant", "dinov2_vits14")),
+            image_size=int(cfg.model.get("dinov2_image_size", 224)),
+        ).to(device)
+        log.info(
+            "Using DinoV2FrozenEncoder | variant=%s | image_size=%d | embed_dim=%d | grid=%dx%d",
+            cfg.model.get("dinov2_variant", "dinov2_vits14"),
+            cfg.model.get("dinov2_image_size", 224),
+            autoencoder.embed_dim,
+            autoencoder.grid,
+            autoencoder.grid,
+        )
     else:
         raise ValueError(
-            "Unsupported model.latent_source='{}'. Use 'wan_vae' or 'lewm_patch'.".format(
+            "Unsupported model.latent_source='{}'. Use 'wan_vae', 'lewm_patch', 'dino_vits14', or 'dinov2'.".format(
                 latent_source
             )
         )
@@ -1756,20 +1818,42 @@ def main(cfg: DictConfig):
                         )
                         loss_total_tensor.backward()
 
-                        if (
-                            dynamics_mode == "lagrangian"
-                            and diagnostics_every > 0
-                            and batch_idx % diagnostics_every == 0
-                        ):
-                            component_stats = summarize_lagrangian_components(
-                                lagrangian,
-                                q_sequence[:, 0],
-                                q_sequence[:, 1],
-                            )
-                            for key, value in component_stats.items():
-                                epoch_diag_sums[key] = (
-                                    epoch_diag_sums.get(key, 0.0) + value
+                        if diagnostics_every > 0 and batch_idx % diagnostics_every == 0:
+                            lat_vel = compute_latent_velocity(q_sequence)
+                            if lat_vel is not None:
+                                epoch_diag_sums["latent_velocity"] = (
+                                    epoch_diag_sums.get("latent_velocity", 0.0) + lat_vel
                                 )
+
+                            if dynamics_mode == "lagrangian":
+                                component_stats = summarize_lagrangian_components(
+                                    lagrangian,
+                                    q_sequence[:, 0],
+                                    q_sequence[:, 1],
+                                )
+                                for key, value in component_stats.items():
+                                    epoch_diag_sums[key] = (
+                                        epoch_diag_sums.get(key, 0.0) + value
+                                    )
+                                if lambda_solver_mse > 0.0:
+                                    with torch.no_grad():
+                                        q_next_diag = training_dynamic_step(
+                                            lagrangian=lagrangian,
+                                            q_prev=q_sequence[:, 0].detach(),
+                                            q_curr=q_sequence[:, 1].detach(),
+                                            alpha=solver_alpha,
+                                            solver_steps=training_solver_steps,
+                                            detach_inputs=True,
+                                        ).detach()
+                                    solver_resid = compute_solver_residual_norm(
+                                        lagrangian,
+                                        q_sequence[:, 0],
+                                        q_sequence[:, 1],
+                                        q_next_diag,
+                                    )
+                                    epoch_diag_sums["solver_residual_norm"] = (
+                                        epoch_diag_sums.get("solver_residual_norm", 0.0) + solver_resid
+                                    )
                             epoch_diag_count += 1
 
                         loss_anchor_mse = loss_anchor_tensor.item()
@@ -1989,7 +2073,7 @@ def main(cfg: DictConfig):
                     }
                     if lambda_solver_mse > 0.0:
                         postfix["SolverMSE"] = f"{loss_solver_mse:.4f}"
-                    if epoch_diag_count > 0:
+                    if epoch_diag_count > 0 and "mass_mean" in epoch_diag_sums:
                         postfix["Mass"] = (
                             f"{epoch_diag_sums['mass_mean'] / epoch_diag_count:.3f}"
                         )
