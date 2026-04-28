@@ -2,37 +2,13 @@ import torch
 from torch import nn
 
 
-class ResidualStateProjector(nn.Module):
-    """
-    Lightweight trainable adapter on top of frozen VAE latents.
-
-    It is initialized as an exact identity so the baseline behavior is preserved
-    at step 0, while still giving SIGReg trainable parameters to shape.
-    """
-
-    def __init__(self, channels, hidden_channels):
-        super().__init__()
-        self.residual = nn.Sequential(
-            nn.Conv2d(channels, hidden_channels, kernel_size=1),
-            nn.SiLU(),
-            nn.Conv2d(hidden_channels, channels, kernel_size=1),
-        )
-
-        nn.init.zeros_(self.residual[-1].weight)
-        nn.init.zeros_(self.residual[-1].bias)
-
-    def forward(self, x):
-        if x.dim() != 4:
-            raise ValueError(f"Expected latent tensor with shape (B, C, H, W), got {tuple(x.shape)}.")
-        return x + self.residual(x)
-
-
 class SIGReg(nn.Module):
     """
     Sketch Isotropic Gaussian Regularizer.
 
-    Input shape: (T, B, D), where T is time, B is batch, and D is the flattened
-    latent dimensionality.
+    In the current repo it is used only during the state-learning stage to keep
+    the learned latent from becoming low-rank or degenerate while the encoder and
+    dynamics are optimized together.
     """
 
     def __init__(self, knots=17, num_proj=256):
@@ -62,10 +38,7 @@ class SIGReg(nn.Module):
             device=proj.device,
             dtype=proj.dtype,
         )
-        projection_matrix = projection_matrix / projection_matrix.norm(
-            p=2,
-            dim=0,
-        ).clamp_min(1e-8)
+        projection_matrix = projection_matrix / projection_matrix.norm(p=2, dim=0).clamp_min(1e-8)
 
         x_t = (proj @ projection_matrix).unsqueeze(-1) * self.t.to(proj.dtype)
         err = (
@@ -76,4 +49,4 @@ class SIGReg(nn.Module):
         return statistic.mean()
 
 
-__all__ = ["ResidualStateProjector", "SIGReg"]
+__all__ = ["SIGReg"]

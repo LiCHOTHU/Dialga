@@ -1,3 +1,0 @@
-enabled: false
-checkpoint_root: ${oc.env:SCRATCH,/tmp}/Dialga/checkpoints/sam2
-model_id: null

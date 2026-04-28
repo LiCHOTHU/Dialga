@@ -1,7 +1,5 @@
 defaults:
   - dynamics: default
-  - perception: sam2
-  - render: composite
   - _self_
 
 experiment:

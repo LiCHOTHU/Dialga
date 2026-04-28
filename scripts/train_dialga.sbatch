@@ -27,18 +27,12 @@ TRAIN_ARGS=("$@")
 if [[ ${#TRAIN_ARGS[@]} -eq 0 ]]; then
   TRAIN_ARGS=(
     "training.epochs=1"
-    "training.log_interval=200"
+    "training.log_interval=50"
     "training.val_every=1"
-    "training.val_every_steps=1000"
+    "training.val_every_steps=200"
     "training.val_max_batches=8"
     "training.checkpoint_every=1"
-    "training.checkpoint_every_steps=2000"
-    "training.inference_every=1"
-    "training.inference_every_steps=1000"
-    "training.save_inference_images=true"
-    "training.save_inference_video=true"
-    "training.save_final_inference=true"
-    "training.lambda_solver_mse=0.1"
+    "training.lambda_solver_mse=1.0"
   )
 fi
 
