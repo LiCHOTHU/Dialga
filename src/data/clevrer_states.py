@@ -210,7 +210,31 @@ class ClevrerStateDataset(Dataset):
         else:
             mask = slot_mask.view(1, self.max_objects).expand(num_frames, -1)
 
-        return positions, velocities, mask, slot_mask, object_attrs, object_ids
+        # Collision tensor: (num_frames, max_objects) bool — slot i is involved in a
+        # collision at frame f if any annotated collision has frame_id == f and
+        # involves the corresponding object_id.
+        collision_slot = torch.zeros(num_frames, self.max_objects, dtype=torch.bool)
+        # Per-frame pair list (for impulse training); a list of length num_frames,
+        # each entry is a list of (slot_i, slot_j) tuples.
+        collision_pairs_per_frame = [[] for _ in range(num_frames)]
+        for event in annotation.get("collision", []) or []:
+            f = int(event.get("frame_id", -1))
+            if f < 0 or f >= num_frames:
+                continue
+            ids = event.get("object_ids", [])
+            if len(ids) != 2:
+                continue
+            i_id, j_id = int(ids[0]), int(ids[1])
+            if i_id not in object_id_to_slot or j_id not in object_id_to_slot:
+                continue
+            si = object_id_to_slot[i_id]
+            sj = object_id_to_slot[j_id]
+            collision_slot[f, si] = True
+            collision_slot[f, sj] = True
+            collision_pairs_per_frame[f].append((si, sj))
+
+        return (positions, velocities, mask, slot_mask, object_attrs,
+                object_ids, collision_slot, collision_pairs_per_frame)
 
     def _resolve_video_path(self, annotation):
         if self.video_dir is None:
@@ -226,9 +250,17 @@ class ClevrerStateDataset(Dataset):
     def __getitem__(self, index):
         annotation_path, start_idx = self.samples[index]
         annotation = self._load_annotation(str(annotation_path))
-        positions, velocities, mask, slot_mask, object_attrs, object_ids = self._build_scene_tensors(annotation)
+        (positions, velocities, mask, slot_mask, object_attrs, object_ids,
+         collision_slot, collision_pairs_per_frame) = self._build_scene_tensors(annotation)
 
         end_idx = start_idx + self.traj_len
+        # Per-window list of collision pair tuples with frame indices remapped
+        # to be window-local (0..traj_len-1).
+        window_collisions = []
+        for f in range(start_idx, end_idx):
+            for (si, sj) in collision_pairs_per_frame[f]:
+                window_collisions.append((f - start_idx, int(si), int(sj)))
+
         return {
             "positions": positions[start_idx:end_idx],
             "velocities": velocities[start_idx:end_idx],
@@ -236,6 +268,8 @@ class ClevrerStateDataset(Dataset):
             "slot_mask": slot_mask.clone(),
             "object_attrs": object_attrs.clone(),
             "object_ids": object_ids.clone(),
+            "collision_mask": collision_slot[start_idx:end_idx].clone(),  # (W, K) bool
+            "collisions": window_collisions,                              # list[(t, i, j)]
             "scene_index": int(annotation["scene_index"]),
             "video_filename": annotation["video_filename"],
             "video_path": self._resolve_video_path(annotation),

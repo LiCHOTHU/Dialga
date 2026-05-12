@@ -1,0 +1,177 @@
+defaults:
+  - _self_
+
+dataset:
+  data_dir: "/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/train_video"
+  annotation_dir: "/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/annotations"
+  split: "train"
+  video_num_frames: 128
+  image_size: 128
+  max_objects: 8
+  coordinate_mode: "world_xy"
+  pos_normalize: 4.0   # divide GT positions by this so they sit roughly in [-1, 1]
+
+model:
+  encoder_type: "slot"          # only "slot" is supported now
+  patch_size: 16
+  embed_dim: 192
+  encoder_depth: 4
+  num_heads: 6
+  mlp_ratio: 4.0
+  num_state_dims: 2
+  # Per-slot static-identity latent: encoder emits (q, z_static) per frame; we
+  # pool z_static over time → one vector per slot per video and feed it to
+  # AccelNet + decoder *in place of* GT attrs. This is the "implicit identity"
+  # channel — it must learn whatever the dynamics + decoder need (color, shape,
+  # mass-relevant features) for the model to fit pixels and trajectories.
+  d_static: 16
+
+  # Dynamics: AccelNet (direct acceleration prediction) + symplectic Verlet
+  # integration. GNS/MGN-style supervised regression with antisymmetric pairwise
+  # forces (Newton's 3rd law by construction).
+  lagrangian_hidden: 256        # legacy field name; sizes AccelNet's MLP
+  lagrangian_use_pair: true     # legacy field name; enables pairwise forces
+
+  impulse_hidden: 64
+
+  # Event head: per-slot 1D-conv that predicts per-(t, slot) event
+  # probability from (q, z_static). Trained against dilated CLEVRER
+  # GT collision_mask via BCE with pos_weight. Used iff lambda_event > 0.
+  event_hidden: 64
+  event_kernel: 5
+  event_depth: 2
+  # Event-head input mode. "q" feeds only positions; "qva" concats centered
+  # velocity + 2nd-diff so the head doesn't have to learn finite differencing.
+  event_input_mode: "q"
+
+  decoder_hidden: 64
+  decoder_slot_embed: 128
+  decoder_blocks: 3
+  decoder_grid_size: 16
+
+training:
+  batch_size: 8
+  num_workers: 2
+  window_length: 6
+  windows_per_video: 8
+  max_videos: 5                 # 5 videos for overfit
+  seed: 0
+
+  # Periodic checkpointing — saves stage1.pt / stage2.pt every N epochs (rolling)
+  ckpt_every: 10
+
+  # Stage 1: encoder + Lagrangian
+  # 200 epochs is the sweet spot for noise-injected training. Longer training
+  # (v10 = 400 ep) overshoots and destabilizes the autograd-DEL solver.
+  stage1_epochs: 200
+  stage1_lr: 5e-4
+  stage1_weight_decay: 1e-5
+  lambda_state: 1.0             # MSE(encoder pred, GT positions)
+  # Curriculum: linearly anneal lambda_state from its starting value toward
+  # lambda_state_anneal_to over lambda_state_anneal_epochs. Used to escape
+  # the constant-velocity collapse: strong GT-q pull early forces the encoder
+  # to reproduce impulsive collision moments; once 2nd-diff has spikes the
+  # self-event teacher has signal and lambda_state can decay.
+  lambda_state_anneal_to: 1.0   # =lambda_state means no curriculum
+  lambda_state_anneal_epochs: 0
+  lambda_solver: 1.0            # one-step Verlet prediction MSE (AccelNet)
+  lambda_collision: 1.0         # CollisionImpulse v_post MSE on GT events
+
+  # Event-head supervision. Trains EventHead to predict per-(t, slot) event
+  # flags from (encoder q, z_static). pos_weight handles the ~1 % positive-
+  # rate imbalance; label_dilation gives the head slack around the contact.
+  lambda_event: 0.0
+  event_pos_weight: 50.0
+  event_label_dilation: 3
+  # event_supervision:
+  #   "gt"     = BCE against CLEVRER GT collision_mask (CLEVRER-only).
+  #   "self"   = z-score of encoder q's 2nd-diff (latent-space teacher).
+  #              Encoder-controllable: it can smooth its own 2nd-diff to
+  #              zero, killing the teacher signal. Empirically collapses.
+  #   "pixel"  = z-score of pixel 2nd-diff Δ²I per slot. Math-wrong: smooth
+  #              motion gives Δ²I ≈ v²·obj'' which is *not* zero. Kept
+  #              only for reproducing the failed baseline.
+  #   "motion" = z-score of Δ² (motion-centroid). Math-corrected: smooth
+  #              constant-velocity motion → centroid linear in t →
+  #              Δ²centroid ≈ 0. Impulsive collisions → centroid kink →
+  #              spike. Domain-portable AND encoder-uncontrollable.
+  event_supervision: "gt"
+  self_event_z_thresh: 1.5
+  self_event_sharpness: 2.5
+  pixel_event_attention_sigma: 0.15
+  # Motion-centroid teacher: absolute |Δ²c| threshold in normalized [-1,1]
+  # coords. When > 0, replaces per-window z-scoring (which is noise at
+  # window length T=6 → only T-2=4 samples). Smooth motion → |Δ²c|≈0;
+  # collisions → 0.05-0.4. Recommended: 0.03-0.08.
+  motion_abs_thresh: 0.0
+  # Hard-binarize teacher labels at 0.5 (strips soft mid-range mass that
+  # confuses BCE/pos_weight at sparse-label regimes).
+  event_teacher_hard: false
+  # Anchor motion teacher's spatial mask on GT q (not encoder q_pred).
+  # Stabilizes teacher labels across epochs — they no longer drift when
+  # the encoder's q wobbles by a pixel. Encoder is still self-supervised
+  # for inference (predicts its own q). Only the *training signal* uses GT q.
+  motion_teacher_gt_q: false
+  # Pair-augment motion teacher labels: when slot i has |Δ²c| > thresh AND
+  # another slot j is within `motion_pair_augment_distance` of slot i at
+  # frame t, also label (t, j) as positive. Matches collision physics where
+  # one partner has tiny a_mag (heavy/stationary object barely reacting) but
+  # is still a participant. Distance in normalized [-1, 1] q coords.
+  motion_pair_augment_distance: 0.0
+  # Feed GT q (not encoder q_pred) to the EventHead during training. This
+  # decouples head training from encoder convergence: when motion_teacher_gt_q=true,
+  # labels are anchored on GT q, so the head's INPUT must also be GT q for
+  # train/label coherence. At inference, encoder q_pred is fed instead — the
+  # encoder is independently supervised via state_loss to match GT q, so the
+  # train/infer distributions match at convergence.
+  event_head_train_on_gt_q: false
+  # Temporal smoothness on encoder q_pred. Penalizes ||Δ²q_pred||² masked
+  # by visibility triples. Lets the EventHead's Δ²q feature spike only at
+  # real collisions (not per-frame encoder noise). 0 = off.
+  lambda_q_smooth: 0.0
+
+  # Stage-1 pixel reconstruction grounding (replaces / augments GT-q
+  # regression). When > 0, Stage 1 jointly trains the SlotPixelDecoder and
+  # adds an MSE(decode(q_pred, z_static, alpha), GT frame) term. This is
+  # what lets the encoder be grounded WITHOUT GT positions — i.e. the
+  # domain-portable regime. Set lambda_state=0 simultaneously to fully
+  # remove GT-position supervision.
+  lambda_recon_stage1: 0.0
+  # InfoNCE-style slot-discrimination loss on z_static (per-frame vs the
+  # video-pooled identity, temperature 0.1). Prevents all slots from
+  # collapsing to the same identity vector — which lambda_static alone
+  # cannot prevent.
+  lambda_contrastive: 0.0
+  # Static-latent consistency: per-frame z_static must agree with the
+  # video-pooled value (masked by visibility). Without this, z_static can drift
+  # frame-to-frame and lose its "identity" semantics.
+  lambda_static: 0.1
+  # GNS/MGN-style noise injection on dynamics inputs (normalized scale).
+  # σ > 0 prevents exact memorization but provides off-manifold robustness for
+  # generalization-time rollouts. For OVERFIT capability tests we use σ = 0
+  # so the model can fit the training set exactly and prove the architecture
+  # has enough capacity. Re-enable (~5e-3 to 2e-2) once overfit is confirmed.
+  noise_sigma: 0.0
+
+  # Stage 2: decoder
+  stage2_epochs: 100
+  stage2_lr: 5e-4
+  stage2_weight_decay: 1e-5
+  lambda_recon: 1.0
+
+  grad_clip_norm: 1.0
+  log_interval: 5
+  device: "cuda"
+
+  checkpoint_every: 0
+  save_last: true
+
+wandb:
+  enabled: false
+  project: "dialga"
+  entity: null
+  name: null
+  group: null
+  job_type: "train_slot"
+  mode: "online"
+  tags: []

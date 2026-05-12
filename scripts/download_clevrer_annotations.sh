@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Download CLEVRER annotation json files (needed for Experiments 1 and 4).
-# These are ~50 MB total and unzip to per-scene json files with 3D trajectories.
+# ~150 MB zip, unzips to per-scene json files with 3D trajectories.
 set -euo pipefail
 
 ANN_DIR="${ANN_DIR:-/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/annotations}"
@@ -9,7 +9,7 @@ mkdir -p "${ANN_DIR}/train"
 
 echo "[info] Downloading CLEVRER train annotations..."
 wget -c --show-progress \
-  "http://data.csail.mit.edu/clevrer/annotations/annotation_train.zip" \
+  "http://data.csail.mit.edu/clevrer/annotations/train/annotation_train.zip" \
   -P "${ANN_DIR}"
 
 echo "[info] Extracting..."
