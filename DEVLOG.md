@@ -1,6 +1,6 @@
-# DIALGA — Results Log
+# DIALGA — Development Log
 
-Running record of the overfit-ladder experiments on CLEVRER. Each entry is meant to be paper-ready: setup, numbers, artifact paths, dates, and interpretation kept together so claims can be traced back to runs.
+Running record of experiments on CLEVRER (and beyond). Each entry is meant to be paper-ready: setup, numbers, artifact paths, dates, and interpretation kept together so claims can be traced back to runs.
 
 ---
 
@@ -299,6 +299,63 @@ Same checkpoint, same head, same labels — only the inference-time `q` differs.
 
 ---
 
+## Iter 21 (2026-05-14): Full CLEVRER scale — train recipe generalizes
+
+**Goal.** The 500-video Iter 18 model fit the training set well but probed *below chance* on val for color/material/shape — a sign that `z_static` had memorized episode-specific surface features rather than learning a transferable mapping. The hypothesis under test: does scaling 20× (500 → 10,000 videos) close the train/val gap, given the same architecture and objective?
+
+**Architecture (unchanged from Iter 16d/18).**
+- Wan-2.2 VAE frozen (`AutoencoderKLWan`, 705M params, fp16) — encodes 128×128 RGB to (48, 3, 8, 8) latent windows of 12 input frames.
+- TrajectoryEncoder: bidirectional transformer with K=8 slot queries + per-frame slot queries, outputs `(z_static[B,K,16], z_dyn[B,T,K,32], event_logits[B,T,K])`.
+- TrajectoryDecoder: **time-blinded** — no temporal positional embedding on output queries; block-diagonal cross-attention mask gates slot information to its own temporal block. This is what *architecturally* enforces z_dyn motion-exclusivity (verified by counterfactual: freezing z_dyn → 0.000000 latent variation).
+- α visibility: cumsum over softmax-normalized event_logits (`use_null=False`).
+- 4.24M trainable params (enc 1.82M, dec 2.42M, pred 0K).
+
+**Recipe.** Mirrors Iter 18 winning config:
+- 10,000 train videos × 4 windows = 40,000 windows, 80/20 split by *video_id* (8,000 train / 2,000 val videos = 32,000 / 8,000 windows).
+- batch=4, num_workers=0, lr=5e-4 cosine→0, weight_decay=1e-3, dropout=0.1, 60 epochs.
+- Losses: recon (Wan latent MSE) + 0.1·‖Δ²z_dyn·α‖² + 0.01·H(event) + 0.01·VICReg(z_static) + 0.02·event NLL vs GT first-visible frame.
+
+**Loss curve.** Smooth, monotonic, no instability. Cosine LR annealed to 0 over 60 epochs (4,745 s = ~79 min wall-clock).
+
+| ep | recon (train) | val_recon | ratio |
+|---:|---:|---:|---:|
+| 1   | 0.0352 | — | — |
+| 5   | 0.0222 | 0.0197 | 0.89 |
+| 10  | 0.0169 | 0.0144 | 0.85 |
+| 20  | 0.0132 | 0.0107 | 0.81 |
+| 30  | 0.0117 | 0.0092 | 0.79 |
+| 40  | 0.0109 | 0.0084 | 0.77 |
+| 50  | 0.0104 | 0.0080 | 0.77 |
+| **60** | **0.0104** | **0.0078** | **0.76** |
+
+**Headline.** `val < train` throughout training. At 500-vid scale (Iter 18) the train/val ratio was **2.4× (val worse)**; at 10k-vid scale it inverts to **0.76× (val better)**. Dropout/WD aren't doing the regularization — the data is.
+
+| Run | Train recon | Val recon | Ratio | Notes |
+|---|---:|---:|---:|---|
+| Iter 16d (100-vid, no split) | 0.0090 | — | — | Pure overfit baseline |
+| Iter 18 (500-vid, 80/20) | 0.0090 | 0.0216 | **2.40×** | Overfit despite dropout 0.1 + WD 1e-3 |
+| **Iter 21 (10k-vid, 80/20)** | **0.0104** | **0.0078** | **0.76×** | Healthy generalization |
+
+**What this does and does not prove.** Pixel/latent recon generalizing is necessary but **not sufficient** for the disentanglement claim. The actual scientific question — does `z_static` now encode *semantic* identity (color/material/shape) instead of episode-specific surface features? — is still open. The MLP probe protocol from Iter 18 needs to be re-run on this checkpoint. Same for event localization on val and pixel PSNR on rendered val GIFs.
+
+**Engineering wins.**
+- Cache resume support added to `scripts/cache_wan_latents.py` — skip existing `<idx>.pt` files, rebuild metadata at end.
+- Auto-restart wrapper `scripts/run_cache_with_restart.sh` survives silent SIGKILLs (the 40k-window cache hit at least two silent deaths during the run; wrapper resumed each time).
+- `scripts/run_iter21_when_cache_done.sh` polls for cache completion then auto-launches training.
+
+**Artifacts.**
+- Checkpoint: `outputs/iter21_10000vid_040702/trajectory.pt`
+- Cache: `outputs/cache/wan_10000vid_W12/` (40,000 windows, ~6 GB)
+- Train log: `outputs/logs/train_iter21.log`
+
+**Open todos for Iter 21.**
+1. Re-run identity probes (color/material/shape) on val z_static → answers the disentanglement-generalization question.
+2. Re-run event localization on val → answers whether the event channel transfers (Iter 18 was 35.9% = trivial baseline).
+3. Counterfactual probe at scale — freeze z_dyn on val videos, confirm 0 latent variation.
+4. Render 5 val GIFs + PSNR.
+
+---
+
 ## Changelog
 
 | Date | Update |
@@ -307,3 +364,4 @@ Same checkpoint, same head, same labels — only the inference-time `q` differs.
 | 2026-05-09 | Rung 3 trained (1.18×). Rungs 4+5 measured per video. Rung 6 (full pipeline) and rung 7 (counterfactual) succeeded on smooth videos; collision-frame weakness confirmed at all three dynamics-involving rungs. |
 | 2026-05-11 | EventHead motion-teacher F1=0.632 on 5 vids (v4 recipe). Beats GT-teacher ceiling (0.625). Two non-obvious bugs (abs_thresh=0.05, Conv1d window mismatch) found and fixed. |
 | 2026-05-12 | 20-vid scale-up exposed structural head bug: per-slot Conv1d blind to pair info. `qva_nn` fix added — standalone head overfits 20 vids in 0.5 s (F1=0.605). Full pipeline limited by encoder q_pred noise (P=0.07 → 0.86 when fed GT q at inference). q-smoothness regularizer added but λ=1.0 below biting threshold. |
+| 2026-05-14 | **Iter 21**: full-CLEVRER scale (10,000 videos, 40,000 windows). 60 epochs, recon 0.0104 / val_recon 0.0078 — *val < train* (Iter 18 was 2.4× overfit). Architecture and recipe generalize; disentanglement probes pending. Renamed RESULTS.md → DEVLOG.md. |

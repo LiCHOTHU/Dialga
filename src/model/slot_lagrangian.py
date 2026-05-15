@@ -84,11 +84,13 @@ class SlotQueryEncoder(nn.Module):
 
     def __init__(self, image_size=128, patch_size=16, in_channels=3,
                  embed_dim=192, depth=4, num_heads=6, mlp_ratio=4.0,
-                 max_objects=8, attr_dim=13, num_state_dims=2, d_static=16):
+                 max_objects=8, attr_dim=13, num_state_dims=2, d_static=16,
+                 d_dyn=0):
         super().__init__()
         self.max_objects = int(max_objects)
         self.num_state_dims = int(num_state_dims)
         self.d_static = int(d_static)
+        self.d_dyn = int(d_dyn)
 
         self.backbone = _SharedPatchBackbone(
             image_size=image_size, patch_size=patch_size, in_channels=in_channels,
@@ -114,6 +116,20 @@ class SlotQueryEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, self.d_static),
         )
+        # Implicit dynamic latent: per-frame, per-slot high-dim code that
+        # the decoder consumes alongside (q, z_static). Drives "what is
+        # happening at this slot at this frame" without needing GT-q
+        # supervision. When d_dyn=0 the head is absent and behavior is
+        # identical to the legacy explicit-q model.
+        if self.d_dyn > 0:
+            self.z_dyn_head = nn.Sequential(
+                nn.LayerNorm(embed_dim),
+                nn.Linear(embed_dim, embed_dim),
+                nn.GELU(),
+                nn.Linear(embed_dim, self.d_dyn),
+            )
+        else:
+            self.z_dyn_head = None
 
         nn.init.trunc_normal_(self.slot_queries, std=0.02)
         nn.init.zeros_(self.slot_mlp[-1].weight)
@@ -122,6 +138,12 @@ class SlotQueryEncoder(nn.Module):
     def forward(self, image, attrs):
         """image: (B, 3, H, W), attrs: (B, K, A)
         → positions (B, K, num_state_dims), z_static (B, K, d_static)
+
+        When d_dyn>0, an additional per-frame per-slot dynamic latent
+        z_dyn (B, K, d_dyn) is computed and exposed as the third return.
+        Call sites that don't care about z_dyn can still unpack the first
+        two returns; the encoder always returns exactly two when d_dyn=0
+        (legacy) and three when d_dyn>0.
         """
         B = image.shape[0]
         kv = self.backbone(image)                              # (B, N, D)
@@ -132,6 +154,9 @@ class SlotQueryEncoder(nn.Module):
         out = q + attended                                     # residual
         positions = self.slot_mlp(out)                         # (B, K, num_state_dims)
         z_static = self.z_static_head(out)                     # (B, K, d_static)
+        if self.z_dyn_head is not None:
+            z_dyn = self.z_dyn_head(out)                       # (B, K, d_dyn)
+            return positions, z_static, z_dyn
         return positions, z_static
 
 
@@ -215,16 +240,23 @@ class SlotPixelDecoder(nn.Module):
 
     def __init__(self, num_state_dims=2, attr_dim=13, max_objects=8,
                  image_size=128, hidden=64, slot_embed=128, num_blocks=3,
-                 grid_size=16):
+                 grid_size=16, d_dyn=0, use_abs_coord=True):
         super().__init__()
         self.D = int(num_state_dims)
         self.image_size = int(image_size)
         self.grid_size = int(grid_size)
         self.max_objects = int(max_objects)
+        self.d_dyn = int(d_dyn)
+        self.use_abs_coord = bool(use_abs_coord)
 
-        # Slot conditioning
+        # Slot conditioning. Includes optional per-frame dynamic latent
+        # z_dyn (d_dyn) alongside (q, z_static, alpha). z_dyn is the
+        # implicit channel — when present, the encoder uses it to carry
+        # whatever per-frame, slot-specific information the decoder needs
+        # without GT supervision.
+        slot_in_dim = self.D + attr_dim + 1 + self.d_dyn
         self.slot_mlp = nn.Sequential(
-            nn.Linear(self.D + attr_dim + 1, slot_embed), nn.SiLU(),
+            nn.Linear(slot_in_dim, slot_embed), nn.SiLU(),
             nn.Linear(slot_embed, slot_embed),
         )
 
@@ -235,11 +267,16 @@ class SlotPixelDecoder(nn.Module):
         coord = torch.stack([gx, gy], dim=0).unsqueeze(0)         # (1, 2, G, G)
         self.register_buffer("coord", coord)
 
-        # slot embed broadcast + absolute coord channels (2) + q-relative coord
-        # channels (2). The q-relative channels are what force the decoder to
-        # be identifiable in q: shifting q shifts the slot-local coord frame,
-        # so the CNN's output pixels follow.
-        in_ch = slot_embed + 4
+        # slot embed broadcast + optional absolute coord channels (2)
+        # + q-relative coord channels (2). The q-relative channels are
+        # what force the decoder to be identifiable in q: shifting q
+        # shifts the slot-local coord frame, so the CNN's output pixels
+        # follow. Dropping the absolute coord channels (use_abs_coord=False)
+        # is the architectural lever that prevents the decoder from
+        # encoding position internally and ignoring q — observed as a
+        # degenerate failure mode in the recon-only ablation.
+        coord_channels = 2 if self.use_abs_coord else 0
+        in_ch = slot_embed + coord_channels + 2  # +2 for q-relative
         layers = []
         c = in_ch
         for _ in range(num_blocks):
@@ -258,21 +295,29 @@ class SlotPixelDecoder(nn.Module):
             raise ValueError("image_size must be divisible by grid_size")
         self.upsample_factor = upsample_factor
 
-    def forward(self, positions, attrs, alpha):
+    def forward(self, positions, attrs, alpha, z_dyn=None):
         """
         positions: (B, K, D), attrs: (B, K, A), alpha: (B, K)
+        z_dyn:     (B, K, d_dyn) per-frame dynamic latent, optional.
+                   When d_dyn>0 the decoder must be called with this.
         returns:   (B, 3, H, W)
 
-        Identifiability-in-q: in addition to the absolute coord grid, we also
-        broadcast a *q-relative* coord channel [gx - q_x, gy - q_y]. This shifts
-        the CNN's input frame to be slot-centered, so the rendered slot's
-        spatial location is *forced* to track q. Without this, the absolute
-        coord channels alone let the decoder ignore q (slot_emb can encode
-        position internally), which yields the degenerate constant-velocity
-        encoder solution.
+        Identifiability-in-q: in addition to the optional absolute coord grid,
+        we also broadcast a *q-relative* coord channel [gx - q_x, gy - q_y].
+        This shifts the CNN's input frame to be slot-centered, so the rendered
+        slot's spatial location is forced to track q. When use_abs_coord=False
+        the q-relative channel is the only spatial signal — the decoder
+        physically cannot place slots without a meaningful q, which prevents
+        the degenerate collapsed-q failure mode.
         """
         B, K = alpha.shape
-        slot_in = torch.cat([positions, attrs, alpha.unsqueeze(-1)], dim=-1)  # (B, K, D+A+1)
+        slot_in_list = [positions, attrs, alpha.unsqueeze(-1)]
+        if self.d_dyn > 0:
+            if z_dyn is None:
+                raise ValueError(f"SlotPixelDecoder configured with d_dyn={self.d_dyn} "
+                                 f"but z_dyn=None was passed.")
+            slot_in_list.append(z_dyn)
+        slot_in = torch.cat(slot_in_list, dim=-1)                             # (B, K, D+A+1[+d_dyn])
         slot_emb = self.slot_mlp(slot_in)                                    # (B, K, E)
 
         # Broadcast slot embedding onto the spatial grid
@@ -283,7 +328,10 @@ class SlotPixelDecoder(nn.Module):
         q_clamped = positions[..., :2].clamp(-1.5, 1.5)                       # (B, K, 2)
         q_grid = q_clamped.view(B * K, 2, 1, 1).expand(-1, -1, self.grid_size, self.grid_size)
         coord_rel = coord - q_grid                                            # (B*K, 2, G, G)
-        x = torch.cat([flat, coord, coord_rel], dim=1)                        # (B*K, E+4, G, G)
+        feats = [flat, coord_rel]
+        if self.use_abs_coord:
+            feats.insert(1, coord)
+        x = torch.cat(feats, dim=1)                                          # (B*K, E+coord_ch+2, G, G)
         x = self.conv(x)
         x = self.head(x)                                                     # (B*K, 4, G, G)
 
@@ -414,10 +462,104 @@ def apply_collision_impulse_to_positions(impulse_module, dynamics,
     return out
 
 
+# -------------------------------------------------------------------- consciousness-structured latent
+
+
+class SlotPredictor(nn.Module):
+    """Per-slot temporal predictor for z_dyn — the "semantic/world-model" channel.
+
+    Architectural lever (lever #2 in the four-lever disentanglement framework):
+    the decoder consumes the *predicted* z_dyn (not the raw encoder output),
+    so any information that flows from encoder to decoder via z_dyn must be
+    *predictable from the past*. Information that is not predictable has to
+    take the event-injection channel instead (see EventGate).
+
+    Mapped onto the human memory analogy:
+      - encoder produces z_dyn_enc[t] (raw observation)
+      - predictor produces z_dyn_pred[t] from z_dyn_enc[<t] (smooth world model)
+      - error e[t] = z_dyn_enc[t] - z_dyn_pred[t] is the prediction-error signal
+      - decoder sees z_dyn_pred[t] + gate(e) * delta(e), so z_dyn_pred is the
+        regular/predictable part and gate*delta is the surprising/episodic part.
+
+    Per-slot MLP (no cross-slot attention). Kept small (~10-20k params) so the
+    predictor cannot model collisions as smooth dynamics — they will only fit
+    through the event channel.
+    """
+
+    def __init__(self, d_dyn, d_static, hidden=64, context_frames=2):
+        super().__init__()
+        self.d_dyn = int(d_dyn)
+        self.context_frames = int(context_frames)
+        in_dim = self.context_frames * self.d_dyn + int(d_static)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.SiLU(),
+            nn.Linear(hidden, hidden), nn.SiLU(),
+            nn.Linear(hidden, self.d_dyn),
+        )
+        # Zero-init last layer → predictor starts as "predict last frame" via
+        # the residual return below. Lets the model start from a sane baseline
+        # before learning corrections.
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, z_dyn, z_static):
+        """z_dyn: (B, T, K, d_dyn); z_static: (B, K, d_static).
+
+        Returns z_dyn_pred (B, T, K, d_dyn). At t < context_frames the predictor
+        sees zero-padded past, so predicted ≈ 0 → the caller should fall back
+        to z_dyn at boundary frames if it cares about t < context_frames.
+        """
+        B, T, K, D = z_dyn.shape
+        zs = z_static.unsqueeze(1).expand(-1, T, -1, -1)             # (B, T, K, d_s)
+        ctx_parts = []
+        for shift in range(1, self.context_frames + 1):
+            pad = z_dyn.new_zeros(B, shift, K, D)
+            past = torch.cat([pad, z_dyn[:, :T - shift]], dim=1)     # (B, T, K, D)
+            ctx_parts.append(past)
+        ctx = torch.cat(ctx_parts, dim=-1)                            # (B, T, K, C*D)
+        x = torch.cat([ctx, zs], dim=-1)
+        delta = self.net(x)
+        # Residual: predict from most-recent past frame + learned delta.
+        most_recent = ctx_parts[0]
+        return most_recent + delta
+
+
+class EventGate(nn.Module):
+    """Sparse event injector — the "episodic" channel.
+
+    Architectural lever (lever #3): events fire only when prediction error
+    is large. The L1 sparsity prior on the gate makes events expensive per
+    firing, so the model only opens this channel when no other channel can
+    explain the data — which is, by definition, when the world model fails
+    (collisions, contacts, occlusions, grasps, etc.).
+
+    No supervised collision labels needed: the architecture defines an event
+    as "moments the predictor cannot predict," and that definition is
+    dataset-agnostic.
+    """
+
+    def __init__(self, d_dyn, hidden=32):
+        super().__init__()
+        self.scorer = nn.Sequential(
+            nn.Linear(int(d_dyn), hidden), nn.SiLU(),
+            nn.Linear(hidden, 1),
+        )
+        # Zero weight + negative bias → gates start near 0 (sigmoid(-3) ≈ 0.05).
+        # Forces the model to *earn* an event firing through training pressure.
+        nn.init.zeros_(self.scorer[-1].weight)
+        nn.init.constant_(self.scorer[-1].bias, -3.0)
+
+    def forward(self, error):
+        """error: (B, T, K, d_dyn) → gate (B, T, K) ∈ [0, 1]."""
+        return torch.sigmoid(self.scorer(error).squeeze(-1))
+
+
 __all__ = [
     "SlotQueryEncoder",
     "LatentSIGRegEncoder",
     "CollisionImpulse",
     "SlotPixelDecoder",
+    "SlotPredictor",
+    "EventGate",
     "apply_collision_impulse_to_positions",
 ]

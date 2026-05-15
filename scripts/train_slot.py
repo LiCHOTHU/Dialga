@@ -35,6 +35,8 @@ from src.model.slot_lagrangian import (
     LatentSIGRegEncoder,
     CollisionImpulse,
     SlotPixelDecoder,
+    SlotPredictor,
+    EventGate,
     apply_collision_impulse_to_positions,
 )
 from src.model.accel_net import AccelNet, verlet_step
@@ -116,7 +118,14 @@ def build_encoder(cfg, attr_dim):
         d_static=int(cfg.model.get("d_static", 16)),
     )
     if enc_type == "slot":
-        return SlotQueryEncoder(**common)
+        # d_dyn is only meaningful for the slot encoder. When > 0 the
+        # encoder also emits a per-frame per-slot dynamic latent that the
+        # decoder consumes alongside (q, z_static). This is the implicit
+        # channel for "what's happening at this slot right now" — designed
+        # to be dataset-agnostic so the same architecture transfers from
+        # CLEVRER to robot-manipulation video without relying on GT
+        # positions or collision annotations.
+        return SlotQueryEncoder(d_dyn=int(cfg.model.get("d_dyn", 0)), **common)
     if enc_type == "sigreg":
         return LatentSIGRegEncoder(latent_dim=int(cfg.model.latent_dim), **common)
     raise ValueError(f"Unknown encoder_type: {enc_type}")
@@ -124,14 +133,23 @@ def build_encoder(cfg, attr_dim):
 
 def encode_window(encoder, frames, attrs):
     """frames: (B, W, 3, H, W); attrs: (B, K, A)
-    → positions (B, W, K, D), z_static_per_frame (B, W, K, d_static)
+    → positions (B, W, K, D), z_static_per_frame (B, W, K, d_static),
+      z_dyn_per_frame (B, W, K, d_dyn) or None when the encoder has no
+      z_dyn head (legacy explicit-q mode).
     """
     B, W = frames.shape[:2]
     flat = frames.flatten(0, 1)                                  # (B*W, 3, H, W)
     attrs_rep = attrs.unsqueeze(1).expand(B, W, *attrs.shape[1:]).flatten(0, 1)
-    pos, z_static = encoder(flat, attrs_rep)                     # (B*W, K, *)
+    out = encoder(flat, attrs_rep)
+    if len(out) == 3:
+        pos, z_static, z_dyn = out
+        return (pos.view(B, W, *pos.shape[1:]),
+                z_static.view(B, W, *z_static.shape[1:]),
+                z_dyn.view(B, W, *z_dyn.shape[1:]))
+    pos, z_static = out
     return (pos.view(B, W, *pos.shape[1:]),
-            z_static.view(B, W, *z_static.shape[1:]))
+            z_static.view(B, W, *z_static.shape[1:]),
+            None)
 
 
 def pool_z_static(z_static_per_frame, visibility):
@@ -270,7 +288,7 @@ def _impulse_loss(impulse, lagrangian, gt_pos, attrs, collisions_per_sample,
     return torch.stack(losses).mean(), n_events
 
 
-def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader, output_dir, wandb_run=None, pixel_decoder=None):
+def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader, output_dir, wandb_run=None, pixel_decoder=None, predictor=None, event_gate=None):
     encoder.train(); lagrangian.train(); impulse.train()
     if sigreg is not None:
         sigreg.train()
@@ -278,6 +296,10 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
         event_head.train()
     if pixel_decoder is not None:
         pixel_decoder.train()
+    if predictor is not None:
+        predictor.train()
+    if event_gate is not None:
+        event_gate.train()
 
     params = (list(encoder.parameters())
               + list(lagrangian.parameters())
@@ -286,6 +308,10 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
         params = params + list(event_head.parameters())
     if pixel_decoder is not None:
         params = params + list(pixel_decoder.parameters())
+    if predictor is not None:
+        params = params + list(predictor.parameters())
+    if event_gate is not None:
+        params = params + list(event_gate.parameters())
     optim = AdamW(params, lr=float(cfg.training.stage1_lr),
                   weight_decay=float(cfg.training.stage1_weight_decay))
     epochs = int(cfg.training.stage1_epochs)
@@ -317,6 +343,20 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
     event_supervision = str(cfg.training.get("event_supervision", "gt")).lower()
     # Stage-1 pixel-recon weight (separate from Stage-2's lambda_recon).
     lambda_recon = float(cfg.training.get("lambda_recon_stage1", 0.0))
+    # Sparsity prior on the EventGate. Makes events expensive per firing, so
+    # the model only opens the episodic channel when prediction fails. Tunes
+    # the trade-off between "events fire too often" (use_too_much_bandwidth)
+    # and "events never fire" (predictor absorbs surprises).
+    lambda_event_sparsity = float(cfg.training.get("lambda_event_sparsity", 0.0))
+    # Direct predictor consistency loss: ||z_dyn_enc - z_dyn_pred||^2 on the
+    # encoder's per-frame z_dyn. Without this, the predictor receives gradients
+    # only through the gated event channel — if the gate stays closed (sparsity
+    # too strong), the predictor never trains. This term gives the predictor
+    # a direct objective AND pulls the encoder toward producing temporally-
+    # coherent z_dyn (because incoherent z_dyn is unpredictable, which
+    # increases the loss). Same purpose as the "smooth-motion prior" in
+    # physics-grounded models, but emergent rather than hand-coded.
+    lambda_predict = float(cfg.training.get("lambda_predict", 0.0))
     self_event_z_thresh = float(cfg.training.get("self_event_z_thresh", 1.5))
     self_event_sharpness = float(cfg.training.get("self_event_sharpness", 2.5))
     # Motion-centroid teacher: absolute |Δ²c| threshold. When > 0 it replaces
@@ -402,7 +442,7 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
             #    Pool z_static over time (visibility-weighted) to get one
             #    per-(video, slot) identity vector that we feed to dynamics
             #    + decoder *in place of GT attrs*.
-            q_pred, z_static_per_frame = encode_window(encoder, frames, attrs)
+            q_pred, z_static_per_frame, z_dyn_per_frame = encode_window(encoder, frames, attrs)
             z_static_video = pool_z_static(z_static_per_frame, visib)  # (B, K, d_static)
             state_loss = masked_mse(q_pred, gt_pos, visib)
             static_loss = static_consistency_loss(z_static_per_frame, z_static_video, visib)
@@ -655,12 +695,89 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
             #    GT frames. This gives the encoder a grounding signal that
             #    does NOT require GT object positions — only raw video.
             recon_loss = q_pred.new_zeros(())
+            event_sparsity_loss = q_pred.new_zeros(())
+            predict_loss = q_pred.new_zeros(())
+            mean_gate = 0.0
             if pixel_decoder is not None and lambda_recon > 0:
                 # Per-frame decode: flatten (B, W) into a single batch dim
                 flat_q = q_pred.reshape(B * W, *q_pred.shape[2:])
                 flat_z = z_static_video.unsqueeze(1).expand(-1, W, -1, -1).reshape(B * W, *z_static_video.shape[1:])
                 flat_v = visib.reshape(B * W, *visib.shape[2:])
-                recon = pixel_decoder(flat_q, flat_z, flat_v)                 # (B*W, 3, H, W)
+                # z_dyn is per-frame (not pooled) — keeps "what's happening
+                # right now" channel intact for the decoder.
+                if z_dyn_per_frame is not None and predictor is not None:
+                    # Consciousness-structured path: decoder consumes
+                    # predictor-mediated z_dyn so the latent channel carries
+                    # only predictable info; surprises are routed through
+                    # the gated event channel.
+                    #
+                    # PV-VAE-inspired mask-predict augmentation: randomly
+                    # mark some non-boundary frames as "masked." For those
+                    # frames, the encoder's z_dyn is discarded and replaced
+                    # by predictor output BEFORE event-gate mediation. The
+                    # decoder must still reconstruct masked frames' pixels,
+                    # so z_dyn is forced to carry recoverable temporal info
+                    # (otherwise masked-frame pixels are unreachable through
+                    # the predictor and recon penalty rises).
+                    mask_predict_ratio = float(cfg.training.get("mask_predict_ratio", 0.0))
+                    zd_for_predict = z_dyn_per_frame
+                    masked_t = []
+                    if mask_predict_ratio > 0.0 and predictor.context_frames < W:
+                        eligible = list(range(predictor.context_frames, W))
+                        n_mask = max(1, int(round(mask_predict_ratio * len(eligible))))
+                        n_mask = min(n_mask, len(eligible))
+                        import random as _r
+                        masked_t = sorted(_r.sample(eligible, k=n_mask))
+                        # Drop encoder z_dyn at masked frames (replace with zeros
+                        # so the encoder's signal can't sneak through; predictor
+                        # output below will fill these positions in zd_used).
+                        zd_for_predict = z_dyn_per_frame.clone()
+                        for t_m in masked_t:
+                            zd_for_predict[:, t_m] = 0.0
+                    zd_pred = predictor(zd_for_predict, z_static_video)          # (B,W,K,d_dyn)
+                    e = z_dyn_per_frame - zd_pred                                # prediction error
+                    # Direct predictor-consistency loss on t >= context_frames
+                    # (predictor has no past at earlier t). Mask by visibility.
+                    cf_loss = predictor.context_frames
+                    if cf_loss < W:
+                        e_loss = e[:, cf_loss:]
+                        v_loss = visib[:, cf_loss:].unsqueeze(-1)
+                        predict_loss = (e_loss.pow(2) * v_loss).sum() / (v_loss.sum() * e_loss.shape[-1]).clamp_min(1.0)
+                    if event_gate is not None:
+                        gate = event_gate(e)                                     # (B,W,K) in [0,1]
+                        # At masked frames, force gate to 0 so the decoder gets
+                        # purely the predictor output — no encoder leak via
+                        # the event channel. This is what makes mask-predict
+                        # bite: masked-frame pixels are reachable only through
+                        # the predictor.
+                        if masked_t:
+                            gate_zero = gate.clone()
+                            for t_m in masked_t:
+                                gate_zero[:, t_m] = 0.0
+                            zd_used = zd_pred + gate_zero.unsqueeze(-1) * e
+                        else:
+                            zd_used = zd_pred + gate.unsqueeze(-1) * e
+                        # Boundary: predictor has no past at t < context_frames,
+                        # so fall back to raw encoder output there. This avoids
+                        # spurious event firing at window boundaries.
+                        cf = predictor.context_frames
+                        if cf > 0 and cf < W:
+                            zd_used = torch.cat([z_dyn_per_frame[:, :cf],
+                                                 zd_used[:, cf:]], dim=1)
+                        # Sparsity loss only on the predictor-active window.
+                        valid_gate = gate[:, cf:] if cf < W else gate
+                        v_mask = visib[:, cf:] if cf < W else visib
+                        if v_mask.sum() > 0:
+                            event_sparsity_loss = (valid_gate * v_mask).sum() / v_mask.sum().clamp_min(1.0)
+                            mean_gate = float(event_sparsity_loss.detach().item())
+                    else:
+                        zd_used = zd_pred
+                    flat_dyn = zd_used.reshape(B * W, *zd_used.shape[2:])
+                elif z_dyn_per_frame is not None:
+                    flat_dyn = z_dyn_per_frame.reshape(B * W, *z_dyn_per_frame.shape[2:])
+                else:
+                    flat_dyn = None
+                recon = pixel_decoder(flat_q, flat_z, flat_v, z_dyn=flat_dyn)  # (B*W, 3, H, W)
                 recon = recon.view(B, W, *recon.shape[1:])
                 recon_loss = torch.nn.functional.mse_loss(recon, frames)
 
@@ -724,7 +841,9 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
                      + lambda_event * event_loss
                      + lambda_recon * recon_loss
                      + lambda_contrastive * contrastive_loss
-                     + lambda_q_smooth * q_smooth_loss)
+                     + lambda_q_smooth * q_smooth_loss
+                     + lambda_event_sparsity * event_sparsity_loss
+                     + lambda_predict * predict_loss)
             total.backward()
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
@@ -741,6 +860,10 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
             sums["event"] += event_loss.item() if isinstance(event_loss, torch.Tensor) else 0.0
             sums["recon"] += recon_loss.item() if isinstance(recon_loss, torch.Tensor) else 0.0
             sums["contrastive"] += contrastive_loss.item() if isinstance(contrastive_loss, torch.Tensor) else 0.0
+            sums.setdefault("event_gate", 0.0)
+            sums["event_gate"] += mean_gate
+            sums.setdefault("predict", 0.0)
+            sums["predict"] += predict_loss.item() if isinstance(predict_loss, torch.Tensor) else 0.0
             steps += 1
 
         sched.step()
@@ -749,13 +872,15 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
         for k in ("total", "state", "del", "solver", "pushforward", "sigreg", "collision", "static", "event", "recon", "contrastive"):
             history[k].append(avg[k])
         if epoch % log_interval == 0 or epoch == 1:
+            gate_avg = sums.get("event_gate", 0.0) / max(steps, 1)
+            pred_avg = sums.get("predict", 0.0) / max(steps, 1)
             log.info(
                 "[stage1] ep %3d/%d | total %.5f | state %.6f (λ=%.3f) | solver %.6f | "
-                "static %.5f | event %.5f (%s) | recon %.5f | contrast %.5f | coll %.5f (n=%d) | lr %.2e",
+                "static %.5f | event %.5f (%s) | recon %.5f | predict %.5f | gate %.4f | contrast %.5f | coll %.5f (n=%d) | lr %.2e",
                 epoch, epochs,
                 avg["total"], avg["state"], lambda_state_curr, avg["solver"],
                 avg["static"], avg["event"], event_supervision,
-                avg["recon"], avg["contrastive"], avg["collision"], n_coll_events,
+                avg["recon"], pred_avg, gate_avg, avg["contrastive"], avg["collision"], n_coll_events,
                 optim.param_groups[0]["lr"],
             )
         _wandb_log(wandb_run, {
@@ -801,6 +926,10 @@ def stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader
             if pixel_decoder is not None:
                 blob["decoder_state_dict"] = pixel_decoder.state_dict()
                 blob["pixel_decoder_jointly_trained"] = True
+            if predictor is not None:
+                blob["predictor_state_dict"] = predictor.state_dict()
+            if event_gate is not None:
+                blob["event_gate_state_dict"] = event_gate.state_dict()
             torch.save(blob, ckpt_path)
             log.info("Stage 1 checkpoint @ ep %d -> %s", epoch, ckpt_path)
     save_loss_curve(history, output_dir / "stage1_loss.png",
@@ -846,7 +975,7 @@ def stage2(cfg, device, encoder, lagrangian, impulse, decoder, loader, output_di
             B, W = frames.shape[:2]
 
             with torch.no_grad():
-                q_pred, z_static_per_frame = encode_window(encoder, frames, attrs)
+                q_pred, z_static_per_frame, z_dyn_per_frame = encode_window(encoder, frames, attrs)
                 z_static_video = pool_z_static(z_static_per_frame, visib)
 
             optim.zero_grad(set_to_none=True)
@@ -856,7 +985,9 @@ def stage2(cfg, device, encoder, lagrangian, impulse, decoder, loader, output_di
                 B, W, *z_static_video.shape[1:]
             ).reshape(B * W, *z_static_video.shape[1:])
             visib_rep = visib.reshape(B * W, *visib.shape[2:])
-            recon = decoder(flat_q, cond_rep, visib_rep)              # (B*W, 3, H, W)
+            flat_dyn = (z_dyn_per_frame.reshape(B * W, *z_dyn_per_frame.shape[2:])
+                        if z_dyn_per_frame is not None else None)
+            recon = decoder(flat_q, cond_rep, visib_rep, z_dyn=flat_dyn)  # (B*W, 3, H, W)
             recon = recon.view(B, W, 3, recon.shape[-2], recon.shape[-1])
 
             loss = F.mse_loss(recon, frames) * lambda_recon
@@ -997,7 +1128,7 @@ def save_overfit_scene_videos(cfg, device, encoder, lagrangian, impulse,
 
     encoder.eval(); lagrangian.eval(); impulse.eval()
     with torch.no_grad():
-        q_enc, z_static_per_frame = encode_window(encoder, frames, attrs)
+        q_enc, z_static_per_frame, z_dyn_per_frame = encode_window(encoder, frames, attrs)
         z_static_video = pool_z_static(z_static_per_frame, visib)
     rollout_q = _autoregressive_rollout_eval(
         lagrangian, impulse, gt_pos, visib, z_static_video, collisions,
@@ -1074,7 +1205,7 @@ def log_inference_videos(cfg, device, encoder, lagrangian, impulse, decoder,
 
     encoder.eval(); lagrangian.eval(); impulse.eval(); decoder.eval()
     with torch.no_grad():
-        q_pred, z_static_per_frame = encode_window(encoder, frames, attrs)
+        q_pred, z_static_per_frame, z_dyn_per_frame = encode_window(encoder, frames, attrs)
         z_static_video = pool_z_static(z_static_per_frame, visib)
     rollout_q = _autoregressive_rollout_eval(
         lagrangian, impulse, gt_pos, visib, z_static_video, collisions,
@@ -1086,9 +1217,15 @@ def log_inference_videos(cfg, device, encoder, lagrangian, impulse, decoder,
             N, W, *z_static_video.shape[1:]
         ).reshape(N * W, *z_static_video.shape[1:])
         visib_rep = visib.reshape(N * W, *visib.shape[2:])
-        recon = decoder(q_pred.reshape(N * W, *q_pred.shape[2:]), cond_rep, visib_rep)
+        flat_dyn = (z_dyn_per_frame.reshape(N * W, *z_dyn_per_frame.shape[2:])
+                    if z_dyn_per_frame is not None else None)
+        recon = decoder(q_pred.reshape(N * W, *q_pred.shape[2:]), cond_rep, visib_rep, z_dyn=flat_dyn)
         recon = recon.view(N, W, 3, recon.shape[-2], recon.shape[-1])
-        rec_roll = decoder(rollout_q.reshape(N * W, *rollout_q.shape[2:]), cond_rep, visib_rep)
+        # For rolled-out positions we don't have a corresponding per-frame
+        # z_dyn (the dynamics module doesn't yet predict z_dyn). Reuse the
+        # encoder's z_dyn at GT frames — this means the rollout visualization
+        # shows "what the decoder would render if the dynamics were perfect."
+        rec_roll = decoder(rollout_q.reshape(N * W, *rollout_q.shape[2:]), cond_rep, visib_rep, z_dyn=flat_dyn)
         rec_roll = rec_roll.view(N, W, 3, rec_roll.shape[-2], rec_roll.shape[-1])
 
     def to_uint8(x):
@@ -1268,12 +1405,37 @@ def main(cfg: DictConfig):
         slot_embed=int(cfg.model.decoder_slot_embed),
         num_blocks=int(cfg.model.decoder_blocks),
         grid_size=int(cfg.model.decoder_grid_size),
+        d_dyn=int(cfg.model.get("d_dyn", 0)),
+        use_abs_coord=bool(cfg.model.get("decoder_use_abs_coord", True)),
     ).to(device)
     log.info("Decoder params  : %d", sum(p.numel() for p in decoder.parameters()))
 
+    # Consciousness-structured latent: optional predictor + event-gate.
+    # When use_predictor=True, the decoder consumes the predictor-mediated
+    # z_dyn rather than the raw encoder z_dyn. This forces z_dyn to carry
+    # *predictable* information and routes surprises through EventGate.
+    # All emergent — no GT collisions, no GT positions, just architecture.
+    use_predictor = bool(cfg.model.get("use_predictor", False)) and int(cfg.model.get("d_dyn", 0)) > 0
+    predictor = None
+    event_gate = None
+    if use_predictor:
+        predictor = SlotPredictor(
+            d_dyn=int(cfg.model.d_dyn),
+            d_static=d_static,
+            hidden=int(cfg.model.get("predictor_hidden", 64)),
+            context_frames=int(cfg.model.get("predictor_context_frames", 2)),
+        ).to(device)
+        event_gate = EventGate(
+            d_dyn=int(cfg.model.d_dyn),
+            hidden=int(cfg.model.get("event_gate_hidden", 32)),
+        ).to(device)
+        log.info("Predictor params : %d", sum(p.numel() for p in predictor.parameters()))
+        log.info("EventGate params : %d", sum(p.numel() for p in event_gate.parameters()))
+
     pixel_decoder_for_stage1 = decoder if lambda_recon_cfg > 0 else None
     stage1(cfg, device, encoder, lagrangian, impulse, sigreg, event_head, loader, output_dir,
-           wandb_run=wandb_run, pixel_decoder=pixel_decoder_for_stage1)
+           wandb_run=wandb_run, pixel_decoder=pixel_decoder_for_stage1,
+           predictor=predictor, event_gate=event_gate)
 
     stage2(cfg, device, encoder, lagrangian, impulse, decoder, loader, output_dir,
            wandb_run=wandb_run)

@@ -169,8 +169,8 @@ def main():
             dyn, impulse,
             gt_pos[n:n+1], visib[n:n+1], z_static[n:n+1],
             collisions_per_sample=[collisions[n]],
-            solver_alpha=float(cfg.training.solver_alpha),
-            solver_steps=max(int(cfg.training.solver_steps), 2),
+            solver_alpha=float(cfg.training.get("solver_alpha", 0.1)),
+            solver_steps=max(int(cfg.training.get("solver_steps", 1)), 2),
             direction_clip=0.5,
             dynamics_type=dyn_type,
         )
@@ -206,8 +206,8 @@ def main():
         dyn, impulse,
         gt_pos[n:n+1], visib[n:n+1], z_static[n:n+1],
         collisions_per_sample=[collisions[n]],
-        solver_alpha=float(cfg.training.solver_alpha),
-        solver_steps=max(int(cfg.training.solver_steps), 2),
+        solver_alpha=float(cfg.training.get("solver_alpha", 0.1)),
+        solver_steps=max(int(cfg.training.get("solver_steps", 1)), 2),
         direction_clip=0.5,
         dynamics_type=dyn_type,
     )
