@@ -27,7 +27,7 @@
 #   /storage/home/.../outputs/iter22c_attrs_${STAMP}/probe_identity_diag.json
 # ===================================================================
 
-set -euo pipefail
+set -eo pipefail
 
 WORKDIR="/storage/home/hcoda1/8/lwang831/workspace/Dialga"
 CONDA_ENV="river"

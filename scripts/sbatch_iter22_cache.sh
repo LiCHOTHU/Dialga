@@ -27,7 +27,7 @@
 #   /storage/scratch1/8/lwang831/cache/wan_10000vid_W12/dino/<idx>.pt   x 40000
 # ===================================================================
 
-set -euo pipefail
+set -eo pipefail
 
 WORKDIR="/storage/home/hcoda1/8/lwang831/workspace/Dialga"
 CONDA_ENV="river"
