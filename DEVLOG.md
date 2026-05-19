@@ -356,6 +356,105 @@ Same checkpoint, same head, same labels — only the inference-time `q` differs.
 
 ---
 
+## Iter 21 — identity probe (2026-05-18): disentanglement claim does not hold
+
+**Question.** Now that recon generalizes (val_recon 0.0078 < train_recon 0.0104), does `z_static` actually encode color/material/shape on held-out videos, or did the model achieve low recon by routing identity through some other path?
+
+**Protocol (linear, held-out).**
+1. Load Iter 21 checkpoint (epoch 55, val_recon 0.00782 — process died before ep 60 but the saved ckpt reproduces DEVLOG-Iter-21 numbers; reran from the same recipe on this cluster, stamp `213853`).
+2. Trainer val split only (val_frac=0.2, seed=42). Encoder never saw any of these videos.
+3. Encode each val video → `z_static` of shape (K=8, 16), averaged across its 4 windows.
+4. 50/50 split *by video_id* (not by slot, seed=0) — disjoint probe-train / probe-test video pools.
+5. Single linear layer per attribute group (no hidden), AdamW, 2000 epochs full-batch.
+
+**Result.**
+
+| Group | Classes | Train slots | Test slots | Chance | Majority | Train acc | **Test acc** | Δ vs maj |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Color    | 8 | 4947 | 4950 | 0.125 | 0.132 | 0.170 | **0.156** | **+0.024** |
+| Material | 2 | 4947 | 4950 | 0.500 | 0.502 | 0.522 | **0.502** | **+0.000** |
+| Shape    | 3 | 4947 | 4950 | 0.333 | 0.352 | 0.377 | **0.364** | **+0.012** |
+
+Material is at majority exactly. Color and shape are at majority + 1-3 pp — below any reasonable threshold for "the linear probe found identity." Iter 18 was *below chance*; Iter 21 is *at majority*. The scale-up moved the needle from "actively wrong" to "indistinguishable from a constant predictor." That is not the disentanglement headline we wanted.
+
+Crucially, **probe-train accuracy is also low** (color 17%, material 52%, shape 38%). The probe isn't overfitting and failing to generalize — it can't even fit the training side. The features simply do not carry identity.
+
+---
+
+## Iter 21 — z_dyn / per-window diagnostic (2026-05-18): identity is nowhere
+
+**Question.** Identity could have failed to land in `z_static` for three structurally different reasons:
+
+1. **Slot drift.** Slot index `k` points to different objects in different windows of the same video, so averaging z_static across windows destroys whatever signal each window carried.
+2. *(omitted — VICReg-collapse hypothesis; harder to test independently.)*
+3. *(omitted — bottleneck-too-narrow hypothesis; testable later by widening d_static.)*
+4. **Identity in z_dyn.** The decoder has 32-dim z_dyn × 12 frames = 384 dims/slot/window vs 16 for z_static. It may have learned to read identity from z_dyn's constant component and never gave z_static a real job.
+
+A single experiment distinguishes (1) and (4): probe both `z_dyn_mean` (z_dyn averaged over T) and per-window z_static under the same protocol.
+
+**Result — three feature variants, same 50/50 video split.**
+
+| Feature variant | Color | Material | Shape | Notes |
+|---|---:|---:|---:|---|
+| z_static, per-video avg (K=8 × 16) | 0.156 | 0.502 | 0.364 | headline; +0.024 / 0.000 / +0.012 vs maj |
+| z_static, per-window (K=8 × 16)    | 0.149 | 0.498 | 0.363 | slightly *worse* than per-video avg |
+| **z_dyn_mean, per-window (K=8 × 32)** | **0.184** | **0.510** | 0.345 | best, but color is still only +0.051 vs majority |
+| majority baseline                   | 0.132 | 0.502 | 0.352 | (per-test-set empirical) |
+
+Reading the rows:
+
+- **Slot drift (hypothesis 1) is ruled out.** Per-window z_static is ≈ per-video-averaged z_static across all three attributes (in fact slightly worse — the opposite of what slot drift would predict).
+- **Identity in z_dyn (hypothesis 4) is ruled out.** z_dyn_mean does carry marginally more color info than z_static (18.4% vs 15.6% vs 13.2% majority), but it is nowhere near the 50%+ that would mean "the decoder is reading identity from z_dyn." Material and shape are at or below majority for z_dyn_mean too.
+- **We are in the worst diagnostic outcome: identity is nowhere.** The encoder has produced zero usable signal about whether a slot is rubber or metal, and only the faintest signal about color. The recon objective on Wan-VAE latents at 8×8 spatial resolution does not carry enough semantic gradient to make the encoder bother encoding identity. The decoder is reconstructing well using positions, motion, and low-frequency pixel statistics; it doesn't need "this is a metal cube" to do its job at 8×8 latent resolution.
+
+**Interpretation.** The Iter 21 architectural disentanglement claim ("freezing z_dyn → 0 latent variation") was true, and remains true — but it meant *z_dyn is doing all the work*. Time-blinded decoder + block-diagonal cross-attention guarantees the factorization is mathematically clean, but does not guarantee the factorization the loss learns matches the one we wanted. We assumed "z_static = identity, z_dyn = motion" would be the natural division of labor under recon supervision. It isn't. The loss let z_static stay near-constant and put everything else into z_dyn.
+
+This is the kind of result that, if Iter 22 produces the positive case, becomes a clean writeup: *naive architectural disentanglement does not yield semantic disentanglement; here is the loss surgery that does.*
+
+**Artifacts.**
+- Linear probe: `outputs/iter21_10000vid_213853/probe_identity_linear.json`
+- Three-variant diagnostic: `outputs/iter21_10000vid_213853/probe_identity_diag.json`
+- Probe scripts: `scripts/probe_iter21_identity.py`, `scripts/probe_iter21_zdyn_diag.py`
+
+---
+
+## Iter 22 plan — push identity into z_static via auxiliary supervision
+
+Two parallel branches, both run from a single sbatch (`scripts/sbatch_iter22_full.sh`).
+
+**22a — DINO-CLS auxiliary (`--lambda_dino 0.5`).** Already-wired hook in `train_trajectory.py`: a small MLP projects `z_static[B,K,16]` to `d_dino=384` and is trained to match a per-slot visibility-weighted average of frame-level DINOv2-S CLS tokens. All K slots in a video target the same CLS sequence, weighted by their own visibility. This is *weaker* than true DINOSAUR (which uses per-patch features and slot→patch assignment) — it's a video-level CLS signal split across slots — but it is the right cheap first try. Tests whether *any* DINO signal is sufficient to move z_static off chance.
+
+**22c — Supervised attrs head (`--lambda_attrs 1.0`).** New in this iter: a 2-layer MLP `AttrsHead` (z_static → 64 → color/material/shape logits) trained with per-slot CE on GT attrs, masked by `slot_mask`. Direct supervision. Independent of the DINO cache. Tests whether the architecture *can* route per-slot identity into z_static when forced to, regardless of teacher quality.
+
+**Shared recipe.** Identical to Iter 21 except for the new aux loss term:
+- 10,000 train videos × 4 windows, 80/20 split by video_id (same seed=42 → same val pool).
+- 60 epochs, batch=4, lr=5e-4 cosine→0, dropout 0.1, wd 1e-3.
+- K=8, d_model=192, d_static=16, d_dyn=32.
+- `lambda_smooth 0.1`, `lambda_entropy 0.01`, `lambda_vicreg 0.01`, `lambda_event_sup 0.02`.
+
+**sbatch verification phases.** Before either long training launches, `sbatch_iter22_full.sh` runs a 10-min smoke gauntlet:
+- Phase 0a: 5-vid Wan cache rebuild (3 min).
+- Phase 0b: 5-vid DINO cache (downloads `facebook/dinov2-small` to `$HF_HOME` if absent).
+- Phase 0c: Python assertion on the DINO blob — `cls.shape == (12, 384)`, dtype float32, finite. Bails out if the cache contract is wrong before committing 1-3 h to the full DINO cache.
+- Phase 0d: 1-epoch trainer smoke with `--lambda_dino 0.5` — confirms the einsum dimension assertion holds and the loss is finite.
+- Phase 0e: 1-epoch trainer smoke with `--lambda_attrs 1.0` — confirms the attrs head plumbing works.
+
+Then Phase 1 (full DINO cache, resume-safe), Phase 2 (Iter 22a train), Phase 3 (Iter 22c train), Phase 4 (linear identity probe + z_dyn diagnostic on each checkpoint, output `probe_identity_linear.json` and `probe_identity_diag.json` next to each ckpt).
+
+**Decision matrix (Phase 4 readout).**
+
+| 22a color | 22a M/S | 22c color/M/S | Meaning | Next step |
+|---|---|---|---|---|
+| 50%+ | 50%+ | passes | DINO-CLS was enough teacher | Ship 22a, write up |
+| 50%+ | trivial | passes | CLS too coarse for M/S; encoder *can* route per-slot when asked | Iter 23 = patch-level DINOSAUR |
+| 50%+ | trivial | trivial on M/S | CLS helps color (scene-level proxy); architecture cannot route material/shape per-slot even under direct supervision | Architecture change: wider d_static, more iters, per-slot decoder targets |
+| trivial | trivial | passes | DINO supervision was wrong shape; encoder is fine | Iter 23 = patch-level DINOSAUR |
+| trivial | trivial | trivial | Encoder genuinely cannot route per-slot features to z_static at all | Revisit slot-binding mechanism (K=8 queries not competing enough) |
+
+**Walltime budget.** ~12 h sequential — 10 min smoke + 1-3 h DINO cache + 3 h × 2 trainings + ~15 min probes. PACE H200 partition.
+
+---
+
 ## Changelog
 
 | Date | Update |
@@ -365,3 +464,6 @@ Same checkpoint, same head, same labels — only the inference-time `q` differs.
 | 2026-05-11 | EventHead motion-teacher F1=0.632 on 5 vids (v4 recipe). Beats GT-teacher ceiling (0.625). Two non-obvious bugs (abs_thresh=0.05, Conv1d window mismatch) found and fixed. |
 | 2026-05-12 | 20-vid scale-up exposed structural head bug: per-slot Conv1d blind to pair info. `qva_nn` fix added — standalone head overfits 20 vids in 0.5 s (F1=0.605). Full pipeline limited by encoder q_pred noise (P=0.07 → 0.86 when fed GT q at inference). q-smoothness regularizer added but λ=1.0 below biting threshold. |
 | 2026-05-14 | **Iter 21**: full-CLEVRER scale (10,000 videos, 40,000 windows). 60 epochs, recon 0.0104 / val_recon 0.0078 — *val < train* (Iter 18 was 2.4× overfit). Architecture and recipe generalize; disentanglement probes pending. Renamed RESULTS.md → DEVLOG.md. |
+| 2026-05-15 | Cleanup: removed dead SlotQueryEncoder/EventHead/wan-flow code (71 files, ~10k LoC). README rewritten for the TrajectoryEncoder pipeline. Live tree narrowed to `scripts/{cache_wan_latents, train_trajectory, probe_iter21_identity}` + `src/{model/trajectory_encoder, data/clevrer_paired, data/clevrer_states}`. |
+| 2026-05-18 | **Iter 21 identity probe — load-bearing test failed.** Linear probe (50/50 video split within trainer val pool) on per-video-averaged z_static: color 0.156 / material 0.502 / shape 0.364, all at or near majority baseline. Probe-train accuracy is also low → not a generalization gap, the features simply do not contain identity. Three-variant diagnostic (probe_iter21_zdyn_diag.py) ruled out both slot drift and identity-in-z_dyn — z_dyn_mean also at chance for material/shape, color +5 pp at best. Diagnosis: identity is nowhere. The recon objective on Wan-VAE latents does not carry enough semantic gradient. |
+| 2026-05-19 | Iter 22 plan: two parallel branches, single sbatch. **22a** = Iter 21 recipe + `--lambda_dino 0.5` (existing CLS-level alignment hook). **22c** = Iter 21 recipe + new `--lambda_attrs 1.0` (supervised AttrsHead, CE on GT color/material/shape from z_static). Added `AttrsHead` class to `src/model/trajectory_encoder.py`; wired `--lambda_attrs` / `--attrs_hidden` plumbing in `train_trajectory.py`; restored deleted `scripts/cache_dino_features.py` with resume + `--max_windows` smoke flag; added DINO-shape assertion in trainer einsum; bundled all stages into `scripts/sbatch_iter22_full.sh` (Phase 0 smoke → Phase 1 full DINO cache → Phase 2 Iter22a → Phase 3 Iter22c → Phase 4 probes on each, ~12 h walltime). |
