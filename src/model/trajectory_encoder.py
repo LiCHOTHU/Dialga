@@ -365,6 +365,34 @@ class TrajectoryDecoder(nn.Module):
         return out
 
 
+# -------------------------------------------------------------------- heads
+
+
+class AttrsHead(nn.Module):
+    """Supervised per-slot identity head: predict (color, material, shape) from z_static.
+
+    Used by the iter-22c diagnostic (option C in the iter-22 plan) — direct
+    supervision on the GT attrs to test whether the encoder *can* route
+    identity into z_static when forced to, regardless of whether DINO-CLS is
+    a sufficient teacher.
+    """
+
+    def __init__(self, d_static: int, n_color: int = 8, n_material: int = 2,
+                 n_shape: int = 3, hidden: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_static, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, n_color + n_material + n_shape),
+        )
+        self.splits = (n_color, n_material, n_shape)
+
+    def forward(self, z_static: torch.Tensor):
+        """z_static: (B, K, d_static) → (logits_color, logits_material, logits_shape)."""
+        x = self.net(z_static)
+        return torch.split(x, self.splits, dim=-1)
+
+
 # -------------------------------------------------------------------- loss
 
 

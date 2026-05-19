@@ -31,9 +31,10 @@ from torch.utils.data import Dataset, DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.model.trajectory_encoder import (
-    TrajectoryEncoder, TrajectoryDecoder, DynPredictor, fill_z_dyn,
+    TrajectoryEncoder, TrajectoryDecoder, DynPredictor, AttrsHead, fill_z_dyn,
     event_to_alpha, trajectory_loss, slot_contrast_loss,
 )
+from src.data.clevrer_states import COLOR_VOCAB, MATERIAL_VOCAB, SHAPE_VOCAB
 
 
 class CachedLatentDataset(Dataset):
@@ -168,6 +169,11 @@ def main():
                          "0 = no split (overfit mode); 0.2 = 80/20 split.")
     ap.add_argument("--val_every", type=int, default=10,
                     help="Run validation every N epochs.")
+    ap.add_argument("--lambda_attrs", type=float, default=0.0,
+                    help="Supervised CE on (color/material/shape) GT attrs from z_static. "
+                         "Forces identity into z_static by direct supervision.")
+    ap.add_argument("--attrs_hidden", type=int, default=64,
+                    help="Hidden dim of the AttrsHead MLP.")
     ap.add_argument("--lambda_dino", type=float, default=0.0,
                     help="DINOSAUR-style auxiliary loss: MSE between projected "
                          "z_static and visibility-weighted DINOv2 CLS features. "
@@ -242,6 +248,20 @@ def main():
         print(f"[dino] alignment head ON (d_static={args.d_static} → {args.d_dino}, "
               f"λ_dino={args.lambda_dino})")
 
+    # Supervised attrs head: predict (color, material, shape) directly from z_static.
+    attrs_head = None
+    if args.lambda_attrs > 0:
+        attrs_head = AttrsHead(
+            d_static=args.d_static,
+            n_color=len(COLOR_VOCAB),
+            n_material=len(MATERIAL_VOCAB),
+            n_shape=len(SHAPE_VOCAB),
+            hidden=args.attrs_hidden,
+        ).to(device)
+        print(f"[attrs] supervised head ON (z_static[{args.d_static}] → "
+              f"({len(COLOR_VOCAB)},{len(MATERIAL_VOCAB)},{len(SHAPE_VOCAB)})  "
+              f"hidden={args.attrs_hidden}  λ_attrs={args.lambda_attrs})")
+
     n_enc = sum(p.numel() for p in enc.parameters())
     n_dec = sum(p.numel() for p in dec.parameters())
     n_pred = sum(p.numel() for p in pred.parameters()) if pred is not None else 0
@@ -253,6 +273,8 @@ def main():
         params = params + list(pred.parameters())
     if dino_head is not None:
         params = params + list(dino_head.parameters())
+    if attrs_head is not None:
+        params = params + list(attrs_head.parameters())
     optim = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
 
@@ -304,6 +326,10 @@ def main():
             if args.lambda_dino > 0 and dino_head is not None and "dino_cls" in batch:
                 dino_cls = batch["dino_cls"].to(device)               # (B, T_pix, 384)
                 visib = batch["visibility"].to(device).float()        # (B, T_pix, K)
+                assert dino_cls.shape[1] == visib.shape[1], (
+                    f"DINO T_pix={dino_cls.shape[1]} vs visib T={visib.shape[1]}; "
+                    f"these must agree at the pixel-frame granularity"
+                )
                 slot_mask_b = batch["slot_mask"].to(device).float()    # (B, K)
                 w_sum = visib.sum(dim=1).clamp_min(1e-3)               # (B, K)
                 # Per-slot target = visibility-weighted mean DINO CLS over time
@@ -314,6 +340,36 @@ def main():
                     dino_loss = (err * slot_mask_b).sum() / slot_mask_b.sum()
                     loss = loss + args.lambda_dino * dino_loss
                     dino_loss_val = float(dino_loss.detach())
+
+            # Supervised attrs head: per-slot CE on (color, material, shape) GT.
+            attrs_loss_val = 0.0
+            if args.lambda_attrs > 0 and attrs_head is not None:
+                attrs = batch["attrs"].to(device)                     # (B, K, A)
+                slot_mask_b = batch["slot_mask"].to(device).float()    # (B, K)
+                n_c = len(COLOR_VOCAB)
+                n_m = len(MATERIAL_VOCAB)
+                n_s = len(SHAPE_VOCAB)
+                color_t = attrs[..., :n_c].argmax(dim=-1)                # (B, K)
+                mat_t   = attrs[..., n_c:n_c + n_m].argmax(dim=-1)       # (B, K)
+                shape_t = attrs[..., n_c + n_m:n_c + n_m + n_s].argmax(dim=-1)  # (B, K)
+                logits_c, logits_m, logits_s = attrs_head(z_static)     # each (B, K, n_*)
+
+                def ce_per_slot(logits, target):
+                    # logits: (B, K, C), target: (B, K)
+                    B_, K_, C_ = logits.shape
+                    return F.cross_entropy(
+                        logits.reshape(-1, C_),
+                        target.reshape(-1),
+                        reduction="none",
+                    ).reshape(B_, K_)
+
+                ce_sum = (ce_per_slot(logits_c, color_t)
+                          + ce_per_slot(logits_m, mat_t)
+                          + ce_per_slot(logits_s, shape_t))            # (B, K)
+                denom = slot_mask_b.sum().clamp_min(1.0)
+                attrs_loss = (slot_mask_b * ce_sum).sum() / denom
+                loss = loss + args.lambda_attrs * attrs_loss
+                attrs_loss_val = float(attrs_loss.detach())
 
             # GT-visibility event supervision (weak supervision)
             event_sup_loss_val = 0.0
@@ -407,6 +463,10 @@ def main():
             }
             if pred is not None:
                 ckpt["predictor_state_dict"] = pred.state_dict()
+            if dino_head is not None:
+                ckpt["dino_head_state_dict"] = dino_head.state_dict()
+            if attrs_head is not None:
+                ckpt["attrs_head_state_dict"] = attrs_head.state_dict()
             ckpt_path = out_dir / "trajectory.pt"
             torch.save(ckpt, ckpt_path)
             print(f"  saved → {ckpt_path}")
