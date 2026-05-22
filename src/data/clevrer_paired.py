@@ -66,6 +66,7 @@ class ClevrerPairedDataset(Dataset):
         coordinate_mode="world_xy",
         image_size=128,
         seed=0,
+        deterministic_starts=None,
     ):
         self.data_dir = data_dir
         self.window_length = int(window_length)
@@ -74,6 +75,12 @@ class ClevrerPairedDataset(Dataset):
         self.max_videos = int(max_videos)
         self.image_size = int(image_size)
         self.seed = int(seed)
+        # If provided, list of exact start_frame offsets to emit per video
+        # (e.g. [0, 33, 66] for v5.1). Overrides windows_per_video random sampling.
+        self.deterministic_starts = (
+            tuple(int(s) for s in deterministic_starts)
+            if deterministic_starts is not None else None
+        )
         if self.window_length < 3:
             raise ValueError("window_length must be at least 3 (DEL needs triples).")
 
@@ -117,7 +124,14 @@ class ClevrerPairedDataset(Dataset):
         samples = []
         for key in video_keys:
             entries = per_video[key]
-            if self.windows_per_video >= len(entries):
+            if self.deterministic_starts is not None:
+                by_start = {int(s): w for w, s in entries}
+                chosen = []
+                for s in self.deterministic_starts:
+                    if s in by_start:
+                        chosen.append((by_start[s], s))
+                    # silently skip if a requested start isn't valid for this video
+            elif self.windows_per_video >= len(entries):
                 chosen = entries
             else:
                 chosen = sorted(rng.sample(entries, k=self.windows_per_video))

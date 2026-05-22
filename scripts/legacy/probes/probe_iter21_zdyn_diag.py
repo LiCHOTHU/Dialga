@@ -39,8 +39,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.clevrer_states import COLOR_VOCAB, MATERIAL_VOCAB, SHAPE_VOCAB
-from src.model.trajectory_encoder import TrajectoryEncoder
-from scripts.train_trajectory import CachedLatentDataset, collate
+from src.model.trajectory_encoder_v21 import TrajectoryEncoder, TrajectoryEncoderSA
+from scripts.legacy.train_trajectory import CachedLatentDataset, collate
 
 
 ATTR_GROUPS = [
@@ -225,14 +225,23 @@ def main():
 
     sample = ds_val[0]
     C, T, H, W = sample["latent"].shape
-    enc = TrajectoryEncoder(
-        latent_ch=C, K=K, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
-        T_max=max(T * 2, 16), spatial_size=H, d_static=d_static, d_dyn=d_dyn,
-        dropout=0.0,
-    ).to(device)
+    use_sa = bool(a.get("use_slot_attn", False))
+    if use_sa:
+        enc = TrajectoryEncoderSA(
+            latent_ch=C, K=K, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            T_max=max(T * 2, 16), spatial_size=H, d_static=d_static, d_dyn=d_dyn,
+            sa_iters=int(a.get("sa_iters", 3)), dropout=0.0,
+        ).to(device)
+    else:
+        enc = TrajectoryEncoder(
+            latent_ch=C, K=K, d_model=d_model, n_heads=n_heads, n_layers=n_layers,
+            T_max=max(T * 2, 16), spatial_size=H, d_static=d_static, d_dyn=d_dyn,
+            dropout=0.0,
+        ).to(device)
     enc.load_state_dict(ckpt.get("encoder_state_dict", ckpt.get("encoder", ckpt)))
     enc.eval()
-    print(f"[model] encoder loaded  K={K} d_static={d_static} d_dyn={d_dyn}")
+    print(f"[model] encoder loaded  K={K} d_static={d_static} d_dyn={d_dyn}  "
+          f"({'SA' if use_sa else 'baseline'})")
 
     loader = DataLoader(ds_val, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers, collate_fn=collate)
@@ -273,7 +282,7 @@ def main():
         ATTR_GROUPS, device, args.probe_epochs, args.probe_lr, args.probe_wd,
     )
 
-    print("\n=== summary (test accuracy / majority baseline) ===")
+    print("\n=== summary (TEST accuracy / majority baseline) ===")
     print(f"{'group':10s} | {'z_static avg':>14s} | {'z_static win':>14s} | {'z_dyn_mean':>14s} | {'majority':>10s}")
     for g, _, _, _ in ATTR_GROUPS:
         rs_avg = results["z_static_per_video_avg"][g]
@@ -281,6 +290,25 @@ def main():
         rd_win = results["z_dyn_mean_per_window"][g]
         print(f"{g:10s} | {rs_avg['test_acc']:>14.3f} | {rs_win['test_acc']:>14.3f} | "
               f"{rd_win['test_acc']:>14.3f} | {rs_avg['majority_baseline']:>10.3f}")
+
+    print("\n=== summary (TRAIN accuracy — gap vs test diagnoses overfit) ===")
+    print(f"{'group':10s} | {'z_static avg':>14s} | {'z_static win':>14s} | {'z_dyn_mean':>14s}")
+    for g, _, _, _ in ATTR_GROUPS:
+        rs_avg = results["z_static_per_video_avg"][g]
+        rs_win = results["z_static_per_window"][g]
+        rd_win = results["z_dyn_mean_per_window"][g]
+        print(f"{g:10s} | {rs_avg['train_acc']:>14.3f} | {rs_win['train_acc']:>14.3f} | "
+              f"{rd_win['train_acc']:>14.3f}")
+
+    print("\n=== summary (TRAIN − TEST gap; large gap = probe overfits, signal weak) ===")
+    print(f"{'group':10s} | {'z_static avg':>14s} | {'z_static win':>14s} | {'z_dyn_mean':>14s}")
+    for g, _, _, _ in ATTR_GROUPS:
+        rs_avg = results["z_static_per_video_avg"][g]
+        rs_win = results["z_static_per_window"][g]
+        rd_win = results["z_dyn_mean_per_window"][g]
+        print(f"{g:10s} | {rs_avg['train_acc']-rs_avg['test_acc']:>+14.3f} | "
+              f"{rs_win['train_acc']-rs_win['test_acc']:>+14.3f} | "
+              f"{rd_win['train_acc']-rd_win['test_acc']:>+14.3f}")
 
     out_path = Path(args.ckpt).parent / "probe_identity_diag.json"
     with open(out_path, "w") as f:

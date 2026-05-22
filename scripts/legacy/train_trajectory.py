@@ -30,8 +30,9 @@ from torch.utils.data import Dataset, DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.model.trajectory_encoder import (
-    TrajectoryEncoder, TrajectoryDecoder, DynPredictor, AttrsHead, fill_z_dyn,
+from src.model.trajectory_encoder_v21 import (
+    TrajectoryEncoder, TrajectoryEncoderSA,
+    TrajectoryDecoder, DynPredictor, AttrsHead, fill_z_dyn,
     event_to_alpha, trajectory_loss, slot_contrast_loss,
 )
 from src.data.clevrer_states import COLOR_VOCAB, MATERIAL_VOCAB, SHAPE_VOCAB
@@ -186,6 +187,11 @@ def main():
 
     ap.add_argument("--use_predictor", action="store_true",
                     help="Fill z_dyn at masked positions via DynPredictor before decoding.")
+    ap.add_argument("--use_slot_attn", action="store_true",
+                    help="Use TrajectoryEncoderSA (Locatello-style competitive Slot Attention "
+                         "front-end + temporal transformer on slot tokens only).")
+    ap.add_argument("--sa_iters", type=int, default=3,
+                    help="Number of Slot Attention iterations per frame (default 3).")
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--log_every", type=int, default=10)
     ap.add_argument("--ckpt_every", type=int, default=50)
@@ -218,13 +224,24 @@ def main():
                                 num_workers=args.num_workers, collate_fn=collate,
                                 pin_memory=(device.type == "cuda"))
 
-    enc = TrajectoryEncoder(
-        latent_ch=C, K=args.K, d_model=args.d_model, n_heads=args.n_heads,
-        n_layers=args.n_layers, T_max=max(T_lat * 2, 16),
-        spatial_size=H_lat,
-        d_static=args.d_static, d_dyn=args.d_dyn,
-        dropout=args.dropout,
-    ).to(device)
+    if args.use_slot_attn:
+        enc = TrajectoryEncoderSA(
+            latent_ch=C, K=args.K, d_model=args.d_model, n_heads=args.n_heads,
+            n_layers=args.n_layers, T_max=max(T_lat * 2, 16),
+            spatial_size=H_lat,
+            d_static=args.d_static, d_dyn=args.d_dyn,
+            sa_iters=args.sa_iters,
+            dropout=args.dropout,
+        ).to(device)
+        print(f"[encoder] Slot-Attention front-end ON  (sa_iters={args.sa_iters})")
+    else:
+        enc = TrajectoryEncoder(
+            latent_ch=C, K=args.K, d_model=args.d_model, n_heads=args.n_heads,
+            n_layers=args.n_layers, T_max=max(T_lat * 2, 16),
+            spatial_size=H_lat,
+            d_static=args.d_static, d_dyn=args.d_dyn,
+            dropout=args.dropout,
+        ).to(device)
     dec = TrajectoryDecoder(
         latent_ch=C, K=args.K, d_model=args.d_model, n_heads=args.n_heads,
         n_layers=args.n_layers, T_max=max(T_lat * 2, 16),

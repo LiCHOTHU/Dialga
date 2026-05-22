@@ -38,6 +38,181 @@ import torch.nn.functional as F
 # -------------------------------------------------------------------- encoder
 
 
+class SlotAttention(nn.Module):
+    """Locatello-style competitive Slot Attention.
+
+    Each iteration:
+      1. q = Linear(LN(slots));  k, v = Linear(LN(features))
+      2. attn = softmax(q @ k.T / sqrt(D), dim=SLOTS) -- COMPETITIVE
+         (slots compete over each input position; each input goes mostly to one slot)
+      3. attn_norm = attn / attn.sum(dim=INPUTS)         (per-slot mass normalization)
+      4. updates = attn_norm @ v
+      5. slots <- GRU(updates, slots);  slots += MLP(LN(slots))
+
+    Apply per-frame with `slots` carried across frames (SAVi corrector) for slot
+    identity continuity. Forward returns the updated slots and the final
+    attention (B, K, N) so we can diagnose binding sharpness.
+    """
+
+    def __init__(self, d_model: int, n_iters: int = 3, dropout: float = 0.0,
+                 mlp_hidden_mult: int = 2, eps: float = 1e-8):
+        super().__init__()
+        self.n_iters = int(n_iters)
+        self.d_model = int(d_model)
+        self.eps = float(eps)
+        self.scale = d_model ** -0.5
+        self.norm_slots = nn.LayerNorm(d_model)
+        self.norm_inputs = nn.LayerNorm(d_model)
+        self.norm_post = nn.LayerNorm(d_model)
+        self.to_q = nn.Linear(d_model, d_model, bias=False)
+        self.to_k = nn.Linear(d_model, d_model, bias=False)
+        self.to_v = nn.Linear(d_model, d_model, bias=False)
+        self.gru = nn.GRUCell(d_model, d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_model * mlp_hidden_mult),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * mlp_hidden_mult, d_model),
+        )
+
+    def forward(self, slots: torch.Tensor, features: torch.Tensor):
+        """slots:    (B, K, D)   carries-in from prior frame (or learned init at t=0).
+           features: (B, N, D)   per-position tokens at the current frame.
+        Returns:
+           slots:    (B, K, D)   updated.
+           attn:     (B, K, N)   final-iter attention (renormalized per slot).
+        """
+        B, K, D = slots.shape
+        f_in = self.norm_inputs(features)
+        k = self.to_k(f_in) * self.scale
+        v = self.to_v(f_in)
+
+        attn_n = None
+        for _ in range(self.n_iters):
+            slots_prev = slots
+            q = self.to_q(self.norm_slots(slots))                          # (B, K, D)
+            logits = torch.einsum("bkd,bnd->bkn", q, k)                    # (B, K, N)
+            # Competitive softmax along the SLOT axis (dim=1):
+            attn = logits.softmax(dim=1)                                   # (B, K, N)
+            # Per-slot mass normalization so each slot's row sums to 1.
+            # attn_n is what we use to aggregate v AND what we return for
+            # diagnostics (proper distribution over inputs N).
+            attn_n = attn + self.eps
+            attn_n = attn_n / attn_n.sum(dim=-1, keepdim=True)
+            updates = torch.einsum("bkn,bnd->bkd", attn_n, v)              # (B, K, D)
+            slots = self.gru(
+                updates.reshape(B * K, D),
+                slots_prev.reshape(B * K, D),
+            ).reshape(B, K, D)
+            slots = slots + self.mlp(self.norm_post(slots))
+        return slots, attn_n
+
+
+class TrajectoryEncoderSA(nn.Module):
+    """Slot-Attention front-end + bidirectional transformer over slot tokens only.
+
+    Pipeline:
+      1. patch_embed:    (B, C, T, H, W) -> (B, T, S, d)  + spatial/temporal pos
+      2. SlotAttention per-frame with cross-frame continuity
+         slots_t = SlotAttention(slots_{t-1}, features_t)     # competitive binding
+         -> (B, T, K, d)
+      3. transformer over [static_slot_q  ||  frame_slot_tokens]   (no patches)
+         -> (B, K + T*K, d)
+      4. heads produce z_static, z_dyn, event_logits, null_logits
+
+    Same I/O contract as TrajectoryEncoder (same losses/heads work unchanged).
+    """
+
+    def __init__(
+        self,
+        latent_ch: int = 48,
+        K: int = 8,
+        d_model: int = 192,
+        n_heads: int = 4,
+        n_layers: int = 4,
+        T_max: int = 32,
+        spatial_size: int = 8,
+        d_static: int = 16,
+        d_dyn: int = 32,
+        sa_iters: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.K = int(K); self.d_model = int(d_model)
+        self.d_static = int(d_static); self.d_dyn = int(d_dyn)
+        self.spatial_size = int(spatial_size)
+
+        S = self.spatial_size * self.spatial_size
+        self.input_proj = nn.Linear(latent_ch, d_model)
+        self.temporal_pos = nn.Embedding(T_max, d_model)
+        self.spatial_pos = nn.Parameter(torch.zeros(1, 1, S, d_model))
+        nn.init.trunc_normal_(self.spatial_pos, std=0.02)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, 1, d_model))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        # Initial slot vectors at t=0 (learned, shared across batch). After t=0
+        # slots carry forward through frames inside the encoder loop.
+        self.slot_queries = nn.Parameter(torch.zeros(1, K, d_model))
+        nn.init.trunc_normal_(self.slot_queries, std=0.02)
+
+        # Time-invariant static-summary queries fed to the transformer.
+        self.static_slot_q = nn.Parameter(torch.zeros(1, K, d_model))
+        nn.init.trunc_normal_(self.static_slot_q, std=0.02)
+
+        self.slot_attn = SlotAttention(d_model, n_iters=sa_iters, dropout=dropout)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=4 * d_model,
+            batch_first=True, norm_first=True, activation="gelu",
+            dropout=dropout,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.out_norm = nn.LayerNorm(d_model)
+
+        self.static_head = nn.Linear(d_model, d_static)
+        self.dyn_head = nn.Linear(d_model, d_dyn)
+        self.event_logit_head = nn.Linear(d_model, 1)
+        self.null_logit_head = nn.Linear(d_model, 1)
+
+    def forward(self, wan_latent: torch.Tensor, frame_mask: torch.Tensor | None = None):
+        B, C, T, H, W = wan_latent.shape
+        S = H * W
+        assert H == W == self.spatial_size
+
+        x = wan_latent.permute(0, 2, 3, 4, 1).reshape(B, T, S, C)
+        x = self.input_proj(x)
+        x = x + self.spatial_pos
+        t_idx = torch.arange(T, device=x.device)
+        x = x + self.temporal_pos(t_idx)[None, :, None, :]
+        if frame_mask is not None:
+            vis = frame_mask.to(x.dtype).view(B, T, 1, 1)
+            x = vis * x + (1.0 - vis) * self.mask_token
+
+        # Per-frame Slot Attention with continuity (SAVi-style corrector).
+        slots = self.slot_queries.expand(B, -1, -1).contiguous()
+        slots_per_frame = []
+        for t in range(T):
+            slots, _ = self.slot_attn(slots, x[:, t])              # (B, K, d)
+            slots_per_frame.append(slots)
+        slots_per_frame = torch.stack(slots_per_frame, dim=1)      # (B, T, K, d)
+
+        # Transformer over slot tokens only (no more patch tokens).
+        static_q = self.static_slot_q.expand(B, -1, -1)            # (B, K, d)
+        frame_tokens = slots_per_frame.reshape(B, T * self.K, -1)
+        tokens = torch.cat([static_q, frame_tokens], dim=1)        # (B, K + T*K, d)
+
+        tokens = self.encoder(tokens)
+        tokens = self.out_norm(tokens)
+        static_out = tokens[:, :self.K]                            # (B, K, d_model)
+        frame_out = tokens[:, self.K:].reshape(B, T, self.K, -1)   # (B, T, K, d_model)
+
+        z_static = self.static_head(static_out)
+        z_dyn = self.dyn_head(frame_out)
+        event_logits = self.event_logit_head(frame_out).squeeze(-1)
+        null_logits = self.null_logit_head(static_out).squeeze(-1)
+        return z_static, z_dyn, event_logits, null_logits
+
+
 class TrajectoryEncoder(nn.Module):
     """Bidirectional encoder over VAE-latent video, emits three components.
 

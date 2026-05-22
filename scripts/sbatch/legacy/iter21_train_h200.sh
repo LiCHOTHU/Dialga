@@ -29,7 +29,7 @@ OUT=/storage/home/hcoda1/8/lwang831/workspace/Dialga/outputs/iter21_10000vid_$(d
 mkdir -p "$OUT"
 echo "[launcher] launching training → $OUT" | tee -a "$TLOG"
 
-$RIVER_PY -u scripts/train_trajectory.py \
+$RIVER_PY -u scripts/legacy/train_trajectory.py \
   --cache_dir "$CACHE" \
   --out_dir "$OUT" \
   --epochs 60 --batch_size 4 --num_workers 0 \

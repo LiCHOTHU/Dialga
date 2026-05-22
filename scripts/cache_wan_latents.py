@@ -82,6 +82,9 @@ def main():
                     choices=["float16", "bfloat16", "float32"])
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--out_dir", type=str, required=True)
+    ap.add_argument("--deterministic_starts", type=str, default=None,
+                    help="Comma-separated start_frame offsets per video, e.g. '0,33,66'. "
+                         "If set, overrides windows_per_video random sampling.")
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -91,6 +94,11 @@ def main():
 
     out_dir = Path(args.out_dir)
     (out_dir / "latents").mkdir(parents=True, exist_ok=True)
+
+    det_starts = None
+    if args.deterministic_starts:
+        det_starts = [int(s) for s in args.deterministic_starts.split(",")]
+        print(f"[data] deterministic starts: {det_starts}")
 
     # Build the dataset — gives us (video_id, start_frame, frames, state) windows.
     ds = ClevrerPairedDataset(
@@ -105,6 +113,7 @@ def main():
         coordinate_mode="world_xy",
         image_size=args.image_size,
         seed=args.seed,
+        deterministic_starts=det_starts,
     )
     print(f"[data] {len(ds)} windows over {args.max_videos} videos "
           f"(W={args.window_length} frames each)")

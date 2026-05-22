@@ -87,7 +87,7 @@ python -u scripts/cache_wan_latents.py \
 gate $? "phase0a_wan_cache"
 
 echo ""; echo "==== Phase 0b: tiny DINO cache (may download dinov2-small) ===="
-python -u scripts/cache_dino_features.py \
+python -u scripts/legacy/cache_dino_features.py \
     --cache_dir "${SMOKE_DIR}" \
     --data_dir "${DATA_DIR}" \
     --annotation_dir "${ANNOTATION_DIR}" \
@@ -110,7 +110,7 @@ print('OK contract holds')
 gate $? "phase0c_contract_check"
 
 echo ""; echo "==== Phase 0d: 1-epoch smoke train with --lambda_dino 0.5 ===="
-python -u scripts/train_trajectory.py \
+python -u scripts/legacy/train_trajectory.py \
     --cache_dir "${SMOKE_DIR}" \
     --out_dir "${SMOKE_DIR}/smoke_dino" \
     --epochs 1 --batch_size 4 --num_workers 0 \
@@ -124,7 +124,7 @@ python -u scripts/train_trajectory.py \
 gate $? "phase0d_smoke_dino_train"
 
 echo ""; echo "==== Phase 0e: 1-epoch smoke train with --lambda_attrs 1.0 ===="
-python -u scripts/train_trajectory.py \
+python -u scripts/legacy/train_trajectory.py \
     --cache_dir "${SMOKE_DIR}" \
     --out_dir "${SMOKE_DIR}/smoke_attrs" \
     --epochs 1 --batch_size 4 --num_workers 0 \
@@ -143,7 +143,7 @@ echo ""; echo "Phase 0 PASSED"
 echo ""; echo "==== Phase 1: full DINO cache on 10k Wan cache ===="
 mkdir -p "${WAN_CACHE}/dino"
 
-python -u scripts/cache_dino_features.py \
+python -u scripts/legacy/cache_dino_features.py \
     --cache_dir "${WAN_CACHE}" \
     --data_dir "${DATA_DIR}" \
     --annotation_dir "${ANNOTATION_DIR}" \

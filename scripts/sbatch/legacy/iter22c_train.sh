@@ -80,7 +80,7 @@ echo "Wan cache present: ${N_WAN} latents"
 
 # ---------- Phase 3 Iter 22c training -------------------------------
 echo ""; echo "==== Phase 3: Iter 22c training (--lambda_attrs 1.0) ===="
-python -u scripts/train_trajectory.py \
+python -u scripts/legacy/train_trajectory.py \
     --cache_dir "${WAN_CACHE}" \
     --out_dir "${OUT_DIR}" \
     --epochs 60 --batch_size 4 --num_workers 0 \
@@ -101,13 +101,13 @@ echo "Iter 22c checkpoint: ${CKPT}"
 
 # ---------- Phase 4 probes on 22c -----------------------------------
 echo ""; echo "==== Phase 4c: linear identity probe ===="
-python -u scripts/probe_iter21_identity.py \
+python -u scripts/legacy/probes/probe_iter21_identity.py \
     --cache_dir "${WAN_CACHE}" \
     --ckpt "${CKPT}" \
     --val_frac 0.2 --seed 42 --probe_split_seed 0
 
 echo ""; echo "==== Phase 4c: z_dyn diagnostic probe ===="
-python -u scripts/probe_iter21_zdyn_diag.py \
+python -u scripts/legacy/probes/probe_iter21_zdyn_diag.py \
     --cache_dir "${WAN_CACHE}" \
     --ckpt "${CKPT}" \
     --val_frac 0.2 --seed 42 --probe_split_seed 0

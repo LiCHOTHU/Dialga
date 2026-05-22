@@ -3,28 +3,26 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --gres=gpu:1
-#SBATCH -p gpu-v100,gpu-a100,gpu-h100
-#SBATCH --time=04:00:00
+#SBATCH -p gpu-a100,gpu-h100
+#SBATCH --time=07:45:00
 #SBATCH --mem-per-gpu=48G
-#SBATCH --job-name=dialga_iter22a
+#SBATCH --job-name=dialga_iter22c_a100
 #SBATCH --qos=embers
 #SBATCH --account=gts-agarg35
 #SBATCH --output=/storage/project/r-agarg35-0/lwang831/outputs/dialga/logs/%x_%j.out
 #SBATCH --error=/storage/project/r-agarg35-0/lwang831/outputs/dialga/logs/%x_%j.err
 
 # ===================================================================
-# Iter 22 — Job 2/3: Iter 22a training (--lambda_dino 0.5) + probes.
+# Iter 22c re-run on A100/H100 — color baseline reference.
 #
-# Depends on the DINO cache produced by sbatch_iter22_cache.sh.
-# Submit with: sbatch --dependency=afterok:<CACHE_JOBID>
+# Changes vs first attempt (which timed out at ep 5/60 on V100):
+#   - drop gpu-v100 partition (was 50 min/ep there)
+#   - batch_size 4 -> 16 (A100 80GB has plenty of headroom)
+#   - num_workers 0 -> 4 (dataloader was the V100 bottleneck)
+#   - wallclock 4h -> 7h45 (embers QoS cap is 8h)
+# Same loss recipe as before: lambda_attrs=1.0, 60 epochs, lr=5e-4.
 #
-# After training, runs the linear identity probe and the z_dyn
-# diagnostic probe on the produced checkpoint.
-#
-# Outputs:
-#   /storage/home/.../outputs/iter22a_dino_${STAMP}/trajectory.pt
-#   /storage/home/.../outputs/iter22a_dino_${STAMP}/probe_identity_linear.json
-#   /storage/home/.../outputs/iter22a_dino_${STAMP}/probe_identity_diag.json
+# Probes run after training on the produced ckpt.
 # ===================================================================
 
 set -eo pipefail
@@ -39,15 +37,13 @@ mkdir -p "${LOG_ROOT}"
 cd "${WORKDIR}"
 
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
-OUT_DIR="${WORKDIR}/outputs/iter22a_dino_${STAMP}"
+OUT_DIR="${WORKDIR}/outputs/iter22c_attrs_a100_${STAMP}"
 mkdir -p "${OUT_DIR}"
 
 echo "================ Job Info ================"
 echo "JobID:   ${SLURM_JOB_ID}"
 echo "Node:    ${SLURM_NODELIST}"
-echo "WanCache:${WAN_CACHE}"
 echo "OutDir:  ${OUT_DIR}"
-echo "Stamp:   ${STAMP}"
 echo "Start:   $(date)"
 echo "========================================="
 
@@ -58,7 +54,6 @@ export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export MKL_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export OPENBLAS_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
 export NUMEXPR_NUM_THREADS="${SLURM_CPUS_PER_TASK}"
-
 export TMPDIR="${PROJECT_TMP}"
 export TEMP="${TMPDIR}"
 export TMP="${TMPDIR}"
@@ -70,25 +65,23 @@ mkdir -p "${TMPDIR}" "${MPLCONFIGDIR}"
 nvidia-smi || true
 python -V
 
-# Sanity: DINO cache should exist (job dependency should guarantee, but check).
-N_DINO=$(ls "${WAN_CACHE}/dino" 2>/dev/null | wc -l)
-if [ "${N_DINO}" -lt 1 ]; then
-  echo "*** DINO cache empty at ${WAN_CACHE}/dino — was the cache job run? ***" >&2
+N_WAN=$(ls "${WAN_CACHE}/latents" 2>/dev/null | wc -l)
+if [ "${N_WAN}" -lt 1 ]; then
+  echo "*** Wan cache empty at ${WAN_CACHE}/latents — build it first ***" >&2
   exit 2
 fi
-echo "DINO cache present: ${N_DINO} blobs"
+echo "Wan cache present: ${N_WAN} latents"
 
-# ---------- Phase 2 Iter 22a training -------------------------------
-echo ""; echo "==== Phase 2: Iter 22a training (--lambda_dino 0.5) ===="
-python -u scripts/train_trajectory.py \
+echo ""; echo "==== Training (--lambda_attrs 1.0, batch=16, workers=4, A100) ===="
+python -u scripts/legacy/train_trajectory.py \
     --cache_dir "${WAN_CACHE}" \
     --out_dir "${OUT_DIR}" \
-    --epochs 60 --batch_size 4 --num_workers 0 \
+    --epochs 60 --batch_size 16 --num_workers 4 \
     --lr 5e-4 --weight_decay 1e-3 --dropout 0.1 \
     --K 8 --d_model 192 --d_static 16 --d_dyn 32 \
     --lambda_smooth 0.1 --lambda_entropy 0.01 --lambda_vicreg 0.01 \
     --lambda_event_sup 0.02 \
-    --lambda_dino 0.5 --d_dino 384 \
+    --lambda_attrs 1.0 \
     --val_frac 0.2 --val_every 5 \
     --log_every 50 --ckpt_every 5 \
     --device cuda
@@ -97,21 +90,24 @@ CKPT="${OUT_DIR}/trajectory.pt"
 if [ ! -f "${CKPT}" ]; then
   echo "*** No checkpoint produced at ${CKPT} ***" >&2; exit 3
 fi
-echo "Iter 22a checkpoint: ${CKPT}"
+echo "Checkpoint: ${CKPT}"
 
-# ---------- Phase 4 probes on 22a -----------------------------------
-echo ""; echo "==== Phase 4a: linear identity probe ===="
-python -u scripts/probe_iter21_identity.py \
+echo ""; echo "==== Linear identity probe ===="
+python -u scripts/legacy/probes/probe_iter21_identity.py \
     --cache_dir "${WAN_CACHE}" \
     --ckpt "${CKPT}" \
     --val_frac 0.2 --seed 42 --probe_split_seed 0
 
-echo ""; echo "==== Phase 4a: z_dyn diagnostic probe ===="
-python -u scripts/probe_iter21_zdyn_diag.py \
+echo ""; echo "==== z_dyn diagnostic probe ===="
+python -u scripts/legacy/probes/probe_iter21_zdyn_diag.py \
+    --cache_dir "${WAN_CACHE}" \
+    --ckpt "${CKPT}" \
+    --val_frac 0.2 --seed 42 --probe_split_seed 0
+
+echo ""; echo "==== Per-slot GT-position raw-latent probe ===="
+python -u scripts/legacy/probes/probe_wan_perslot_gtpos.py \
     --cache_dir "${WAN_CACHE}" \
     --ckpt "${CKPT}" \
     --val_frac 0.2 --seed 42 --probe_split_seed 0
 
 echo ""; echo "Finished at $(date)"
-echo "Results: ${OUT_DIR}/probe_identity_linear.json"
-echo "         ${OUT_DIR}/probe_identity_diag.json"
