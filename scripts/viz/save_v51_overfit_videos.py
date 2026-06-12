@@ -96,7 +96,9 @@ def main():
     chunk_size_lat = int(a.get("chunk_size_lat", 9))
     no_proj = bool(a.get("no_proj", False))
 
-    enc = LatentEncoder3D(d_static=d_static, d_dyn=d_dyn, hidden_ch=enc_hidden_ch).to(device)
+    use_ln = "norm_static.weight" in ckpt["encoder"]
+    enc = LatentEncoder3D(d_static=d_static, d_dyn=d_dyn, hidden_ch=enc_hidden_ch,
+                          use_layer_norm=use_ln).to(device)
     dec = LatentDecoder(d_static=d_static, d_dyn=d_dyn, hidden_ch=dec_hidden_ch,
                         chunk_size_lat=chunk_size_lat).to(device)
     fwd = ForwardDynamics(d_dyn=d_dyn, d_state=d_state, no_proj=no_proj).to(device)
@@ -105,7 +107,9 @@ def main():
     gp = GatePredictor(d_dyn=d_dyn).to(device)
     enc.load_state_dict(ckpt["encoder"])
     dec.load_state_dict(ckpt["decoder"])
-    fwd.load_state_dict(ckpt["fwd"])
+    # v5.1.2 ckpts have forward_dynamics.norm_out; the reverted module doesn't —
+    # ignore extra keys with strict=False so both ckpt generations load.
+    fwd.load_state_dict(ckpt["fwd"], strict=False)
     eh.load_state_dict(ckpt["event_head"])
     ge.load_state_dict(ckpt["g_event"])
     gp.load_state_dict(ckpt["gate_predictor"])

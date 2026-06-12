@@ -43,6 +43,7 @@ class LatentEncoder3D(nn.Module):
         d_dyn: int = 16,
         n_groups: int = 8,
         shared_trunk: bool = False,
+        use_layer_norm: bool = False,
     ):
         super().__init__()
         self.latent_ch = int(latent_ch)
@@ -50,6 +51,7 @@ class LatentEncoder3D(nn.Module):
         self.d_static = int(d_static)
         self.d_dyn = int(d_dyn)
         self.shared_trunk = bool(shared_trunk)
+        self.use_layer_norm = bool(use_layer_norm)
 
         self.trunk_static = _conv3d_trunk(latent_ch, hidden_ch, n_groups)
         if self.shared_trunk:
@@ -60,6 +62,14 @@ class LatentEncoder3D(nn.Module):
 
         self.head_static = nn.Linear(hidden_ch, d_static)
         self.head_dyn = nn.Linear(hidden_ch, d_dyn)
+
+        # v5.1.2 ckpts have these LN layers; pre-v5.1.2 ckpts (v5.pt / v5_best.pt)
+        # do not. Opt-in via use_layer_norm so both populations load cleanly.
+        if self.use_layer_norm:
+            self.norm_static = nn.LayerNorm(d_static)
+            self.norm_dyn = nn.LayerNorm(d_dyn)
+            with torch.no_grad():
+                self.norm_dyn.weight.fill_(15.0 / (d_dyn ** 0.5))
 
     def forward(self, latent_chunk: torch.Tensor) -> dict:
         """
@@ -82,6 +92,9 @@ class LatentEncoder3D(nn.Module):
         z_static = self.head_static(h_s)                             # (B, D_s)
         h_d = h_d_raw.mean(dim=(3, 4)).permute(0, 2, 1).contiguous() # (B, T, hidden_ch)
         z_dyn = self.head_dyn(h_d)                                   # (B, T, D_d)
+        if self.use_layer_norm:
+            z_static = self.norm_static(z_static)
+            z_dyn = self.norm_dyn(z_dyn)
         return {"z_static": z_static, "z_dyn": z_dyn}
 
 

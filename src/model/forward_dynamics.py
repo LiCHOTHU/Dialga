@@ -88,7 +88,8 @@ class ForwardDynamics(nn.Module):
         pos_next = pos + vel * self.dt + 0.5 * a * self.dt * self.dt
         vel_next = vel + a * self.dt
         s_next = torch.cat([pos_next, vel_next], dim=-1)  # (B, d_state)
-        return self.W_unproj(s_next)                       # (B, d_dyn)
+        z_dyn_next = self.W_unproj(s_next)                # (B, d_dyn)
+        return z_dyn_next
 
     def rollout(self, z_dyn_init: torch.Tensor, n_steps: int) -> torch.Tensor:
         """Roll forward n_steps starting from z_dyn_init (one Verlet step per
@@ -130,7 +131,8 @@ class ForwardDynamics(nn.Module):
                 + 0.5 * a.unsqueeze(1) * ts_b * ts_b               # (B, T, d_half)
         vel_t = vel.unsqueeze(1) + a.unsqueeze(1) * ts_b           # (B, T, d_half)
         s_t = torch.cat([pos_t, vel_t], dim=-1)                    # (B, T, d_state)
-        return self.W_unproj(s_t)                                  # (B, T, d_dyn)
+        z_dyn_next = self.W_unproj(s_t)                            # (B, T, d_dyn)
+        return z_dyn_next
 
 
 __all__ = ["ForwardDynamics"]

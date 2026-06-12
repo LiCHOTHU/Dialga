@@ -37,12 +37,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.data.clevrer_states import COLOR_VOCAB, MATERIAL_VOCAB, SHAPE_VOCAB
 from src.data.clevrer_window import ClevrerChunkPairs, chunk_collate
+from src.data.clevrer_window_pixels import ClevrerChunkPairsWithPixels
 from src.loss.info_nce import info_nce
 from src.model.attrs_head import AttrsHead
 from src.model.event_head import EventHead, GEvent, GatePredictor
 from src.model.forward_dynamics import ForwardDynamics
 from src.model.latent_decoder import LatentDecoder
 from src.model.latent_encoder import LatentEncoder3D
+
+
+def load_wan_vae_trainable(model_id, dtype, device, train_enc: bool, train_dec: bool):
+    """Load Wan-VAE and set requires_grad on encoder/decoder submodules per flags.
+    Returns the VAE in train() mode for the unfrozen parts."""
+    from diffusers import AutoencoderKLWan
+    vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype)
+    # Default: freeze everything.
+    for p in vae.parameters():
+        p.requires_grad_(False)
+    # Unfreeze the requested halves.
+    if train_enc and hasattr(vae, "encoder"):
+        for p in vae.encoder.parameters():
+            p.requires_grad_(True)
+    if train_dec and hasattr(vae, "decoder"):
+        for p in vae.decoder.parameters():
+            p.requires_grad_(True)
+    vae.eval()  # keep BN/etc. in eval; only weights have grad
+    return vae.to(device)
+
+
+def _vae_encode(vae, pix: torch.Tensor) -> torch.Tensor:
+    """pix (B, T_pix, 3, H, W) in [-1, 1] -> latent (B, C, T_lat, H_lat, W_lat).
+
+    Wan-VAE expects (B, 3, T_pix, H, W). Matches scripts/cache_wan_latents.py."""
+    x = pix.permute(0, 2, 1, 3, 4).contiguous().to(next(vae.parameters()).dtype)
+    out = vae.encode(x)
+    z = out.latent_dist.mean if hasattr(out, "latent_dist") else out.latents
+    return z.float()                              # (B, C, T_lat, H_lat, W_lat)
+
+
+def _vae_decode(vae, latent: torch.Tensor) -> torch.Tensor:
+    """latent (B, C, T_lat, H_lat, W_lat) -> pix (B, T_pix, 3, H, W) in [-1, 1]."""
+    z = latent.to(next(vae.parameters()).dtype)
+    out = vae.decode(z)
+    pix = out.sample if hasattr(out, "sample") else out          # (B, 3, T_pix, H, W)
+    return pix.permute(0, 2, 1, 3, 4).contiguous().float()
 
 N_COLOR    = len(COLOR_VOCAB)
 N_MATERIAL = len(MATERIAL_VOCAB)
@@ -80,7 +118,7 @@ def stage_at_epoch(ep: int, s1: int, s2: int) -> int:
 
 # --------------------------------------------------------------------- losses
 
-def compute_losses(batch, models, args, stage: int, device):
+def compute_losses(batch, models, args, stage: int, device, vae=None):
     """Compute ALL six losses every step (logged regardless of stage).
     Stage-gating controls only which losses sum into `total`.
 
@@ -93,8 +131,15 @@ def compute_losses(batch, models, args, stage: int, device):
       * L_fwd uses the BASE step (no event correction).
       * L_event_aux trains only event_head + g_event (both fwd and target
         encoded z_dyn are detached).
+
+    v5.1.2 VAE-unfreeze additions (Exp 2/3/4):
+      * If args.unfreeze_vae_enc and vae provided: re-encode pix_* through
+        vae.encoder (with grad) and use those fresh latents as chunk_*.
+      * If args.unfreeze_vae_dec and vae provided: decode recon_obs/recon_pred
+        through vae.decoder (with grad), add L_pixel = MSE(pred_pix, pix_*).
     """
     enc, dec, fwd, eh, ge, gp, ah = models
+    use_pixels = getattr(args, "use_pixels", False)
 
     chunk_obs   = batch["chunk_obs"].to(device)       # (B, C, T, H, W)
     chunk_pred  = batch["chunk_pred"].to(device)
@@ -102,6 +147,16 @@ def compute_losses(batch, models, args, stage: int, device):
     gate_GT     = batch["gate_GT"].to(device).float() # (B,) in {0, 1}
     attrs       = batch["attrs"].to(device)            # (B, K, A) one-hot
     slot_mask   = batch["slot_mask"].to(device)        # (B, K) bool
+
+    # v5.1.2: re-encode raw pixels through Wan-VAE encoder (with grad) so it
+    # gets a gradient signal. Cached latents are overridden.
+    if vae is not None and getattr(args, "unfreeze_vae_enc", False):
+        pix_obs   = batch["pix_obs"].to(device)        # (B, T_pix, 3, H, W)
+        pix_pred  = batch["pix_pred"].to(device)
+        pix_obs_b = batch["pix_obs_b"].to(device)
+        chunk_obs   = _vae_encode(vae, pix_obs)
+        chunk_pred  = _vae_encode(vae, pix_pred)
+        chunk_obs_b = _vae_encode(vae, pix_obs_b)
 
     # ---- three encoder passes ----
     enc_obs  = enc(chunk_obs)
@@ -132,6 +187,27 @@ def compute_losses(batch, models, args, stage: int, device):
     L_recon = F.mse_loss(recon_obs, chunk_obs)
     L_pred = F.mse_loss(recon_pred, chunk_pred)
     L_fwd = F.mse_loss(z_dyn_pred_base, z_dyn_pred_target)
+
+    # v5.1.2: pixel-space supervision. Decode the reconstructed latents through
+    # the Wan decoder and MSE against raw pixels. Done OUTSIDE no-grad so grad
+    # flows through the decoder (frozen OR trainable) back to recon_*, the small
+    # model, and — when the encoder is unfrozen — all the way to the Wan encoder.
+    # This is the ANCHOR that keeps an unfrozen encoder's latents decodable:
+    # without it (Exp 2/e2) the encoder sits on both sides of the latent-space
+    # L_recon and collapses to a trivial low-variance blob (recon -> 0, pixels ->
+    # garbage). Active whenever a VAE is loaded and lambda_pixel > 0, independent
+    # of which half is unfrozen.
+    L_pixel = torch.zeros((), device=device)
+    L_pixel_pred = torch.zeros((), device=device)
+    pixel_on = (vae is not None and getattr(args, "lambda_pixel", 0.0) > 0.0
+                and "pix_obs" in batch)
+    if pixel_on:
+        pix_obs_target  = batch["pix_obs"].to(device)
+        pix_pred_target = batch["pix_pred"].to(device)
+        pred_pix_obs   = _vae_decode(vae, recon_obs)        # (B, T_pix, 3, H, W)
+        pred_pix_pred  = _vae_decode(vae, recon_pred)
+        L_pixel      = F.mse_loss(pred_pix_obs,  pix_obs_target)
+        L_pixel_pred = F.mse_loss(pred_pix_pred, pix_pred_target)
     # Ablation 1: --consist_loss mse replaces InfoNCE with plain MSE on z_static.
     if getattr(args, "consist_loss", "infonce") == "mse":
         L_infonce = F.mse_loss(z_static_a, z_static_b)
@@ -166,14 +242,19 @@ def compute_losses(batch, models, args, stage: int, device):
     # L_gate are still computed (for logging) but never enter `total`. EventHead /
     # GEvent / GatePredictor accordingly receive no gradient and stay near init.
     # L_attrs joins from stage 2 with weight λ_attrs (Exp 1: 0.05).
+    lambda_recon = getattr(args, "lambda_recon", 1.0)
     if stage == 1:
-        total = L_recon
+        total = lambda_recon * L_recon
+        if pixel_on:
+            total = total + args.lambda_pixel * L_pixel
     else:  # stage 2 — production loss for the rest of training
-        total = (L_recon
+        total = (lambda_recon * L_recon
                  + args.lambda_pred * L_pred
                  + args.lambda_fwd * L_fwd
                  + args.lambda_consist * L_infonce
                  + args.lambda_attrs * L_attrs)
+        if pixel_on:
+            total = total + args.lambda_pixel * (L_pixel + L_pixel_pred)
 
     # ---- diagnostics (always logged, never contribute to loss) ----
     with torch.no_grad():
@@ -189,7 +270,8 @@ def compute_losses(batch, models, args, stage: int, device):
 
     return {
         "recon": L_recon, "pred": L_pred, "fwd": L_fwd, "consist": L_infonce,
-        "event_aux": L_event_aux, "gate": L_gate, "attrs": L_attrs, "total": total,
+        "event_aux": L_event_aux, "gate": L_gate, "attrs": L_attrs,
+        "pixel": L_pixel, "pixel_pred": L_pixel_pred, "total": total,
         **diag,
     }
 
@@ -197,13 +279,13 @@ def compute_losses(batch, models, args, stage: int, device):
 # ----------------------------------------------------------------- validation
 
 @torch.no_grad()
-def validate(models, val_loader, args, device):
+def validate(models, val_loader, args, device, vae=None):
     [m.eval() for m in models]
     sums = {}
     n = 0
     for batch in val_loader:
         # stage=3 so every loss + every diagnostic is computed
-        out = compute_losses(batch, models, args, stage=3, device=device)
+        out = compute_losses(batch, models, args, stage=3, device=device, vae=vae)
         B = batch["chunk_obs"].shape[0]
         for k, v in out.items():
             sums[k] = sums.get(k, 0.0) + float(v) * B
@@ -236,6 +318,11 @@ def main():
     ap.add_argument("--dec_hidden_ch", type=int, default=64)
     ap.add_argument("--chunk_size_lat", type=int, default=9)
 
+    ap.add_argument("--lambda_recon",     type=float, default=1.0,
+                    help="Weight on latent-space L_recon = MSE(dec(z), chunk). "
+                         "Set 0 for VAE-unfrozen runs that supervise in pixel space "
+                         "instead (--lambda_pixel>0), so the encoder can't game the "
+                         "latent target by collapsing.")
     ap.add_argument("--lambda_pred",      type=float, default=1.0)
     ap.add_argument("--lambda_fwd",       type=float, default=0.1)
     ap.add_argument("--lambda_consist",   type=float, default=1.0)
@@ -255,7 +342,14 @@ def main():
 
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--log_every",  type=int, default=1)
-    ap.add_argument("--ckpt_every", type=int, default=5)
+    ap.add_argument("--ckpt_every", type=int, default=5,
+                    help="Save an epoch-numbered ckpt_ep{N}.pt every N epochs. "
+                         "A rolling last.pt is always saved every epoch for resume.")
+    ap.add_argument("--resume", type=str, default="",
+                    help="Auto-resume: 'auto' loads <out_dir>/last.pt if present "
+                         "(restores models, VAE, optimizer, scheduler, best-val "
+                         "tracking and epoch). Pass an explicit path to resume from "
+                         "a specific ckpt. Empty = start fresh.")
     ap.add_argument("--max_steps",  type=int, default=0)
     ap.add_argument("--early_stop_patience", type=int, default=0,
                     help="Stop when val_recon hasn't improved for this many val checks. "
@@ -278,7 +372,35 @@ def main():
                     help="W&B run name. Defaults to basename of --out_dir.")
     ap.add_argument("--wandb_mode", type=str, default="online",
                     choices=["online", "offline", "disabled"])
+    # v5.1.2 VAE-unfreeze experiments (Exp 2/3/4)
+    ap.add_argument("--video_dir", type=str,
+                    default="/storage/project/r-agarg35-0/lwang831/dataset/CLEVRER/train_video",
+                    help="Path to raw CLEVRER mp4 root. Used whenever the VAE/pixel "
+                         "path is active (--unfreeze_vae_* or --lambda_pixel>0).")
+    ap.add_argument("--unfreeze_vae_enc", action="store_true",
+                    help="Re-encode raw pixels through Wan-VAE encoder with grad. "
+                         "Latents from cache are ignored for chunk_obs/pred/b.")
+    ap.add_argument("--unfreeze_vae_dec", action="store_true",
+                    help="Decode predicted latents through Wan-VAE decoder with grad "
+                         "and add L_pixel = MSE(pred_pix, GT_pix).")
+    ap.add_argument("--lambda_pixel", type=float, default=0.0,
+                    help="Weight on pixel-space L_pixel = MSE(wan_dec(recon), raw_pix). "
+                         "Any value >0 LOADS the Wan VAE (frozen unless --unfreeze_vae_* "
+                         "is also set) and the raw-pixel dataset, so the frozen control "
+                         "(e1) can be supervised in pixel space exactly like e2/e3. "
+                         "REQUIRED for enc-only runs to keep latents decodable. "
+                         "Default 0 = no VAE, latent-space supervision only.")
+    ap.add_argument("--vae_model_id", type=str, default="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+    ap.add_argument("--vae_dtype", type=str, default="bfloat16",
+                    choices=["float16", "bfloat16", "float32"])
+    ap.add_argument("--vae_lr", type=float, default=0.0,
+                    help="Separate LR for VAE params. 0 = use same as --lr.")
     args = ap.parse_args()
+    # Load the VAE + raw-pixel dataset whenever any VAE half is unfrozen OR a
+    # pixel-space loss is requested (lambda_pixel>0). The latter lets the frozen
+    # control (e1) share e2/e3's pixel supervision with both halves frozen.
+    args.use_pixels = bool(args.unfreeze_vae_enc or args.unfreeze_vae_dec
+                           or args.lambda_pixel > 0.0)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir)
@@ -291,32 +413,43 @@ def main():
         # Quiet wandb's own dir spam (matplotlib etc.)
         os.environ.setdefault("WANDB_DIR", str(out_dir))
         os.environ.setdefault("WANDB_SILENT", "true")
-        wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            mode=args.wandb_mode,
-            config=vars(args),
-            dir=str(out_dir),
-        )
+        # Resume the SAME wandb run across requeues: the run id is stashed in a
+        # small text file in out_dir on first launch.
+        init_kw = dict(project=args.wandb_project, name=run_name,
+                       mode=args.wandb_mode, config=vars(args), dir=str(out_dir))
+        rid_file = out_dir / "wandb_run_id.txt"
+        if args.resume and rid_file.exists():
+            prev_id = rid_file.read_text().strip()
+            if prev_id:
+                init_kw.update(id=prev_id, resume="allow")
+        wandb.init(**init_kw)
+        try:
+            rid_file.write_text(wandb.run.id)
+        except Exception:
+            pass
         print(f"[wandb] project={args.wandb_project} run={run_name} mode={args.wandb_mode}")
     else:
         print("[wandb] disabled" + (" (not installed)" if not _WANDB_OK else ""))
 
     # ---- data ----
+    def _make_ds(split):
+        kw = dict(seed=args.seed, max_videos=args.max_videos)
+        if args.val_frac > 0:
+            kw.update(split=split, val_frac=args.val_frac)
+        if args.use_pixels:
+            return ClevrerChunkPairsWithPixels(args.cache_dir, args.video_dir, **kw)
+        return ClevrerChunkPairs(args.cache_dir, **kw)
+
     if args.val_frac > 0:
-        ds_train = ClevrerChunkPairs(args.cache_dir, split="train",
-                                     val_frac=args.val_frac, seed=args.seed,
-                                     max_videos=args.max_videos)
-        ds_val = ClevrerChunkPairs(args.cache_dir, split="val",
-                                   val_frac=args.val_frac, seed=args.seed,
-                                   max_videos=args.max_videos)
+        ds_train = _make_ds("train")
+        ds_val   = _make_ds("val")
         print(f"[data] train={len(ds_train)} pairs, val={len(ds_val)} pairs "
-              f"(val_frac={args.val_frac})")
+              f"(val_frac={args.val_frac}, use_pixels={args.use_pixels})")
     else:
-        ds_train = ClevrerChunkPairs(args.cache_dir, seed=args.seed,
-                                     max_videos=args.max_videos)
+        ds_train = _make_ds("all")
         ds_val = None
-        print(f"[data] no split: {len(ds_train)} pairs (overfit mode)")
+        print(f"[data] no split: {len(ds_train)} pairs (overfit mode, "
+              f"use_pixels={args.use_pixels})")
 
     pin = (device.type == "cuda")
     loader = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
@@ -353,10 +486,35 @@ def main():
           f"ah {sum(p.numel() for p in ah.parameters())} | "
           f"total {n_total/1e6:.2f}M")
 
+    # ---- (optional) Wan-VAE with selectively-unfrozen halves ----
+    vae = None
+    if args.use_pixels:
+        vae_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+                     "float32": torch.float32}[args.vae_dtype]
+        print(f"[vae] loading {args.vae_model_id} dtype={args.vae_dtype} "
+              f"train_enc={args.unfreeze_vae_enc} train_dec={args.unfreeze_vae_dec}")
+        vae = load_wan_vae_trainable(args.vae_model_id, vae_dtype, device,
+                                     train_enc=args.unfreeze_vae_enc,
+                                     train_dec=args.unfreeze_vae_dec)
+        n_vae_train = sum(p.numel() for p in vae.parameters() if p.requires_grad)
+        n_vae_total = sum(p.numel() for p in vae.parameters())
+        print(f"[vae] {n_vae_total/1e6:.1f}M total, {n_vae_train/1e6:.1f}M trainable")
+
     params = []
     for m in models:
         params += list(m.parameters())
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    if vae is not None:
+        vae_params = [p for p in vae.parameters() if p.requires_grad]
+        if vae_params:
+            vae_lr = args.vae_lr if args.vae_lr > 0 else args.lr
+            opt = torch.optim.AdamW([
+                {"params": params,     "lr": args.lr},
+                {"params": vae_params, "lr": vae_lr},
+            ], weight_decay=args.weight_decay)
+        else:
+            opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
     if args.lr_schedule == "cosine":
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     elif args.lr_schedule == "constant":
@@ -370,17 +528,68 @@ def main():
     best_val_recon = float("inf")
     best_epoch = 0
     val_no_improve = 0
-    for ep in range(1, args.epochs + 1):
+
+    # ---- auto-resume from latest checkpoint ----
+    start_epoch = 1
+    if args.resume:
+        resume_path = None
+        if args.resume == "auto":
+            cand = out_dir / "last.pt"
+            resume_path = cand if cand.exists() else None
+        else:
+            cand = Path(args.resume)
+            resume_path = cand if cand.exists() else None
+        if resume_path is not None:
+            print(f"[resume] loading {resume_path}")
+            ck = torch.load(resume_path, map_location=device)
+            enc.load_state_dict(ck["encoder"])
+            dec.load_state_dict(ck["decoder"])
+            fwd.load_state_dict(ck["fwd"])
+            eh.load_state_dict(ck["event_head"])
+            ge.load_state_dict(ck["g_event"])
+            gp.load_state_dict(ck["gate_predictor"])
+            ah.load_state_dict(ck["attrs_head"])
+            if vae is not None and "wan_vae" in ck:
+                vae.load_state_dict(ck["wan_vae"])
+            if "optimizer" in ck:
+                opt.load_state_dict(ck["optimizer"])
+            if "scheduler" in ck:
+                sched.load_state_dict(ck["scheduler"])
+            step = int(ck.get("step", 0))
+            best_val_recon = float(ck.get("best_val_recon", best_val_recon))
+            best_epoch = int(ck.get("best_epoch", best_epoch))
+            val_no_improve = int(ck.get("val_no_improve", val_no_improve))
+            if isinstance(ck.get("history"), list):
+                history = ck["history"]
+            start_epoch = int(ck.get("epoch", 0)) + 1
+            print(f"[resume] continuing at epoch {start_epoch}/{args.epochs} "
+                  f"(step {step}, best_val_recon={best_val_recon:.5f} @ ep {best_epoch})")
+        else:
+            print(f"[resume] no checkpoint found (--resume {args.resume!r}) "
+                  "— starting fresh")
+
+    if start_epoch > args.epochs:
+        print(f"[resume] already at epoch {start_epoch - 1} >= {args.epochs}; "
+              "nothing to do.")
+        (out_dir / "DONE").write_text(f"epochs={args.epochs}\n")
+        if use_wandb:
+            wandb.finish()
+        return
+
+    for ep in range(start_epoch, args.epochs + 1):
         stage = stage_at_epoch(ep, args.stage1_epochs, args.stage2_epochs)
         sums = {}
         n_batches = 0
         [m.train() for m in models]
         for batch in loader:
-            losses = compute_losses(batch, models, args, stage, device)
+            losses = compute_losses(batch, models, args, stage, device, vae=vae)
             total = losses["total"]
             opt.zero_grad(set_to_none=True)
             total.backward()
-            torch.nn.utils.clip_grad_norm_(params, 1.0)
+            all_grad_params = params + (
+                [p for p in vae.parameters() if p.requires_grad] if vae is not None else []
+            )
+            torch.nn.utils.clip_grad_norm_(all_grad_params, 1.0)
             opt.step()
             step += 1
 
@@ -394,10 +603,13 @@ def main():
 
         val_metrics = None
         if val_loader is not None and (ep % args.val_every == 0 or ep == args.epochs):
-            val_metrics = validate(models, val_loader, args, device)
+            val_metrics = validate(models, val_loader, args, device, vae=vae)
 
         if ep % args.log_every == 0 or ep == 1:
-            keys = ["recon", "pred", "fwd", "consist", "attrs", "event_aux", "gate", "total"]
+            keys = ["recon", "pred", "fwd", "consist", "attrs", "event_aux", "gate"]
+            if args.use_pixels and getattr(args, "lambda_pixel", 0.0) > 0.0:
+                keys += ["pixel", "pixel_pred"]
+            keys += ["total"]
             train_str = " ".join(f"{k}={avg[k]:.5f}" for k in keys if k in avg)
             diag_str = (f" |z_s_std={avg.get('z_static_std', 0):.3f}"
                         f" |z_d_norm={avg.get('z_dyn_obs_norm', 0):.3f}"
@@ -431,7 +643,7 @@ def main():
             wandb.log(log_row, step=ep)
 
         def _build_ckpt():
-            return {
+            ck = {
                 "encoder": enc.state_dict(),
                 "decoder": dec.state_dict(),
                 "fwd": fwd.state_dict(),
@@ -442,11 +654,33 @@ def main():
                 "args": vars(args),
                 "epoch": ep,
                 "step": step,
+                # --- resume state ---
+                "optimizer": opt.state_dict(),
+                "scheduler": sched.state_dict(),
+                "best_val_recon": best_val_recon,
+                "best_epoch": best_epoch,
+                "val_no_improve": val_no_improve,
+                "history": history,
             }
+            # Only save VAE state when something was actually trainable.
+            if vae is not None and any(p.requires_grad for p in vae.parameters()):
+                ck["wan_vae"] = vae.state_dict()
+            return ck
 
+        # Rolling resume ckpt every epoch (overwritten) so a preemption/timeout
+        # loses at most one epoch. Heavy (VAE bundled) but cheap vs 25 min/epoch.
+        ck = _build_ckpt()
+        # Atomic write: a preemption landing mid-save would otherwise truncate
+        # last.pt and break --resume auto. Write to a temp then os.replace (an
+        # atomic rename on POSIX), so last.pt is always a complete checkpoint.
+        tmp_ckpt = out_dir / "last.pt.tmp"
+        torch.save(ck, tmp_ckpt)
+        os.replace(tmp_ckpt, out_dir / "last.pt")
+        (out_dir / "history.json").write_text(json.dumps(history, indent=2))
+        # Organized milestone snapshot every ckpt_every epochs.
         if args.ckpt_every > 0 and (ep % args.ckpt_every == 0 or ep == args.epochs):
-            torch.save(_build_ckpt(), out_dir / "v5.pt")
-            (out_dir / "history.json").write_text(json.dumps(history, indent=2))
+            torch.save(ck, out_dir / f"ckpt_ep{ep:04d}.pt")
+            torch.save(ck, out_dir / "v5.pt")
 
         # ---- early stopping + best-by-val ckpt ----
         # Only eligible once stage 2 has started — stage 1 ends with low val_recon
@@ -478,6 +712,9 @@ def main():
     # Final ckpt + history
     torch.save(_build_ckpt(), out_dir / "v5.pt")
     (out_dir / "history.json").write_text(json.dumps(history, indent=2))
+    # DONE marker: training reached its natural end (final epoch or early stop).
+    # The chained sbatch checks this to know it should stop requeueing.
+    (out_dir / "DONE").write_text(f"epoch={ep} best_val_recon={best_val_recon:.5f}\n")
     print(f"\n[done] final: {avg}")
     print(f"[best] val_recon={best_val_recon:.5f} at ep {best_epoch} (v5_best.pt)")
     if use_wandb:

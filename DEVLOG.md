@@ -896,6 +896,200 @@ Holding off on scaling looks more defensible after this comparison. The paper fr
 
 ---
 
+## v5.1.2 (2026-05-25): VAE-unfreeze experiments — encoder "win" is latent collapse, e4 is a batch-size artifact
+
+Four configs probing whether unfreezing the frozen Wan-2.2 VAE (704.7M) helps: **e1** all-frozen baseline (control), **e2** encoder-only unfrozen, **e3** decoder-only unfrozen (+ pixel-space `L_pixel`), **e4** both unfrozen (+ `L_pixel`). e2/e3/e4 submitted 2026-05-24 on L40S-48GB (embers, `gts-agarg35-ideas_l40s`), output to scratch. **All three were PREEMPTED by embers after 6–7 h** (e3 → ep 20, e2 → ep 36, e4 → ep 9); none requeued. Despite the short budgets the result is clear and cautionary: **the headline recon improvement from unfreezing the encoder is the encoder cheating, not a better representation.**
+
+### Setup
+
+| Knob | e1 frozen | e2 enc | e3 dec | e4 both |
+|---|---|---|---|---|
+| VAE trainable params | 0 | 149.6M (enc) | 555.0M (dec) | 704.7M (both) |
+| Extra loss | — | — | `--lambda_pixel 1.0` | `--lambda_pixel 1.0` |
+| Batch | (baseline) | 2 | 2 | **1** |
+| vae_lr / lr | — / 5e-4 | 1e-5 / 5e-4 | 1e-5 / 5e-4 | 1e-5 / 5e-4 |
+| dtype | — | bf16 | bf16 | bf16 |
+
+Common: 1000 vids, val_frac 0.2, d_static=64/d_dyn=64/d_state=32, enc 128 / dec 256, InfoNCE temp 0.1 (λ_consist=1.0), constant lr.
+
+### Results — matched budget (val @ ~ep 35; lower recon/attrs better)
+
+| Metric | e1 frozen | e2 enc-unfrozen | Read |
+|---|---|---|---|
+| recon (latent MSE) | 0.01795 | **0.00170** | e2 ~10× lower |
+| pred (latent MSE) | 0.03046 | **0.00186** | e2 ~16× lower |
+| **z_static_std** | 0.197 | 0.101 | e2's static code ~½ the spread |
+| **attrs** CE | 2.179 | 2.961 | e1 decodes attributes *better* |
+
+`z_static_std` trajectory (the tell): ep 5 → e1 0.045 / **e2 0.000 (collapsed)**; ep 15 → 0.144 / 0.057; ep 35 → 0.197 / 0.101. e1 converged (ep 335) to val_recon 0.01744, z_s_std 0.385, attrs 0.078.
+
+e3 (dec) reached only ep 20 (val_recon 0.0288, *above* baseline — decoder retraining perturbs recon before reconverging; inconclusive). e4 (both, B=1): `consist=0.00000` every step, `z_s_std=NaN` from ep 1, latent norms drifting (z_dyn 6.3→10.4, z_event 0.3→7.8). No checkpoint saved.
+
+### Findings
+
+1. **The encoder-unfrozen recon win is a moving-target cheat, not representation gain.** When the encoder is trainable, the reconstruction *target* is its own output, so the cheapest way to cut recon loss is to shrink/flatten the latent until it is trivial to reproduce. Evidence at matched budget: e2's `z_static` collapsed to std≈0 by ep 5 and stays at half e1's spread; and e2 decodes object **attributes worse** (CE 2.96 vs 2.18). The probe (recon) improved by hollowing out the thing it probes — a regression in the project's terms (representation is the headline; recon/decode are probes).
+2. **e4 did not fail from VAE instability — it failed from `batch_size=1`.** This model's InfoNCE consistency loss uses in-batch negatives; at B=1 the (1×1) softmax is always 1.0, so the loss is exactly `−log(1)=0` (the `consist=0.00000` signature) and the contrastive regularizer that pins `z_static` is silently switched off. `z_s_std=NaN` is `std(dim=0)` (unbiased) over a single sample → ÷0. Both symptoms are forced by B=1 regardless of what's frozen; the actual training losses stayed finite. **Both-unfrozen never got a valid test** — it needs B≥2, which OOMs on 48 GB, so it requires an 80 GB GPU.
+3. **Decoder-only (e3) is inconclusive** at ep 20 and would need many more epochs (slow: ~14 min/epoch at B=2 ⇒ embers' 8 h cap only reaches ~ep 33).
+4. **Operational (cost us a day, saved to memory [[project_vae_unfreeze_runbook]]):** the base `gts-agarg35` account routes embers jobs to V100-16GB regardless of the `-p` line (→ instant OOM on any VAE-unfrozen job); use `gpu-l40s` + `gts-agarg35-ideas_l40s`. Decoder + `L_pixel` is the memory hog (dec B=4 OOMs >48 GB; both B=2 OOMs). The cedar filesystem hit 100 % full → checkpoints now go to scratch (15 TB individual quota).
+
+### Open / next
+
+- **The only fair comparison is in a fixed space.** Decode e1 and e2 latents through the **same frozen decoder** and compare PSNR/SSIM/LPIPS vs GT frames, and re-run the **structure probes** (color/attrs/trajectory) at equal budget. Latent-space recon across a frozen vs trainable encoder is not apples-to-apples.
+- If pursuing VAE unfreezing: encoder-unfrozen needs a **representation anchor** (keep InfoNCE strong, possibly freeze z_static magnitude or add the supervised AttrsHead) so the latent can't collapse; both-unfrozen needs **B≥2 on an 80 GB GPU**; decoder-only needs full convergence (drop embers for 3-day walltime).
+
+### Artifacts
+
+| Run | Reached | Checkpoint (scratch `dialga_outputs/`) |
+|---|---|---|
+| e2 enc | ep 36 | `v512_e2_enc_unfrozen_20260524_194228/{v5,v5_best}.pt` (1.4 GB) |
+| e3 dec | ep 20 | `v512_e3_dec_unfrozen_20260524_180523/v5_best.pt` |
+| e4 both | ep 9 | none saved |
+| e1 frozen (baseline) | ep 350 | `outputs/v512_e1_frozen_20260522_221139/v5_best.pt` |
+
+Sbatches: `scripts/sbatch/v512_e{2,3,4}_*.sbatch`. e1 recon render: `outputs/v512e1_recon_20260524_014551/video_0000{0-4}_gt_vs_model.mp4`.
+
+---
+
+## v5.1.2 (2026-05-30): retrieval probes — z_static/z_dyn factorize as a downstream task
+
+A downstream-task complement to the linear-probe disentanglement results. Probes ask "is this info present in the latent"; retrieval asks "is this info functionally **useful**" — pick a query, return the K nearest by cosine in one of {`z_static`, `z_dyn`, raw Wan latent, random}, score against held-out ground truth. The two tasks target opposite axes: **content retrieval** (does z_static find videos with similar objects?) and **motion retrieval** (does z_dyn find chunks with similar motion?). Same val split as every other v5.1.2 result (max_videos=1000, val_frac=0.2, seed=42, 1000 videos × 3 chunks = 3000 chunks); checkpoint = `v512_e1_frozen_20260526_001020/v5_best.pt`. All computed locally on A100 in ~90 s + a few seconds of eval each.
+
+### Cache (Step 0)
+
+`scripts/cache_val_embeddings.py` runs e1 over all val chunks once and saves per-chunk `{z_static, z_dyn_last, z_dyn_mean, wan_mean}` plus per-video `{attrs, slot_mask}` and per-video aggregates. **Sanity result**: within-video std of z_static = **0.224** while typical magnitude is ~6, i.e. only ~3.7 % relative drift across the 3 chunks of one video — so even though val InfoNCE is well above chance ([[project_disentangle_probe]]), the contrastive structure DOES generalize in an L2 sense (per-video mean is a usable anchor).
+
+### TODO 1 — content retrieval via z_static (per-video, 100 queries)
+
+Per-video attribute set = `{(color, material, shape), ...}` decoded from one-hot `attrs` blocks. Three Jaccard variants: full tuple, color-only, material-only, shape-only.
+
+**Mean Jaccard_full @ K** (no threshold; precision@K at threshold 0.5 was useless — sets have ~5 elements and 48 possible tuples so 0.5 overlap almost never hits any method):
+
+| method | J@1 | J@5 | J@10 |
+|---|---|---|---|
+| **z_static** | **0.118** | **0.094** | **0.089** |
+| z_dyn_mean | 0.045 | 0.056 | 0.053 |
+| wan_mean | 0.067 | 0.074 | 0.074 |
+| random | 0.064 | 0.064 | 0.062 |
+
+**Per-attribute Jaccard @ K=5**:
+
+| method | color | material | shape |
+|---|---|---|---|
+| **z_static** | **0.459** | 0.954 | 0.798 |
+| z_dyn_mean | 0.339 | 0.943 | 0.772 |
+| wan_mean | 0.403 | 0.947 | 0.785 |
+| random | 0.352 | 0.948 | 0.783 |
+
+### TODO 2 — motion retrieval via z_dyn (per-chunk, 100 queries, same-video chunks filtered)
+
+Per-chunk descriptors built from `outputs/trajectory_gt_val.pt`: mean speed, 8-bin angular direction histogram, collision flag. **Same-video chunks are filtered from the gallery** — without this filter top-K trivially returns the other 2 chunks of the same video. Combined similarity = mean of (speed_sim, direction_sim, collision_sim).
+
+**Combined motion similarity @ K**:
+
+| method | @1 | @5 | @10 |
+|---|---|---|---|
+| **z_dyn_last** | **0.648** | **0.629** | 0.607 |
+| z_dyn_mean | 0.629 | 0.590 | 0.583 |
+| z_static | 0.586 | 0.579 | 0.582 |
+| wan_mean | 0.616 | 0.624 | **0.614** |
+| random | 0.492 | 0.524 | 0.519 |
+
+**Per-dimension @ K=5**:
+
+| method | speed | direction | collision |
+|---|---|---|---|
+| **z_dyn_last** | 0.808 | 0.428 | **0.650** |
+| z_dyn_mean | 0.779 | 0.381 | 0.612 |
+| z_static | 0.802 | 0.399 | 0.538 |
+| wan_mean | 0.816 | **0.487** | 0.568 |
+| random | 0.759 | 0.300 | 0.512 |
+
+### Findings
+
+1. **The diagonal works.** z_static beats every baseline on content (J@1 0.118 vs random 0.064 — **~2× random**) and z_dyn beats every baseline on motion (combined@1 0.648 vs random 0.492 — **+31 %**). The functional factorization claim survives a downstream test, not just a linear probe.
+2. **The off-diagonal works in the right direction**, asymmetrically. z_dyn for content **fails below random** (J@1 0.045 < random 0.064) — strongest evidence that z_dyn carries no useful identity. z_static for motion is *above* random (0.586 vs 0.492) — z_static carries some weak motion structure, but loses to z_dyn at the dimension that matters most (collision: 0.538 vs 0.650).
+3. **Color is the only identity dimension z_static does meaningfully.** +0.107 over random on color (0.459 vs 0.352); material and shape are saturated near baseline because the vocabularies are small (2, 3) and scenes contain most members. Matches the disentanglement probe exactly: scene-modal color is real, per-object identity is not.
+4. **Collision is the strongest motion dimension z_dyn does.** +0.138 over random on collision (0.650 vs 0.512). Mirrors the disentanglement probe (z_dyn collision Δmaj +0.10–0.15) and the z_event-inert finding — collision lives in z_dyn implicitly, no separate event channel needed for *retrieval*.
+5. **Wan-mean baseline is competitive and informative.** It loses on color (0.403 < 0.459) and collision (0.568 < 0.650) — both semantic features — but **beats z_dyn on direction** (0.487 vs 0.428). The raw VAE mean captures pixel-level direction-of-motion structure that our learned z_dyn doesn't preserve. Honest weakness to disclose; explainable as "spatial-mean Wan latent retains optical-flow-like signal lost by the global z_dyn pool."
+
+### Caveats
+
+- 100 queries each; not bootstrap-CI'd. With one-shot numbers these gaps are directional, not significant-tested. Adequate for the paper's claim of factorization-in-the-right-direction; not adequate for fine-grained method comparisons.
+- Speed signal has a tiny dynamic range (p50=0.017, p95=0.032) — speeds barely differentiate. Direction and collision are where the motion story actually lives.
+- precision@K with threshold-0.5 Jaccard ≈ 0 for all methods (too strict for multi-object scenes). Reported but uninformative; mean Jaccard@K is the working metric.
+
+### Artifacts
+
+```
+scripts/cache_val_embeddings.py
+scripts/eval_content_retrieval.py
+scripts/eval_motion_retrieval.py
+outputs (next to ckpt):
+  val_embeddings.pt           (3000×64 z_static + sibling tensors + per-video attrs)
+  eval_content_retrieval.json
+  eval_motion_retrieval.json
+```
+
+### Next
+
+The 4-way `(channel × query-type)` retrieval matrix is now numerically established. Task #61 (`viz/render_retrieval_results.py`) renders the qualitative paper figure — 3 query videos × 4 method panels — using these JSON outputs.
+
+---
+
+## v5.1.2 (2026-06-08 → 06-11): CLEVRER blur — 11.8 dB gap isolated to our model, Option A flat, ablation suite launched, recovery plan
+
+The 10k-video CLEVRER run `v512_clevrer_big` ("Option A": the e1-frozen recipe + `--lambda_pixel 1.0 --lambda_attrs 0.5`, d_static=96 / d_dyn=96 / d_state=48, enc 192 / dec 384, B=2, 200 ep, self-chaining 8 h embers blocks on L40S, checkpoints on cedar after the scratch1 inode-quota incident) was the loss-only attempt to fix the z_static collapse before committing to an architecture rewrite. Verdict at ep 148: **it didn't work.** Reconstructions remain visibly blurry — shape and color barely readable — and the numbers agree.
+
+### Option A is flat
+
+Rendered 5 GT-vs-model mp4s from the ep 140 checkpoint (`scripts/sbatch/render_v512_clevrer_big.sbatch` → copied to `outputs/v512_clevrer_big_recon_ep140/`). Cross-run PSNR (obs = frames 0–32 recon, pred = 33–65 rollout, 5-clip mean):
+
+| Checkpoint | obs dB | pred dB |
+|---|---|---|
+| v512e1 frozen (2026-05-24) | 32.49 | 30.00 |
+| clevrer_big ep 131 | 32.63 | 29.46 |
+| clevrer_big ep 140 | 32.73 | 29.51 |
+
+No movement. The collapse signature persists on val: at ep 148, z_static_std train 0.29 / **val 0.11**, attrs CE train 0.90 / **val 4.93** — the static channel memorizes train identity and carries little to held-out videos. Best val_recon 0.01978 @ ep 130, flat since.
+
+### Blame isolation: the 11.8 dB gap is ours, not the VAE's
+
+Measured the true ceiling without re-encoding anything: the GT panel of every render *is* `wan_decode(cached_latent)` — already a one-pass Wan roundtrip — so raw-video-vs-GT-panel PSNR = the ceiling. On video 0: **Wan-VAE roundtrip 41.20 dB; our model 29.37 dB vs raw (29.40 vs ceiling)**. The frozen VAE costs almost nothing; the **11.8 dB gap belongs entirely to the 8.6M trainable model** (enc 2.5M + dec 6.1M). Reference 3-panel video (`raw | Wan-ceiling | model`): `outputs/v512_clevrer_big_recon_ep140/video_00000_raw_vs_gt_vs_model.mp4`.
+
+Compression bookkeeping for everything that follows: z = 96 (static) + 9×96 (dyn) + 4 (event) = **964 floats/chunk** vs the Wan latent's 48×9×8×8 = 27,648 → **28.7×** further compression, ~1683× vs pixels. CLEVRER's true scene state is ~100–200 floats (≤8 objects × pose+vel+attrs), so **rate is not the bottleneck** — encoder precision and decoder rendering capacity are.
+
+### Ablation suite launched (2026-06-10)
+
+Four single-flag-flip ablations against the exact Option A recipe — fresh runs, own cedar dirs, same self-chaining pattern (`scripts/sbatch/v512_clevrer_{noattrs,noevent,nopixel,nopred}.sbatch`):
+
+| Run | Flag | Status (06-11) | Early signal |
+|---|---|---|---|
+| noattrs | `--lambda_attrs 0` | ep 9 | **hardest z_static collapse** (train std 0.07 vs ~0.27 elsewhere) — λ_attrs is what props the static channel up |
+| noevent | `--lambda_event_aux 0` | ep 9 | — |
+| nopred | `--lambda_pred 0` | ep 10 | — |
+| nopixel | `--lambda_pixel 0` | **DONE ep 200** (latent-only ⇒ no VAE decode ⇒ ~20× faster epochs) | best latent recon (val 0.0146 vs big 0.0176) but **val attrs 15.9** vs train 0.03 — pure-latent training memorizes identity and generalizes none of it; this is exactly the config that produced the original blur |
+
+### Literature review (deep research: 95 claims checked, 16 confirmed / 9 refuted)
+
+Verified moves, each from a CLEVRER-or-similar disentangled-video paper:
+
+1. **Pixel-space loss through a frozen decoder preserves attributes** (SlotFormer ablation: L_I is specifically what keeps color/shape). Ours is λ_pixel=1.0 — evidently too weak.
+2. **DiViD anti-leakage**: residual subtraction (dyn path sees `x[t] − x[0]`, static from frame 0 only) + orthogonality loss L_orth = Σₜ⟨s, dₜ⟩².
+3. **DeCo-VAE staged training**: train motion first, then freeze; weights recon 4.0 / perceptual 4.0 / KL 1e-7 / GAN 0.2 turned on late.
+4. **Heavy conditional decoders, never higher rate**: SlotDiffusion (LDM U-Net cross-attn on a frozen VQ-VAE, wins LPIPS everywhere), BCD (DiT + temporal attention, motion via AdaGN), VidTwin (4–8-D codes decode sharply with a ~300M decoder).
+5. **Metric warning**: on CLEVRER, PSNR ordering inverts from perception — PredRNN 31.34 dB / LPIPS 0.17 vs SlotFormer 30.21 dB / LPIPS 0.11. We have been steering by PSNR only.
+
+### Recovery plan (rate held at 964 floats/chunk)
+
+- **Phase 0 — blame isolation (~2 d):** (a) LPIPS+SSIM on existing renders; (b) GT-state render probe — train a decoder from CLEVRER GT annotations (task #38 extraction) alone: sharp ⇒ encoder's fault, blurry ⇒ decoder's fault; (c) unfactorized 964-D AE control at the same enc/dec size — measures the factorization tax. Gate: if (c) also sits at ~29 dB, skip Phase 1.
+- **Phase 1 — loss fixes, fresh "v513" chain (~3–4 d):** L_orth (λ≈0.1) + residual subtraction + VICReg variance hinge on z_static (the surgical fix for the std-0.09 collapse) + λ_pixel 1.0→4.0 with an LPIPS term + `--freeze_static_after` staging. New flags in `train_v5.py` only; no architecture change.
+- **Phase 2 — decoder upgrade at fixed rate (~1–2 wk):** first a deterministic cross-attention decoder (latent-grid queries attending to [z_static; z_dyn tokens; z_event], ~30–50M params — decoder size doesn't count against compression); if still soft, a conditional diffusion decoder in the frozen Wan latent space (SlotDiffusion/DiViD pattern). Any new decoder passes the full-recipe 5-vid overfit test before a 10k chain.
+- **Phase 3 — rate reallocation (only if 1–2 stall):** redistribute within budget, e.g. d_static 256 + d_dyn 64×9 + 4 = 836 < 964; or 8 object slots at the same total.
+
+All 5 chains keep running regardless — they are the paper's ablation table. Known issue to fold into whichever phase runs: GatePredictor is dead on this run (sigmoid 0.531–0.539 for both gate classes).
+
+---
+
 ## Changelog
 
 | Date | Update |
@@ -914,3 +1108,9 @@ Holding off on scaling looks more defensible after this comparison. The paper fr
 | 2026-05-21 | **z_dyn / z_event verification suite — six TODOs, all green.** Frozen-encoder events fine-tune (6 min wall, V100, embers): EventHead+GEvent+GatePredictor only (4,581 params on the Exp 1 ckpt), val gate F1=0.789 by ep 1. **TODO 1** rollout PSNR (N=200): A_fwd 27.85 dB / B_freeze 26.20 dB / C_oracle 29.89 dB — **Δ(A − B)=+1.65 dB** is the "z_dyn enables predictive rollout" number; gap to oracle +2.04 dB. **TODO 2** trajectory probe: position R² z_static 0.50 vs z_dyn 0.74 (**Δ=+0.24**) — motion factorization confirmed in the opposite direction of identity. Velocity probe noisy (chunk-mean variance ~1e-4), honestly disclosed. **TODO 3** event necessity 2×2: L_pred drops +0.00029 on event chunks (correct sign, ~1% relative), 0.00000 on non-event (gate sanity passes). **TODO 4** counterfactual rendering (10 collision chunks, side-by-side mp4s): mean residual_norm 0.40, mean PSNR gain +0.025 dB, 7/10 positive, best `cf_00` +0.18 dB. **TODO 5** gate F1: AUC 0.751, best F1 **0.799** at threshold 0.45 — GatePredictor reads collision presence from z_dyn without GT. New scripts: `train_v5_events.py`, `extract_trajectory_gt.py`, `eval_rollout_psnr.py`, `eval_event_necessity.py`, `eval_gate_predictor.py`, `probes/probe_v5_trajectory.py`, `viz/render_event_counterfactual.py`, `sbatch/v511_events_finetune.sbatch`. Honest weaknesses called out: velocity probe uninformative; z_event correction small in magnitude. |
 | 2026-05-21 | **Exp 1 (AttrsHead) + Exp 3 (no_proj), two parallel sbatches**, ~1 h each on V100. **Exp 1 lands the headline**: light supervised CE (λ_attrs=0.05) on z_static from a new linear AttrsHead lifts material Δ +0.079 → **+0.160** and shape Δ +0.095 → **+0.168** — both past the +0.15 target — while color improves (+0.224 → **+0.269**) and val_recon holds (0.01745, +0.0005). All three identity targets hit in one shot; z_s_std grows 0.30 → 0.50. **Exp 3 falsifies the W_proj bottleneck claim**: removing W_proj/W_unproj (Identity, d_state=d_dyn=64) barely moves anything — color Δ +0.224 → +0.214, val_recon 0.01696 → 0.01687, and z_dyn identity Δ stays at chance (-0.07 to -0.01). Interpretation: InfoNCE + split-trunk is strong enough to anchor identity in z_static regardless of whether z_dyn can carry it. Adds `src/model/attrs_head.py`, `--lambda_attrs/--attrs_hidden/--no_proj` flags, new sbatches. Fixed a probe-script bug: `probe_v5_zdyn_diag.py` and `save_v51_overfit_videos.py` now read `no_proj` from ckpt args. |
 | 2026-05-21 | **z_dyn / z_event verification suite (6 TODOs)**. Frozen-encoder events fine-tune (V100, 6 min wall) achieves val gate F1 **0.789** at ep 1, with full eval suite then run locally. **z_dyn predictive value**: rollout PSNR A_fwd − B_freeze = **+1.65 dB** (oracle is +2.04 dB above A). **z_dyn motion encoding**: position R² 0.74 (vs z_static R² 0.50) — factorization confirmed in both directions. Velocity probe uninformative (chunk-mean variance too low). **z_event necessity**: L_pred drop +0.00029 on event chunks (correct sign, small magnitude); sanity 0.00000 on non-event chunks. **z_event causal**: mean residual_norm 0.40, 7/10 pixel PSNR positive (best +0.189 dB on `cf_00`). **Gate F1**: best 0.799 at thresh=0.45, AUC=0.751. Three channels, six numbers, each in the right direction. Six new scripts under `scripts/{train_v5_events, extract_trajectory_gt, eval_rollout_psnr, eval_event_necessity, eval_gate_predictor}.py` plus `scripts/probes/probe_v5_trajectory.py` and `scripts/viz/render_event_counterfactual.py`. |
+| 2026-05-25 | **v5.1.2 VAE-unfreeze (e2 enc / e3 dec / e4 both), all preempted by embers after 6–7 h.** Headline: encoder-unfrozen (e2) cuts val_recon ~10× (0.0179 → 0.0017) but it's a **moving-target cheat, not a representation gain** — at matched budget (ep 35) z_static collapses (std 0.197 → 0.101, was 0.000 at ep 5) and attribute CE *worsens* (2.18 → 2.96). e4 (both unfrozen) is a **batch-size-1 artifact**, not VAE instability: at B=1 InfoNCE has no in-batch negatives so `consist≡0` (regularizer off) and `z_s_std=NaN` from unbiased `std` over one sample; both-unfrozen never got a valid test (needs B≥2 ⇒ 80 GB GPU). e3 (dec) inconclusive at ep 20. Fair test deferred: fixed-space pixel metrics (PSNR/SSIM/LPIPS through one frozen decoder) + structure probes at equal budget. Ops lessons → memory `project_vae_unfreeze_runbook`: `gts-agarg35` routes embers to V100-16GB (use `ideas_l40s`/L40S); dec+`L_pixel` is the memory hog (dec B=4 / both B=2 both OOM at 48 GB); cedar 100 % full → checkpoints to scratch. Sbatches `scripts/sbatch/v512_e{2,3,4}_*.sbatch`. |
+| 2026-05-30 | **v5.1.2 retrieval probes (downstream-task complement to the linear probes).** Local A100, ~90 s encode + a few s per eval, same 1k-vid val split as every other v5.1.2 result. **TODO 1 content (per-video z_static, 100 queries):** mean Jaccard_full @ K=1 z_static 0.118 vs random 0.064 (~2×), wan_mean 0.067, z_dyn_mean 0.045 (below random — wrong tool). Color is the only attribute z_static really retrieves (+0.107 over random); material/shape near-baseline because the vocabs (2, 3) are too small. **TODO 2 motion (per-chunk z_dyn, same-video chunks filtered):** combined sim @ K=1 z_dyn_last 0.648 vs random 0.492 (+31 %), z_static 0.586, wan_mean 0.616. Collision is z_dyn's strongest dimension (0.650 vs random 0.512, +0.138). One honest weakness: wan_mean *beats* z_dyn on direction-of-motion (0.487 vs 0.428) — raw spatial-mean Wan latent retains optical-flow-like signal that the globally-pooled z_dyn drops. Factorization holds on both diagonals; off-diagonal "z_dyn for content" *falls below random*, the strongest evidence yet that z_dyn carries no identity. Sanity: within-video std of z_static is 0.224 vs typical norm ~6 — 3.7 % drift, contrastive structure DOES generalize in L2 even though val InfoNCE is above chance. Artifacts: `scripts/{cache_val_embeddings, eval_content_retrieval, eval_motion_retrieval}.py`; outputs next to e1 ckpt. |
+| 2026-06-01 | **LIBERO action probe on v512_big — z_dyn matches raw Wan at 32× the compression.** Frozen encoder + tiny shared-across-timesteps MLP (D_in→128→7) predicts per-latent-frame 7-DoF actions (6 cont + binary gripper) on the v5.1.2 LIBERO-90 ckpt (300 ep, d_static=96/d_dyn=96/enc_h=192/dec_h=384). 10 tasks held out (ids 7,8,11,19,26,29,41,44,57,75); MLP trains on train tasks only, evals on val-episodes + held-out tasks. **Headline (held-out, 11,367 steps): z_dyn 0.935 gripper / cont_mse 0.0236, wan_flat 0.936 / 0.0217, wan_mean 0.909 / 0.0268, random_init_z_dyn 0.908 / 0.0336, z_static 0.749 / 0.0624.** Per-dim R² (z_dyn val) dx +0.56 / dy +0.86 / dz +0.82 / drx +0.14 / dry +0.13 / drz +0.33. **Three findings**: (1) **z_dyn ties full raw Wan at 32× per-frame compression** — held-out gripper 0.935 vs 0.936, cont_mse within 8 %, so the bottleneck loses ~zero actionable motion content. (2) **Disentanglement holds end-to-end**: z_static collapses to majority-baseline on gripper (0.749, below the 0.743 chance) and R²≈0 on continuous dims; the prior "z_dyn beats wan_mean by 35 %" framing was vs the 48-dim spatial-pooled Wan, not raw — the fair comparison is "matches raw with 32× fewer dims." (3) **Rotation R²≈0 for every feature including raw Wan** — drx/dry/drz are sparse and small (std 0.04-0.11 vs translation 0.31-0.40), so this is a probe/data limit not a z_dyn limit. Honest caveats: per-dim RMSE / std is 48-49 % on dy/dz (moderate), 76 % on dx, ≥94 % on rotations (≈ guessing the mean); gripper headline of 94 % is +20 pts over majority-baseline of 74 % (gripper open most of the time). No action supervision was used during training — pure probe. Wall: 10 min on local A100, 20 probe epochs × 5 features. Artifacts: `scripts/eval_libero_action_probe.py` (added `wan_flat` baseline), `scripts/sbatch/libero_eval_action_probe.sbatch` (retargeted to `libero_v512_big`), outputs `/storage/scratch1/8/lwang831/dialga_outputs/libero_v512_big/eval_action_probe{,_v2}.json`. |
+| 2026-06-10 | **v512_clevrer_big (Option A) judged flat + ceiling isolated + 4 ablations launched.** Ep-140 render: obs 32.73 / pred 29.51 dB — statistically identical to v512e1 from 05-24 (32.49/30.00); val z_static_std stuck at 0.11, val attrs CE 4.9 vs train 0.9. Ceiling measurement via raw-video-vs-GT-panel PSNR (GT panel = Wan roundtrip by construction): **Wan ceiling 41.20 dB, model 29.37 dB → the 11.8 dB gap is entirely the 8.6M trainable model's**. Launched single-flag ablations noattrs/noevent/nopixel/nopred (fresh runs, cedar dirs, self-chaining L40S embers, `scripts/sbatch/v512_clevrer_no*.sbatch`). Renders copied to `outputs/v512_clevrer_big_recon_ep140/` incl. 3-panel raw\|ceiling\|model video. |
+| 2026-06-11 | **nopixel ablation DONE (ep 200, ~20× faster epochs without VAE decode): best latent recon (val 0.0146) but val attrs 15.9 vs train 0.03** — latent-only training memorizes identity, generalizes none; defends λ_pixel. noattrs early signal: hardest z_static collapse (std 0.07 @ ep 9). **Literature review (95 claims, 16 confirmed / 9 refuted)** → verified levers: pixel loss through frozen decoder preserves attrs (SlotFormer), residual subtraction + L_orth (DiViD), staged freeze + recon/perceptual 4.0/4.0 (DeCo-VAE), heavy conditional decoders at tiny code rates (SlotDiffusion/BCD/VidTwin), PSNR↔LPIPS ordering inversion on CLEVRER. **Recovery plan recorded** (rate fixed at 964 floats/chunk): Phase 0 blame isolation (LPIPS/SSIM; GT-state render probe; unfactorized 964-D AE control) → Phase 1 v513 loss fixes (L_orth, residual dyn, VICReg variance hinge, λ_pixel 4.0 + LPIPS, freeze-static staging) → Phase 2 cross-attn then diffusion decoder at fixed rate → Phase 3 rate reallocation only if 1–2 stall. |
+| 2026-05-27 | **v5.1.2 re-run: pixel-loss anchor + auto-resume + fair frozen control.** Root-caused e2's garbage reconstruction to the absence of a pixel-space loss: with only latent `L_recon` and a trainable encoder, the encoder sits on both sides of the target and collapse is the trivial optimum. Fix: `L_pixel` now backprops through the (frozen or trainable) Wan decoder to the encoder, decoupled from `--unfreeze_vae_dec`; added `--lambda_recon` so e2/e3 run `lambda_recon=0, lambda_pixel=5.0` (pixel co-primary). Verified the fix holds over a full 8 h window: e2 `z_s_std` *grew* 0.041 → 0.540 (old run collapsed to 0.000 by ep 5), `L_pixel` monotone down. **Fair 3-way comparison locked in:** e1/e2/e3 now share an identical loss config (`lambda_recon=0, lambda_pixel=5.0`, B=2, 1000 vids, 200 ep); the ONLY difference is which VAE half is trainable — **e1 frozen** (control, both halves frozen, `--lambda_pixel>0` loads the VAE frozen so it too is supervised in pixel space), **e2** encoder-unfrozen, **e3** decoder-unfrozen. Made `lambda_pixel>0` load a frozen VAE (`use_pixels` no longer gated solely on unfreeze flags; default `lambda_pixel` 1.0→0.0 so non-pixel runs are unaffected); e1 moved to L40S since the frozen-decoder pixel path OOMs the old V100-16GB control. **Auto-resume** added (`--resume auto` restores models/VAE/optimizer/scheduler/best/epoch from a rolling `last.pt` saved every epoch; organized `ckpt_ep{N}.pt` every 10; `DONE` marker on completion; wandb resumes same run); e1/e2/e3 sbatch use a STABLE out_dir and **self-chain** past the 8 h embers wall via `sbatch --dependency=afterany:$JOBID` until `DONE` (cap 20 attempts). Submitted e1=9192118, e2=9192047, e3=9192048 on L40S. |

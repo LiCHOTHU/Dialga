@@ -47,7 +47,7 @@ class GEvent(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, z_event: torch.Tensor) -> torch.Tensor:
-        return self.proj(z_event)               # (B, d_dyn)
+        return self.proj(z_event)  # (B, d_dyn)
 
 
 class GatePredictor(nn.Module):
