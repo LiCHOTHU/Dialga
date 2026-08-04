@@ -1310,7 +1310,17 @@ Related plan doc: `EXPERIMENT_PLAN_v7.md`.
 | +spatial | spatial | 256 | 1.0 | 0.090 |
 | **v5.9 (+spatial +λ-rebalance)** | **spatial** | **256** | **0.1** | **0.077** |
 
-Reading: the win is **the spatial structure, not the extra floats** — at a fixed 256-float budget, global→spatial is 0.113→0.077 (~32%), while quadrupling a *global* code barely moved it (0.12→0.113). The λ_pred rebalance adds ~14% more. Same root theme as the project's core global-pool finding, now applied to z_dyn (z_static got the spatial-grid fix in v5.7; z_dyn never did).
+Reading: the win is **the spatial structure, not the extra floats** — at a fixed 256-float budget, global→spatial is 0.113→0.077 (~32%), while quadrupling a *global* code barely moved it (0.12→0.113). The λ_pred rebalance adds ~14% more.
+
+**Attribution in pixel PSNR (held-out DROID, confirms the above in dB):**
+| config | z_dyn | rate | λ_pred | pixel PSNR |
+|---|---|---|---|---|
+| baseline | global | 96 | 1.0 | 16.10 dB |
+| +rate only | global | 256 | 0.1 | 16.73 dB |
+| +spatial | spatial | 256 | 1.0 | 19.45 dB |
+| **v5.9** | **spatial** | 256 | 0.1 | **20.53 dB** |
+
+Decomposition of +4.4 dB: **spatial structure +2.7 dB** (dominant), λ_pred rebalance +1.1 dB, extra rate alone +0.6 dB (negligible). The gain is architectural, not rate. Same root theme as the project's core global-pool finding, now applied to z_dyn (z_static got the spatial-grid fix in v5.7; z_dyn never did).
 
 **Honest status / open items.**
 - Verified on DROID moving-camera video; **CLEVRER generality cross-check pending** (does spatial z_dyn help / not regress on easy data → is it a *general* video-AE improvement or DROID-specific).
