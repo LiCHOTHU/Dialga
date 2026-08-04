@@ -153,6 +153,46 @@ are the four probes below. Identity is the load-bearing one.
 
 Per-experiment results land in `DEVLOG.md` as they finish.
 
+## Moving-camera extension (v5.9)
+
+The factorization above assumes a roughly static camera (CLEVRER). To carry it
+to **real, moving-camera video** (DROID wrist camera), two changes were needed —
+one is the current headline result.
+
+**Spatial `z_dyn` (the reconstruction fix).** The original dynamics code was a
+*global* per-frame vector, broadcast to every latent cell by the decoder. That
+is rank-limited: it can only produce a spatially-uniform per-frame delta, which
+suffices for CLEVRER's low-rank rigid-body motion but collapses on real textured
+video (DROID reconstructed at only 16 dB vs a 33 dB VAE ceiling). Following what
+every real-video tokenizer does (VidTwin, Hi-VAE, Cosmos, MAGVIT-v2), `z_dyn`
+becomes a **per-frame spatial grid** `[B, T, c_dyn, g, g]` (`--dyn_spatial
+--dyn_grid`): the encoder projects the per-frame feature grid with a 1×1 conv,
+and the decoder bilinearly upsamples it to the latent lattice instead of
+broadcasting one vector. Combined with rebalancing the forward-prediction weight
+(`--lambda_pred 1.0 → 0.1`, which was strangling `z_dyn`), this raises held-out
+DROID reconstruction from **16.1 → 20.5 dB (+4.4 dB)**. A matched-rate ablation
+attributes the gain to the **spatial structure, not the extra rate**:
+
+| z_dyn | rate | λ_pred | pixel PSNR |
+|---|---|---|---|
+| global | 96 | 1.0 | 16.10 dB |
+| global | 256 | 0.1 | 16.73 dB |
+| spatial | 256 | 1.0 | 19.45 dB |
+| **spatial** | **256** | **0.1** | **20.53 dB** |
+
+→ spatial structure **+2.7 dB**, λ_pred rebalance +1.1 dB, extra rate +0.6 dB.
+
+**Camera-trajectory conditioning (`src/model/camera_pose.py`).** A known
+per-frame camera pose is injected so `z_static` can be made viewpoint-stable
+(pose-conditioned multi-frame aggregation of the static grid: `PlaneSweep` /
+`WorldMemory` aggregators, `--use_camera_pose --static_agg`). This is an add-on
+on top of the reconstruction fix; its camera-invariance benefit on real DROID is
+still open (the within-episode metric compares non-overlapping windows, so it
+cannot yet cleanly isolate camera-invariance — see `DEVLOG.md`).
+
+See `DEVLOG.md` ("v5.9 — Spatial z_dyn") for the full diagnosis, method, and open
+items (CLEVRER generality cross-check pending; rate grew 96→256).
+
 ## Repository layout
 
 ```
