@@ -1090,6 +1090,164 @@ All 5 chains keep running regardless — they are the paper's ablation table. Kn
 
 ---
 
+## v5.1.3 (2026-06-12): MAETok port — masked DINOv2 semantic prediction (Fork C) built, smoke-tested, launched on full CLEVRER
+
+Port of MAETok (Chen et al., ICML'25, arXiv:2502.03444; code `Hhhhhhao/continuous_tokenizer`) onto the v5.1.2 chunk-wise architecture. MAETok's finding: a plain AE's latent becomes semantically structured when the encoder is trained with mask modeling — mask 40-60% of input tokens, predict frozen-teacher features (DINOv2 is the strongest target) at masked positions through throwaway shallow decoders. Their ablation: AE gFID 24.47 → +MM 18.17 → +MM+decoder-FT 5.69 (rFID 0.48). Our port attacks the diagnosed failure: identity is ABSENT from z_static on val (attrs CE 4.9 val vs 0.9 train on v512_clevrer_big).
+
+### Stage 0 — diagnosis confirmed before building (go/no-go gate)
+
+- **Nonlinear probe** (`scripts/probes/probe_v5_nonlinear.py`, on the cached e1 val embeddings, same 50/50 protocol as the linear probe): 2-layer MLP ≈ linear — color Δ +0.086 (MLP) vs +0.122 (linear), material +0.032/+0.036, shape ≈0 for both, MLP train acc 1.000 (pure overfit). **Information is absent, not nonlinearly hidden** → encoder-side fix justified.
+- **Encoder inspection**: `LatentEncoder3D` is Conv3d end-to-end, no token axis → **Fork C** (mask spatio-temporal latent cells, not tokens).
+
+### Build
+
+- `scripts/cache_dino_patch.py` — DINOv2-small patch features for all 30k wan-cache windows: frame `start+4i` anchors latent frame i, 16×16 DINO grid avg-pooled to the latent's 8×8. Output is ONE 13.3 GB float16 memmap on scratch1 (rows = wan window idx; 2 files, no inode pressure) + `index.json`. 30k windows in 27 min on the local V100 (18.4 win/s). Gotcha fixed: the dataset's `max_videos` does *random* video subsetting, so the cache build must construct the full-10k dataset; an alignment assertion (video_id, start_frame vs wan metadata) guards every row. Second gotcha: login `.bashrc` exports `TRANSFORMERS_CACHE=/huggingface` which overrides `HF_HOME` — all HF env vars must be set together (this was also the root cause of the earlier `/huggingface` PermissionError).
+- `src/model/masking.py` — `ObjectRegionMask`: saliency = per-cell channel variance; mask `ratio` (0.5) of the 9×8×8 cells sampled uniformly from the top-`pool_frac` (0.75) by saliency; masked cells get one learnable 48-d vector. Verified: object cells masked at 0.64 vs 0.50 base.
+- `src/model/aux_semantic_decoder.py` — `AuxSemanticDecoder`: LatentDecoder body with 384-d output; predicts DINO features per cell from (z_static, z_dyn) alone — the codes must carry the semantics. **Numerical hazard found in testing**: the cosine loss gradient diverges as 1/|pred| at LatentDecoder's inherited zero-init → 1.4e7 grad spike on step 0 (global clip would then zero out every other loss's update). Fixed with std=1e-3 init; step-0 grad now 1.07.
+- `src/loss/feature_pred.py` — `masked_feature_loss`: 1−cos averaged over masked cells only (MAETok's L_mask form).
+- `scripts/train_v5.py` — aux branch appended; **hard invariants**: ForwardDynamics/recon/InfoNCE consume only the UNMASKED pass; the masked second encoder pass feeds only `L_mae_sem`. New flags `--lambda_mae --mask_ratio --mask_pool_frac --aux_hidden_ch --dino_cache_dir`; joins `total` from stage 2; ckpt gains `masker`/`aux_decoder`; legacy 7-module path byte-identical. `ClevrerChunkPairs` gained `dino_cache_dir` (lazy per-worker memmap read, `dino_obs` (9,8,8,384) keyed by obs-window idx).
+
+### Validation + launches (jobs of 2026-06-12)
+
+- Local 3-epoch 20-vid mini-train (latent-only, V100): `mae_sem` 1.0 → **0.127** by ep 3 — the codes can predict masked DINO features; all losses finite; resume ckpt writes.
+- **9855030 `v513_mae_smoke`** — Stage-5 gate: 20-vid overfit, FULL v513 recipe (Option A + λ_mae=0.5), 300 ep on L40S. Watches: mae_sem ↓, recon no-regress, pred/fwd unchanged, attrs ↓.
+- **9855227 `v513_mae_smoke_ctrl`** — identical but λ_mae=0: the config-matched control that makes "recon no-regress" rigorous.
+- **9855251 `v513_mae_clevrer`** — the experiment: full 10k CLEVRER, **single-variable vs v512_clevrer_big** (`--lambda_mae 0.5 --mask_ratio 0.5`, all else identical), self-chaining 8h embers blocks, cedar OUT_DIR. Rate unchanged (z = 964 floats/chunk; the aux decoder is discarded at eval).
+
+Read-out plan: compare v513_mae_clevrer vs v512_clevrer_big on val attrs CE + val z_static_std first (the mechanism's direct target), then render + PSNR/LPIPS once past ~ep 50.
+
+---
+
+## PAPER EXPERIMENT SET (2026-07): the embedding paper
+
+**This is the set of experiments the paper is written from.** After testing three framings
+against evidence in one session (2026-07-16), the verdict is settled and recorded in
+`memory/project_paper_framing_verdict.md`: **DIALGA is a video-EMBEDDING paper. Reconstruction
+is a probe/limitation, not a claim.** Everything below is eval-only (no new training), all on
+the same held-out CLEVRER val videos unless noted. Scripts: `scripts/probes/{rd_table,
+rfvd_table,baseline_probe_table,frozen_set_probe,probe_v512_disentangle}.py`,
+`scripts/eval_libero_action_probe.py`.
+
+### The one-line verdict on whether it works
+
+It works **as an embedding**: the 96-float `z_static` code is genuinely semantic and the
+static/dynamic split is real. It does **not** work as reconstruction/compression (loses to
+H.264 on every metric). "Significantly beats baselines" is TRUE vs the control baselines
+(raw latent, PCA, random-init, prior) and FALSE vs DINOv2 (0.932 < 0.950, and DINO is our own
+teacher). The honest headline is *compact + factorized + video-native*, not *SOTA representation*.
+
+### Table 1 — Semantic probe: the headline. (job 11199805, v55_pool_mean ep200, 16k train / 4k val)
+
+Frozen linear probe, permutation-invariant multi-hot presence set (which colours/materials/
+shapes appear), val colour mAP vs base-rate prior floor.
+
+| features | dim | colour mAP |
+|---|---|---|
+| dino_meanpool | 384 | 0.950 |
+| **ours z_static** | **96** | **0.932** |
+| wan_meanpool | 48 | 0.774 |
+| wan_flat (raw latent) | 27648 | 0.773 |
+| random-init encoder | 96 | 0.750 |
+| wan_pca96 | 96 | 0.679 |
+| base-rate prior | — | 0.498 |
+
+96 learned floats beat the ENTIRE 27648-float raw Wan latent (+0.16, **288× smaller**), the
+dim-matched PCA-96 (+0.25 → this is learning, not width), and the untrained architecture
+(+0.18 → training, not the conv prior). **HONEST CAVEAT: DINOv2 (0.950) beats us and is our own
+MAE teacher — frame as compactness (96 vs 384 dims, within 0.018 of a 142M-image model), NEVER
+"we beat DINOv2".**
+
+### Table 2 — Attribute-supervision control: the claim is self-supervised. (job 11227560, all @ep70, epoch-matched single-variable ablations)
+
+The reviewer's first objection: the encoder trained with a supervised AttrsHead (λ_attrs=0.5)
+backpropping into it, so probing attributes back out is circular. `v512_clevrer_noattrs`
+(λ_attrs=0.0) is the control.
+
+| arm | λ_attrs | colour mAP |
+|---|---|---|
+| noevent / nopred | 0.5 | 0.920 |
+| nopixel | 0.5 | 0.917 |
+| **noattrs (control)** | **0.0** | **0.869** |
+| prior | — | 0.498 |
+
+Supervision contributes only **+0.05**. With ZERO attribute labels the code still hits 0.869 —
+above wan_flat 0.773, PCA-96 0.680, random 0.756 (Block B). **The claim is not "we supervised
+attributes in and read them back out."** The rate curve (Block C, width-matched ep50, 644→7684
+floats): colour mAP **flat, 0.919→0.927 across a 12× rate range** — semantics do not track rate.
+
+### Table 3 — Factorization cross-probe: the split is real on identity. (job 11285010, CLEVRER trajectory GT, 1000 vids / 2000 chunks, 3 arms)
+
+Δ over majority (identity, want z_static>0 AND z_dyn≈0) and R² (motion, want z_dyn>z_static).
+
+| arm (v55 headline) | colour z_static | colour z_dyn | pos R² z_static | pos R² z_dyn |
+|---|---|---|---|---|
+| v55_pool_mean ep200 | **+0.316** ✓ | −0.032 ✓fail | 0.421 | **0.819** ✓ |
+| noattrs ep70 (label-free) | +0.186 ✓ | −0.040 ✓fail | 0.545 | 0.629 ✓ |
+| nopixel ep200 | +0.286 ✓ | −0.028 ✓fail | 0.471 | 0.574 ✓ |
+
+The clean off-diagonal: **z_dyn is at chance on colour (−0.03 to −0.04) across all three arms**,
+including the label-free one — dynamics genuinely cannot read identity. z_dyn beats z_static on
+position everywhere. **Two honest weaknesses for the paper**: (1) z_static is NOT fully blind to
+position (R² 0.42–0.55) — objects sit still, so "where" leaks into the static code; (2) the
+**velocity** rows are degenerate (near-constant target → negative R²) — DROP velocity from the
+table, do not report noise.
+
+### Table 4 — Second dataset (LIBERO-90 action probe): answers "CLEVRER-only". (job 11285009, 10 held-out unseen tasks)
+
+Frozen encoder + tiny shared-across-time MLP → 6 continuous action dims + binary gripper. NO
+action supervision in representation training. Held-out = 10 tasks [7,8,11,19,26,29,41,44,57,75]
+excluded from encoder training entirely.
+
+| feature | heldout cont-MSE ↓ | heldout gripper ↑ |
+|---|---|---|
+| **z_dyn (ours)** | **0.0227** | **0.930** |
+| wan_mean (just use the VAE) | 0.0267 | 0.909 |
+| random_init_z_dyn (untrained arch) | 0.0320 | 0.920 |
+| z_static (wrong tool) | 0.0654 | 0.732 |
+
+z_dyn beats the raw-VAE baseline on **unseen tasks of a real robot dataset**, stable across
+training (ep100 heldout 0.0235 → ep200 0.0227) — not a lucky checkpoint. **The "CLEVRER-only"
+objection is answered.** HONEST CAVEATS: margin over wan_mean is ~15% relative (not a blowout);
+random_init also edges past wan_mean, so some of the win is the pooling architecture, not
+training — but z_dyn clearly beats random_init (0.0227 vs 0.0320), so training carries real
+signal. Single seed → cannot yet claim statistical significance on this margin.
+
+### Table 5 — Reconstruction / rFVD: the CENTRAL NEGATIVE (limitations section, NOT a claim). (jobs 11199622 R-D, 11199935 rFVD)
+
+| | rFVD ↓ | PSNR | LPIPS |
+|---|---|---|---|
+| Wan-VAE ceiling | 1.86 | 48.31 | 0.0011 |
+| **H.264** @34.3kbps | **41.75** | 43.25 | 0.0091 |
+| H.265 @37.0kbps | 164.56 | 40.86 | 0.0212 |
+| ours 964f ep200 (23.4kbps) | 153.04 | 33.82 | 0.0790 |
+| ours 3844f ep200 (best) | 119.98 | 34.77 | 0.0611 |
+
+**Reconstruction is dead, three independent reasons:** (1) H.264 beats us on PSNR (+10 dB),
+LPIPS (~10×) AND rFVD (3–5×), matching our 964f/23.4kbps model at ~11.6 kbps — half our
+bitrate. (2) **No rate axis**: 4× the bits → +0.9 dB PSNR; rFVD is non-monotonic in rate
+(ep200: 964f=153 but 1924f=179, WORSE) — the model ignores its bits. (3) Published tokenizers
+(VideoFlexTok rFVD 48.7 @160tok on K600, LARP 42.1, VidTok-FSQ 84.1) beat us on far harder
+data. **DROPPED: flow decoder** (buys ~2× rFVD per FlexTok Table 3; we'd need 3× to reach H.264
+on easy data) **and nested rate** (nesting an axis that doesn't exist). **NEVER** compare our
+CLEVRER 128² PSNR to FlexTok's ImageNet 256² 17.70 dB — not a claim.
+
+### What the paper can defensibly claim
+1. A compact (96-float) factorized video embedding that beats the raw VAE latent it's distilled
+   from at 288× fewer dims (Table 1), self-supervised (Table 2), on a semantic probe.
+2. The static/dynamic split is real: dynamics cannot read identity, and it transfers to a
+   second real dataset where it beats the raw-VAE baseline on unseen tasks (Tables 3, 4).
+3. Reconstruction is an honest limitation, reported in full (Table 5).
+
+### What it CANNOT claim (write these as limitations, not omissions)
+- Not SOTA: DINOv2 beats the semantic probe and is our own teacher.
+- LIBERO margin is modest and single-seed → **run multi-seed variance before "significantly
+  outperforms" goes in the paper.** This is the single highest-leverage eval-only item left.
+- z_static leaks position; velocity probe is uninformative; reconstruction loses to H.264.
+
+Related plan doc: `EXPERIMENT_PLAN_v7.md`.
+
+---
+
 ## Changelog
 
 | Date | Update |
@@ -1113,4 +1271,51 @@ All 5 chains keep running regardless — they are the paper's ablation table. Kn
 | 2026-06-01 | **LIBERO action probe on v512_big — z_dyn matches raw Wan at 32× the compression.** Frozen encoder + tiny shared-across-timesteps MLP (D_in→128→7) predicts per-latent-frame 7-DoF actions (6 cont + binary gripper) on the v5.1.2 LIBERO-90 ckpt (300 ep, d_static=96/d_dyn=96/enc_h=192/dec_h=384). 10 tasks held out (ids 7,8,11,19,26,29,41,44,57,75); MLP trains on train tasks only, evals on val-episodes + held-out tasks. **Headline (held-out, 11,367 steps): z_dyn 0.935 gripper / cont_mse 0.0236, wan_flat 0.936 / 0.0217, wan_mean 0.909 / 0.0268, random_init_z_dyn 0.908 / 0.0336, z_static 0.749 / 0.0624.** Per-dim R² (z_dyn val) dx +0.56 / dy +0.86 / dz +0.82 / drx +0.14 / dry +0.13 / drz +0.33. **Three findings**: (1) **z_dyn ties full raw Wan at 32× per-frame compression** — held-out gripper 0.935 vs 0.936, cont_mse within 8 %, so the bottleneck loses ~zero actionable motion content. (2) **Disentanglement holds end-to-end**: z_static collapses to majority-baseline on gripper (0.749, below the 0.743 chance) and R²≈0 on continuous dims; the prior "z_dyn beats wan_mean by 35 %" framing was vs the 48-dim spatial-pooled Wan, not raw — the fair comparison is "matches raw with 32× fewer dims." (3) **Rotation R²≈0 for every feature including raw Wan** — drx/dry/drz are sparse and small (std 0.04-0.11 vs translation 0.31-0.40), so this is a probe/data limit not a z_dyn limit. Honest caveats: per-dim RMSE / std is 48-49 % on dy/dz (moderate), 76 % on dx, ≥94 % on rotations (≈ guessing the mean); gripper headline of 94 % is +20 pts over majority-baseline of 74 % (gripper open most of the time). No action supervision was used during training — pure probe. Wall: 10 min on local A100, 20 probe epochs × 5 features. Artifacts: `scripts/eval_libero_action_probe.py` (added `wan_flat` baseline), `scripts/sbatch/libero_eval_action_probe.sbatch` (retargeted to `libero_v512_big`), outputs `/storage/scratch1/8/lwang831/dialga_outputs/libero_v512_big/eval_action_probe{,_v2}.json`. |
 | 2026-06-10 | **v512_clevrer_big (Option A) judged flat + ceiling isolated + 4 ablations launched.** Ep-140 render: obs 32.73 / pred 29.51 dB — statistically identical to v512e1 from 05-24 (32.49/30.00); val z_static_std stuck at 0.11, val attrs CE 4.9 vs train 0.9. Ceiling measurement via raw-video-vs-GT-panel PSNR (GT panel = Wan roundtrip by construction): **Wan ceiling 41.20 dB, model 29.37 dB → the 11.8 dB gap is entirely the 8.6M trainable model's**. Launched single-flag ablations noattrs/noevent/nopixel/nopred (fresh runs, cedar dirs, self-chaining L40S embers, `scripts/sbatch/v512_clevrer_no*.sbatch`). Renders copied to `outputs/v512_clevrer_big_recon_ep140/` incl. 3-panel raw\|ceiling\|model video. |
 | 2026-06-11 | **nopixel ablation DONE (ep 200, ~20× faster epochs without VAE decode): best latent recon (val 0.0146) but val attrs 15.9 vs train 0.03** — latent-only training memorizes identity, generalizes none; defends λ_pixel. noattrs early signal: hardest z_static collapse (std 0.07 @ ep 9). **Literature review (95 claims, 16 confirmed / 9 refuted)** → verified levers: pixel loss through frozen decoder preserves attrs (SlotFormer), residual subtraction + L_orth (DiViD), staged freeze + recon/perceptual 4.0/4.0 (DeCo-VAE), heavy conditional decoders at tiny code rates (SlotDiffusion/BCD/VidTwin), PSNR↔LPIPS ordering inversion on CLEVRER. **Recovery plan recorded** (rate fixed at 964 floats/chunk): Phase 0 blame isolation (LPIPS/SSIM; GT-state render probe; unfactorized 964-D AE control) → Phase 1 v513 loss fixes (L_orth, residual dyn, VICReg variance hinge, λ_pixel 4.0 + LPIPS, freeze-static staging) → Phase 2 cross-attn then diffusion decoder at fixed rate → Phase 3 rate reallocation only if 1–2 stall. |
+| 2026-06-12 | **v5.1.3 MAETok port built + launched.** Stage-0 gates passed: MLP probe ≈ linear probe on z_static (identity ABSENT, not nonlinear → encoder fix justified); encoder is Conv3d → Fork C (cell masking, not tokens). Built: DINOv2-small patch cache for all 30k windows (13.3 GB memmap, 27 min on V100), `ObjectRegionMask` (channel-variance saliency, learnable mask vector), `AuxSemanticDecoder` (384-d LatentDecoder body; fixed a 1/|pred| cosine-grad singularity at zero-init → std 1e-3), masked-cosine loss, `train_v5.py` aux branch with hard invariants (dynamics path never sees the masked pass). Mini-train: mae_sem 1.0→0.13 in 3 ep. Launched 9855030 smoke (20-vid full recipe), 9855227 matched no-MAE control, **9855251 `v513_mae_clevrer`** (full 10k CLEVRER, single-variable vs v512_clevrer_big: `--lambda_mae 0.5 --mask_ratio 0.5`, self-chaining, cedar). Read-out: val attrs CE + val z_static_std vs big first, render later. Ops: `.bashrc` exports `TRANSFORMERS_CACHE=/huggingface` overriding HF_HOME — set ALL HF env vars in jobs (root cause of the old `/huggingface` PermissionError). |
 | 2026-05-27 | **v5.1.2 re-run: pixel-loss anchor + auto-resume + fair frozen control.** Root-caused e2's garbage reconstruction to the absence of a pixel-space loss: with only latent `L_recon` and a trainable encoder, the encoder sits on both sides of the target and collapse is the trivial optimum. Fix: `L_pixel` now backprops through the (frozen or trainable) Wan decoder to the encoder, decoupled from `--unfreeze_vae_dec`; added `--lambda_recon` so e2/e3 run `lambda_recon=0, lambda_pixel=5.0` (pixel co-primary). Verified the fix holds over a full 8 h window: e2 `z_s_std` *grew* 0.041 → 0.540 (old run collapsed to 0.000 by ep 5), `L_pixel` monotone down. **Fair 3-way comparison locked in:** e1/e2/e3 now share an identical loss config (`lambda_recon=0, lambda_pixel=5.0`, B=2, 1000 vids, 200 ep); the ONLY difference is which VAE half is trainable — **e1 frozen** (control, both halves frozen, `--lambda_pixel>0` loads the VAE frozen so it too is supervised in pixel space), **e2** encoder-unfrozen, **e3** decoder-unfrozen. Made `lambda_pixel>0` load a frozen VAE (`use_pixels` no longer gated solely on unfreeze flags; default `lambda_pixel` 1.0→0.0 so non-pixel runs are unaffected); e1 moved to L40S since the frozen-decoder pixel path OOMs the old V100-16GB control. **Auto-resume** added (`--resume auto` restores models/VAE/optimizer/scheduler/best/epoch from a rolling `last.pt` saved every epoch; organized `ckpt_ep{N}.pt` every 10; `DONE` marker on completion; wandb resumes same run); e1/e2/e3 sbatch use a STABLE out_dir and **self-chain** past the 8 h embers wall via `sbatch --dependency=afterany:$JOBID` until `DONE` (cap 20 attempts). Submitted e1=9192118, e2=9192047, e3=9192048 on L40S. |
+| 2026-07-16 | **FRAMING VERDICT + paper gate tables (see "PAPER EXPERIMENT SET" section above).** Tested three framings against evidence in one session; verdict: **DIALGA is an EMBEDDING paper, reconstruction is a limitation not a claim** (`memory/project_paper_framing_verdict.md`). **R-D gate (job 11199622)** and **rFVD gate (job 11199935)** both fired against the tokenizer/codec framing: H.264 beats us on PSNR (+10 dB), LPIPS (~10×) AND rFVD (3–5×, 41.75 vs our 153.04 @964f ep200), matching our bitrate at ~half the rate; no rate axis (4× bits → +0.9 dB, rFVD non-monotonic). **E2 flow decoder + E4 nested rate DROPPED** per the pre-committed decision rule. **Baseline probe (job 11199805)** = the headline: ours 96-float z_static colour mAP **0.932** beats raw 27648-float latent 0.773 (288× smaller), PCA-96 0.679, random-init 0.750; DINOv2 0.950 is the honest caveat (our own teacher). Built `scripts/probes/{rd_table,rfvd_table,baseline_probe_table}.py` (cd-fvd/I3D). PV-VAE found mis-cited (no static/dyn factorization) → cite VidTwin/PVDM. |
+| 2026-07-24 | **Paper experiment set completed — attrs control, E5 second dataset, factorization (see section above).** **Attribute-supervision control (job 11227560, @ep70 epoch-matched):** the label-free arm (λ_attrs=0.0) hits colour mAP **0.869** vs 0.917–0.920 supervised vs 0.498 prior — supervision adds only +0.05, so the claim is NOT circular; label-free still beats wan_flat 0.773 / PCA-96 0.680 / random 0.756. Rate curve flat (0.919→0.927 over 12× rate). **E5 LIBERO-90 second dataset (job 11285009, 10 held-out unseen tasks):** z_dyn heldout cont-MSE **0.0227** / gripper 0.930 beats wan_mean 0.0267/0.909, random_init 0.0320/0.920, z_static 0.0654/0.732 — stable ep100→ep200, answers "CLEVRER-only". **Factorization cross-probe (job 11285010, 3 arms):** z_dyn at chance on colour (−0.03 to −0.04) across all arms incl. label-free while z_static wins (+0.19 to +0.32); z_dyn wins position R² (0.82 vs 0.42 on v55). Honest weaknesses for the paper: DINOv2 (teacher) beats the probe; LIBERO margin ~15% single-seed (→ run multi-seed before "significantly outperforms"); z_static leaks position; velocity probe degenerate (drop it); recon loses to H.264. |
+| 2026-07-30 | **v5.9 reconstruction fix — spatial z_dyn + rebalanced L_pred (breaks the DROID 16 dB floor at overfit level).** Root-caused the DROID moving-camera failure to RECONSTRUCTION, not camera conditioning: 3 camera aggregators (conv / plane-sweep / world-memory) all tied at `zstatic_within_ep≈0.52` and **16 dB pixel PSNR** (vs 33 dB VAE ceiling) — you can't judge camera-invariance on a model that can't reconstruct. Diagnosis via free-code + real-module overfits on DROID Wan-latent chunks: (1) code capacity is NOT the limit — 960 free floats reconstruct chunks to **0.002 MSE**; (2) the real model's overfit floored at **0.0775**; (3) two causes — **z_dyn was a GLOBAL per-frame vector** broadcast to every decoder cell (rank-limited; can't represent per-frame per-location change — lit review: VidTwin/Hi-VAE/Cosmos/MAGVIT-v2 ALL keep a per-frame spatial code, global-motion methods only work on synthetic data), and **L_pred (forward-dynamics) strangled z_dyn** (dropping λ_pred 1.0→0 alone took real-encoder overfit 0.0775→**0.0056**). FIX = (a) **spatial z_dyn** `[B,T,d_dyn]→[B,T,c_dyn,gd,gd]` (`--dyn_spatial --dyn_grid 8`, d_dyn 256) in encoder (`proj_dyn` 1×1 conv over per-frame grid) + decoder (upsample+concat, not broadcast); (b) **λ_pred 1.0→0.1**. Rate-matched real-module overfit (24 DROID chunks): GLOBAL 0.0056 vs **SPATIAL 0.0027 (2.1×)**, both ≫ 0.0775 floor. Same theme as the project's core global-pool finding, now applied to z_dyn (z_static got the spatial-grid fix in v5.7; z_dyn never did). Full DROID run launched (`droid_v59_on`, 40 ep, all eps, static_agg=world); **pixel-PSNR readout pending** to confirm the 16 dB jump generalizes. Env: home-NFS editable paths in `sys.path` hang `import torch` on the Triton metadata scan — strip `/storage/home/` from sys.path before import; run from a clean dir with `env -u PYTHONPATH`. |
+
+---
+
+## v5.9 — Spatial z_dyn: the reconstruction fix for real (moving-camera) video (2026-07-30)
+
+**Problem.** On DROID wrist-camera video (real, moving camera), the factorized embedding reconstructed at only **16.1 dB pixel PSNR** vs a 33.3 dB frozen-Wan-VAE ceiling — a 17 dB gap. This blocked the whole moving-camera study: three camera-conditioning aggregators (concat-conv, plane-sweep, world-memory/median) all tied at `zstatic_within_ep≈0.52` and 16 dB, because you cannot measure camera-invariance on a model that cannot reconstruct. The camera conditioning was never the blocker — **reconstruction was.**
+
+**Diagnosis (local overfit ladder on DROID Wan-latent chunks).**
+1. Capacity is NOT the limit — free per-chunk codes (960 floats) reconstruct DROID chunks to **0.002 latent MSE**.
+2. The real model's overfit floored at **0.0775** — it couldn't even memorize 27 chunks.
+3. Raising z_static spatial resolution (4×4→8×8) did nothing (0.0775→0.0760) — so z_static was not the wall.
+4. Root cause: **z_dyn was a GLOBAL per-frame vector** — the decoder broadcast it to every latent cell (`z_dyn.reshape(B*T,d_dyn,1,1).expand(...,s,s)`), so the per-frame delta field is spatially uniform (rank-limited). Real textured video needs a per-frame *spatial* change field; CLEVRER worked only because its motion is low-rank rigid-body.
+5. Literature review (VidTwin, Hi-VAE, Cosmos-Tokenizer, MAGVIT-v2, PVDM) is unanimous: **every VAE that reconstructs real video keeps a per-frame spatial code**; global-motion factorizations (S3VAE, MoCoGAN) only work on synthetic data. Hi-VAE explicitly found a global motion code insufficient and added a spatial motion grid.
+6. Secondary cause: **L_pred (forward-dynamics) was strangling z_dyn** — forcing it to be roll-forward-predictable at recon's expense. Dropping λ_pred 1.0→0 alone took a real-encoder overfit 0.0775→0.0056.
+
+**Method (the fix).**
+- **Spatial z_dyn.** Change the dynamics code from `z_dyn ∈ [B,T,d_dyn]` (global) to a **per-frame spatial grid** `[B,T,c_dyn,gd,gd]`, flattened to `d_dyn = c_dyn·gd²`.
+  - Encoder (`LatentEncoder3D`, `--dyn_spatial --dyn_grid 8`): adaptive-pool the per-frame dyn-trunk features to `(gd,gd)`, concat the per-frame pose embedding over cells, `proj_dyn` (1×1 conv) → `(c_dyn,gd,gd)`.
+  - Decoder (`SpatialGridDecoder`): reshape z_dyn back to `(c_dyn,gd,gd)` and **bilinear-upsample** to the 8×8 latent lattice, then concat with the (upsampled) static grid + coords — instead of broadcasting one vector to every cell.
+- **Rebalance L_pred:** `--lambda_pred 1.0 → 0.1` so forward-prediction stops sacrificing reconstruction.
+- Config used: `--d_dyn 256 --dyn_spatial --dyn_grid 8` (c_dyn=4), on top of the existing spatial z_static grid + world-memory camera aggregator.
+
+**Results (full DROID, 149 eps, held-out).**
+- **Pixel PSNR: 16.1 → 20.5 dB (+4.4 dB)** vs the old global-z_dyn baseline (VAE ceiling 33.3 dB — headroom remains).
+- Latent val_recon: 0.12 → 0.077.
+
+**Attribution (matched-rate ablations, held-out latent val_recon; lower better).**
+| config | z_dyn | rate | λ_pred | val_recon |
+|---|---|---|---|---|
+| baseline | global | 96 | 1.0 | ~0.12 |
+| +rate only | global | 256 | 0.1 | 0.113 |
+| +spatial | spatial | 256 | 1.0 | 0.090 |
+| **v5.9 (+spatial +λ-rebalance)** | **spatial** | **256** | **0.1** | **0.077** |
+
+Reading: the win is **the spatial structure, not the extra floats** — at a fixed 256-float budget, global→spatial is 0.113→0.077 (~32%), while quadrupling a *global* code barely moved it (0.12→0.113). The λ_pred rebalance adds ~14% more. Same root theme as the project's core global-pool finding, now applied to z_dyn (z_static got the spatial-grid fix in v5.7; z_dyn never did).
+
+**Honest status / open items.**
+- Verified on DROID moving-camera video; **CLEVRER generality cross-check pending** (does spatial z_dyn help / not regress on easy data → is it a *general* video-AE improvement or DROID-specific).
+- Rate grew (z_dyn 96→256); the efficiency claim now rests on the recon win justifying the extra rate — report the RD trade explicitly.
+- 20.5 dB is a real gain but still 12.7 dB under the VAE ceiling — not "solved," direction confirmed.
+- The camera-invariance question is separate and still open (the DROID within-episode metric compares non-overlapping chunks = different scene content, so it can't isolate camera-invariance; needs overlapping-window or a static-scene multiview testbed).
+
+**Env note.** Local `train_v5` launches wedge because home-NFS editable paths in `sys.path` hang `import torch` on the Triton `importlib.metadata` scan — strip `/storage/home/` from sys.path before `import torch`; run from a clean dir with `env -u PYTHONPATH`; and set all 4 HF cache vars on *separate* export lines (single-line `export A=$HF_HOME B=$A` doesn't expand, so the profile's `TRANSFORMERS_CACHE=/huggingface` wins and the Wan-VAE load fails).
