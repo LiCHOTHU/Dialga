@@ -3,3 +3,19 @@ __pycache__/
 *.py[cod]
 output/
 datasets/*
+# --- vendored third-party repo (has its own .git; not ours to commit) ---
+ml-videoflextok/
+
+# --- OS / editor junk ---
+.DS_Store
+*.DS_Store
+
+# --- LaTeX build artifacts (keep sources: main.tex, sections/, .bib) ---
+iclr2026/*.aux
+iclr2026/*.log
+iclr2026/*.blg
+iclr2026/*.bbl
+iclr2026/*.out
+iclr2026/*.fls
+iclr2026/*.fdb_latexmk
+iclr2026/*.synctex.gz

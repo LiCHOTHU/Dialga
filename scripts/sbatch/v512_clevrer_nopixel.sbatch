@@ -40,7 +40,7 @@ mkdir -p "${OUT_DIR}"
 echo "OutDir: ${OUT_DIR}"; nvidia-smi || true
 
 SCRIPT_PATH="${WORKDIR}/scripts/sbatch/v512_clevrer_nopixel.sbatch"
-ATTEMPT="${ATTEMPT:-1}"; MAX_ATTEMPTS=20
+ATTEMPT="${ATTEMPT:-1}"; MAX_ATTEMPTS=500
 if [ -f "${OUT_DIR}/DONE" ]; then
     echo "[chain] ${OUT_DIR}/DONE present — training complete; exiting."; exit 0
 fi

@@ -1329,3 +1329,55 @@ Decomposition of +4.4 dB: **spatial structure +2.7 dB** (dominant), λ_pred reba
 - The camera-invariance question is separate and still open (the DROID within-episode metric compares non-overlapping chunks = different scene content, so it can't isolate camera-invariance; needs overlapping-window or a static-scene multiview testbed).
 
 **Env note.** Local `train_v5` launches wedge because home-NFS editable paths in `sys.path` hang `import torch` on the Triton `importlib.metadata` scan — strip `/storage/home/` from sys.path before `import torch`; run from a clean dir with `env -u PYTHONPATH`; and set all 4 HF cache vars on *separate* export lines (single-line `export A=$HF_HOME B=$A` doesn't expand, so the profile's `TRANSFORMERS_CACHE=/huggingface` wins and the Wan-VAE load fails).
+
+## v6.0 — Frozen-VAE disentanglement reframe + fair-baseline sweep (2026-08-20)
+
+**Framing pivot.** After the rFVD/embedding framings, the paper is reframed as
+*plug-in disentanglement of a frozen video-VAE latent* (identity / object-motion /
+camera), positioned against PV-VAE (predictive but entangled, trains a VAE
+\[arXiv:2605.02134]) and the S3VAE/C-DSVAE/VidTwin decomposition line (train small
+VAEs, no camera). We do **not** claim to beat foundation encoders on semantics or
+codecs on reconstruction; contribution is the cheap, camera-aware decomposition.
+Abstract + intro + contributions rewritten (`iclr2026/sections/00,01`).
+
+**Fair-baseline sweep (CLEVRER, all methods on the SAME frozen Wan latent).**
+
+*Decodability (Table 10, equal-capacity decoder → Wan latent, val latent-MSE):*
+ours **0.0241** < VideoMAE/VideoFlexTok 0.0296 < DINOv2 0.0376; ablation: full
+latent 0.0228 (ceiling), mean-pool 0.0392, random-init 0.0658. Reported as
+"recon retained %": ours **94.6%** vs 77% / 61%. A real, fair win.
+
+*Semantic efficiency (`semantic_efficiency.py`):* rate curve + label curve. Label
+efficiency is the win — ours z_static@96 at 360 labels = **0.854 mAP**, above
+PCA-96 (0.814) and the full 27648-float latent (0.819). Filled as Table Q1(b).
+
+*Aggregate semantic mAP (Table 1):* ours 0.893, loses to mean-pool (0.904), full
+latent (0.897) and all pretrained @96 (0.96–0.98). Kept honest, demoted to
+peer-class + reference framing (foundation encoders = reference block, not rivals).
+
+**Disentanglement head-to-head (`disent_headtohead`, ours vs entangled `--shared_trunk`
+AE, same rate/data/params).** z_dyn identity-LEAKAGE: ours 0.805 vs entangled 0.809 —
+essentially a **tie**. The static/dynamic split is only *partial*; identity still
+leaks into z_dyn about as much as a shared-trunk model. NOT filled into the paper
+(would weaken it). Fix requires an independence/adversarial loss pushing identity out
+of z_dyn (retrain) — open item, the load-bearing gap for the disentanglement claim.
+
+**Is the SSv2 gap our model? No — it's the input.** Full raw Wan latent (27648-d,
+the ceiling of what any encoder could extract from this VAE) probes SSv2 top-1 at
+**9.5%** — already far below VideoMAE's 15.7%. So the recognition gap is baked into
+the frozen-VAE latent, not our encoder. Confirmed by two negatives: 4× data
+(8k→32k, `ssv2_train_32k`) moved top-1 6.50→6.15 (**flat**); 4× model scaling on
+SSv2 bought only ~1 pt earlier. Conclusion: recognition accuracy is input-capped;
+stop competing there, lean on decomposition + efficiency.
+
+**V-JEPA baseline not runnable** in our env: official `facebookresearch/vjepa2`
+torch.hub entry collides with our top-level `src/` package (`No module named
+'src.hub'`). Deferred; would need a separate-process feature cache. VideoMAE /
+VideoFlexTok / DINOv2 all verified loading + producing finite features.
+
+**Infra.** Added bad-node hostname guard (`atl1-1-03-007-29-0`; site plugin ignores
+`--exclude`) + sleep-backoff self-resubmit to every new sbatch; embers preemption
+handled via self-chaining. Login-node probes get killed by policy → all probes now
+run as embers jobs. New: `clevrer_{baselines,decode_baselines,rollout_baselines,
+decode_ablation}.py`, `semantic_efficiency.py`, `ssv2_action_probe.py` (+full-latent
+ceiling row), `clevrer_entangled`/`clevrer_scale`/`ssv2_{cache,train}_32k` sbatch.

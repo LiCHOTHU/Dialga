@@ -1,0 +1,24 @@
+% Keep to one paragraph, ~210 words. Refresh numbers when final endpoints land.
+Powerful pretrained video VAEs compress video into rich but \emph{entangled}
+latents: object identity, object motion, and camera motion are fused into one code
+that cannot be read, edited, or predicted factor by factor. Recovering such
+structure normally means training a new VAE from scratch. We present \method{}, a
+lightweight adapter that re-encodes the latent of \emph{any frozen} video VAE into
+named, independently accessible slots --- a spatial static code (identity), a
+per-frame spatial dynamics code (object motion), and a camera code --- with a
+decoder structurally prevented from mixing them, and \emph{no} VAE retraining.
+Carrying this factorization to real moving-camera robot video exposed a general
+failure: a \emph{global} per-frame dynamics vector reconstructs real textured video
+$17$\,dB below the frozen-VAE ceiling, because the decoder can only broadcast it
+uniformly across space. Giving the dynamics code a spatial axis raises held-out
+reconstruction by $+4.4$\,dB, which a matched-rate ablation attributes to spatial
+\emph{structure} ($+2.7$\,dB) rather than added rate ($+0.6$\,dB). We show the code
+is cleanly \emph{disentangled} (a diagonal-dominant cross-probe), controllable
+(identity/motion swap), and camera-aware (a known-pose path for viewpoint stability
+that entangled and camera-blind baselines lack), and that its dynamics code
+transfers to robot action read-out. We are explicit about what \method{} is
+\emph{not}: at extreme compression it does not beat foundation encoders on semantic
+accuracy or classical codecs on rate--distortion --- we report both. Its
+contribution is a cheap, camera-aware \emph{disentanglement} of frozen video-VAE
+latents that entangled predictive VAEs and camera-blind decomposition VAEs do not
+provide.

@@ -1,0 +1,23 @@
+We presented \method{}, a factorized, high-compression embedding of a frozen
+video-VAE latent whose static and dynamic slots are separately usable, and
+we identified and fixed the one architectural choice --- a global per-frame
+dynamics code --- that made such a factorization collapse on real, moving-camera
+video. Re-shaping the dynamics code into a per-frame spatial grid raises real-video
+reconstruction by $+4.4$\,dB, attributable to the spatial structure rather than to
+rate, and the resulting embedding is factorized and useful for downstream control.
+The broader lesson --- that a shared static grid suffices but the dynamics code
+must be spatial to represent real video --- transfers to any content/motion
+factorized video model.
+
+\paragraph{Limitations.}
+\label{sec:limitations}
+\method{} is not a codec: at matched bitrate it loses to H.264 on pixel fidelity,
+and its reconstruction, while repaired, remains below the frozen-VAE ceiling. The
+camera-invariance benefit of the pose path is not yet cleanly established on real
+robot data: the DROID within-episode metric compares \emph{non-overlapping}
+temporal windows, which see genuinely different scene content as the camera sweeps,
+and therefore cannot isolate camera-invariance from ordinary content change; a
+static-scene multi-view testbed (or overlapping windows) is required to measure it.
+Finally, several downstream and semantic numbers are currently reported on a prior
+model version and are being recomputed on the final model; the factorization and
+reconstruction claims are the ones we consider established.

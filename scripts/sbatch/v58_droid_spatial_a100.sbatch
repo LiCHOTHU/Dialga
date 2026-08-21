@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#SBATCH -N 1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH -p gpu-a100
+#SBATCH --time=05:00:00
+#SBATCH --mem-per-gpu=80G
+#SBATCH --job-name=v58_droid_spatial_a100
+#SBATCH --qos=inferno
+#SBATCH --account=gts-agarg35-ideas_l40s
+#SBATCH --output=/storage/project/r-agarg35-0/lwang831/outputs/dialga/logs/%x_%j.out
+#SBATCH --error=/storage/project/r-agarg35-0/lwang831/outputs/dialga/logs/%x_%j.err
+
+# v5.8 moving-camera FIX (toy-selected): spatial z_static + MULTI-FRAME pose
+# aggregation (encoder inverts) + SpatialGridDecoder pose re-apply (decoder
+# re-applies). Replaces the failed pool+concat recipe. Trains ON + BLIND on the
+# already-extracted DROID cache (1335 chunks) -> camera readout + pixel PSNR.
+# Self-contained: num_workers=0, wandb DISABLED (no NFS temp writes).
+# a100 clone of v58_droid_spatial.sbatch (l40s partition was jammed).
+set -eo pipefail
+WORKDIR="/storage/home/hcoda1/8/lwang831/workspace/Dialga"
+PT="/storage/project/r-agarg35-0/lwang831/tmp"
+CACHE="${PT}/droid_fast_cache"
+OUT_ON="${PT}/droid_spatial_on"
+OUT_BLIND="${PT}/droid_spatial_blind"
+EPOCHS="${EPOCHS:-150}"
+cd "${WORKDIR}"
+
+source ~/.bashrc; conda activate river
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-6}"
+export TMPDIR="${PT}"; export TEMP="${PT}"; export TMP="${PT}"
+export MPLCONFIGDIR="${PT}/matplotlib"
+export HF_HOME="/storage/project/r-agarg35-0/lwang831/hf_cache"
+export HF_HUB_CACHE="${HF_HOME}"; export HUGGINGFACE_HUB_CACHE="${HF_HOME}"
+export TRANSFORMERS_CACHE="${HF_HOME}"
+export WANDB_MODE=disabled
+export PYTHONPATH="${WORKDIR}:${PYTHONPATH:-}"
+nvidia-smi || true
+
+TRAIN=(--dataset droid --cam_source real --cache_dir "${CACHE}"
+    --batch_size 16 --num_workers 0
+    --epochs "${EPOCHS}" --stage1_epochs 5 --stage2_epochs $((EPOCHS-5))
+    --lr 3e-4 --lr_schedule cosine --weight_decay 1e-3
+    --d_static 96 --d_dyn 96 --d_state 48 --enc_hidden_ch 192 --dec_hidden_ch 384
+    --static_grid 4 --pool_type spatial --decoder_type spatial
+    --lambda_recon 1.0 --lambda_pred 1.0 --lambda_fwd 0.3 --lambda_consist 1.0
+    --lambda_attrs 0.0 --lambda_event_aux 0.0 --lambda_gate 0.0
+    --infonce_temperature 0.1 --lambda_pixel 0.0 --lambda_mae 0.0
+    --early_stop_patience 0 --val_frac 0.2 --log_every 25 --ckpt_every 1000 --resume auto
+    --use_camera_pose --pose_inject concat --d_pose 32 --pose_dim 6 --pose_n_trans 3
+    --lambda_cam_inv 1.0 --device cuda)
+
+echo "==================== [1/3] TRAIN pose-ON (spatial) ===================="
+python -u scripts/train_v5.py "${TRAIN[@]}" --out_dir "${OUT_ON}" --wandb_run_name droid_spatial_on
+
+echo "==================== [2/3] TRAIN pose-BLIND (spatial) ===================="
+python -u scripts/train_v5.py "${TRAIN[@]}" --cam_pose_blind --out_dir "${OUT_BLIND}" --wandb_run_name droid_spatial_blind
+
+echo "==================== [3/3] READOUT + PSNR ===================="
+python -u scripts/probes/droid_camera_readout.py \
+    --cache_dir "${CACHE}" --val_frac 0.2 --seed 42 --psnr \
+    --ckpt on:"${OUT_ON}/v5.pt" --ckpt blind:"${OUT_BLIND}/v5.pt" \
+    --out_json "${PT}/droid_spatial_readout.json"
+
+echo "V58_DROID_SPATIAL_DONE at $(date)"

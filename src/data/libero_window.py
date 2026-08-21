@@ -166,6 +166,8 @@ class LiberoChunkPairs(Dataset):
             "actions_pred":      pred["actions"],
             "gripper_state_obs": obs["gripper_state"],
             "gate_GT":     pred["gripper_event"].float(),
+            "attrs":       torch.zeros(1, 1, dtype=torch.float32),
+            "slot_mask":   torch.zeros(1, dtype=torch.bool),
             "task_id":     int(obs["task_id"]),
             "episode_id":  int(obs["episode_id"]),
             "global_episode_id": int(obs["global_episode_id"]),

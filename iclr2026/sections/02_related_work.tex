@@ -1,0 +1,60 @@
+% Citation map: keys in iclr2026_conference.bib. VERIFY every arXiv id / venue
+% before submission (several reconstructed from memory; the uncertain ones are
+% marked VERIFY inside the .bib).
+
+\paragraph{Self-supervised video representation.}
+Masked and predictive video encoders --- VideoMAE \citep{videomae}, V-JEPA
+\citep{vjepa}, and image-level DINOv2 \citep{dinov2} --- learn strong transferable
+features that are evaluated by frozen-feature probes (linear, attentive-pool,
+$k$-NN) and label efficiency on Kinetics and Something-Something. They produce a
+single unstructured feature grid and are trained on human-action video; they do
+not expose a named identity/dynamics/event factorization, nor are they aimed at
+object-physics or robot data. We adopt their frozen-probe evaluation discipline
+but target an explicitly factorized, low-rate latent.
+
+\paragraph{Factorized and disentangled video.}
+A line of sequential VAEs splits video into a time-invariant content code and a
+per-frame motion code: DSVAE \citep{dsvae}, S3VAE \citep{s3vae}, C-DSVAE
+\citep{cdsvae}, MoCoGAN \citep{mocogan}; VidTwin \citep{vidtwin} carries this into
+a modern video VAE with separate structure and dynamics latents, and object-centric
+SlotFormer \citep{slotformer} validates its factorization by downstream physical
+reasoning. Two properties are near-universal in this family and matter for us: the
+disentanglement is demonstrated almost only on synthetic or narrow data, and the
+\emph{motion} code is a global per-frame vector. Our analysis explains why that
+second choice caps real-video reconstruction; our spatial-dynamics code is the
+fix, and unlike this literature we demonstrate the split on \emph{real} video at
+a two-to-three-order-of-magnitude smaller code.
+
+\paragraph{Video tokenizers and world models.}
+Tokenizers --- MAGVIT-v2 \citep{magvitv2}, Cosmos \citep{cosmos}, PVDM
+\citep{pvdm} --- and latent world models --- DreamerV3 \citep{dreamerv3}, TD-MPC2
+\citep{tdmpc2}, iVideoGPT \citep{ivideogpt}, Genie \citep{genie} --- all keep a
+per-frame \emph{spatial} token grid and are judged by generation quality
+(FVD/PSNR) and, for world models, by planning return and sample efficiency. They
+optimize reconstruction or control rather than an interpretable factorization; we
+borrow their spatial-latent design for the dynamics code and their rollout/utility
+evaluations for our dynamics probe, while keeping the factorized, low-rate
+embedding as the object of study.
+
+\paragraph{Camera- and viewpoint-aware representation.}
+Geometry-aware attention (GTA \citep{gta}) and projective positional encodings
+(PRoPE \citep{prope}) inject known camera pose to improve novel-view synthesis and
+cross-view reasoning; MosaicMem \citep{mosaicmem} combines explicit 3D lifting with
+implicit dynamics for camera-consistent memory; view-invariant policies and world
+models \citep{reviwo,vista} demonstrate viewpoint robustness by held-out-camera
+control. Our camera path uses known pose in the same spirit, but as an add-on to a
+factorized embedding rather than for synthesis, and we test camera-invariance of
+the \emph{state} directly via a pose-readout asymmetry.
+
+\paragraph{Visual representations for robotics.}
+R3M \citep{r3m}, VIP \citep{vip}, MVP \citep{mvp}, and Voltron \citep{voltron}
+learn frozen visual encoders judged by behavior-cloning success rate, action/state
+probes, and sample efficiency on manipulation. We evaluate \method{}'s dynamics
+code with the same frozen-encoder protocol on LIBERO \citep{libero}, and use these
+methods as the baselines for downstream usefulness.
+
+In sum, prior factorized-video work demonstrates its split on synthetic data with
+a global motion code, and prior tokenizers keep spatial latents but no
+interpretable factorization; \method{} is, to our knowledge, the first to show
+that a named identity/dynamics/event factorization can be learned at high
+compression on real moving-camera video, once the dynamics code is made spatial.

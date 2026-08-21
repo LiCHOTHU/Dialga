@@ -1,0 +1,129 @@
+% P1 the goal (a factorized video embedding) -> P2 prior factorized models are
+% synthetic-only -> P3 real-video failure + the diagnosis -> P4 the fix (spatial
+% dynamics) -> P5 camera add-on + results -> contributions.
+
+A video representation should keep its kinds of information in different places:
+\emph{identity} --- what the objects are, constant over time --- \emph{object
+motion} --- how they move --- and, for a moving camera, \emph{camera motion} ---
+how the viewpoint moves. Modern video VAEs do the opposite. Trained to reconstruct,
+they pack texture, identity, object motion, and camera motion into a single
+unstructured latent grid that offers no axis along which a downstream user can read
+out identity, freeze dynamics, or subtract the camera \citep{videomae,vjepa}. That
+structure can be recovered, but expensively: sequential VAEs that split content from
+motion do so by \emph{training a VAE from scratch} \citep{s3vae,cdsvae}, and recent
+large predictive video VAEs enrich the latent's motion-awareness but leave it
+\emph{entangled}, and cost a full pretraining run \citep{pvvae}. We ask a cheaper
+question: given an \emph{already-trained, frozen} video VAE, can we recover a named,
+factorized, camera-aware decomposition of its latent \emph{without retraining it}?
+
+\method{} is a lightweight adapter that re-encodes each short chunk of a frozen
+video-VAE latent into three named, independently accessible slots --- a spatial
+static code (identity), a per-frame spatial dynamics code (object motion), and a
+camera code --- with a decoder structurally prevented from mixing them. Decoding,
+forward prediction, and counterfactual editing are \emph{probes} of the
+factorization, not the objective. We are explicit about the regime: at this extreme
+compression the code does \emph{not} beat foundation encoders on semantic accuracy,
+nor the frozen VAE on reconstruction --- it is distilled from that VAE and cannot
+exceed it, and we report both plainly (\cref{tab:q1_semantic,tab:q5_rd}). At
+$288\times$ compression it stays \emph{as} semantically accessible as the full
+latent it is distilled from (attribute-probe mAP within noise; \cref{tab:q1_semantic})
+while remaining decodable (SSIM $\approx 0.96$). The contribution is not a higher
+number on any single axis --- it is the \emph{decomposition itself}: a cheap,
+camera-aware factorization that entangled latents, whether raw or predictive, cannot
+provide, and that we show is clean (a diagonal-dominant cross-probe), controllable
+(identity/motion swap), and transferable (the dynamics code drives robot control).
+
+The line of work that targets this decomposition --- sequential VAEs that split
+video into a time-invariant content code and a per-frame motion code
+\citep{dsvae,s3vae,cdsvae}, and object-centric models that factorize into slots
+\citep{slotformer} --- validates the factorization almost exclusively on
+\emph{synthetic} video with rigid, low-rank motion (Sprites, MUG, CLEVRER). It has
+remained unclear whether such a factorization can be learned at high compression
+on \emph{real}, cluttered, moving-camera video, where the demonstration and the
+demand are both far harder.
+
+We study \method{}, an encoder that compresses each short chunk of a frozen
+video-VAE latent into two named slots --- a spatial static code $\zs$ and a
+per-frame dynamics code $\zd$ --- at extreme rate, with a decoder structurally
+prevented from mixing them. Decoding, forward prediction, and
+counterfactual editing are \emph{probes} of the representation, not the objective:
+the claim is about what the latent carries, not about pixel fidelity, which
+classical codecs win outright at matched bitrate \citep{h264}. Taking this design
+to a real robot's moving wrist camera (DROID \citep{droid}) surfaced the failure
+that became the technical core of this paper. A model that factorizes cleanly on
+synthetic CLEVRER \citep{clevrer} reconstructed real video at only $16$\,dB ---
+$17$\,dB below the frozen-VAE ceiling --- \emph{no matter how the camera was
+conditioned}. The camera was not the bottleneck; reconstruction was.
+
+We trace the failure to a single property shared with the entire prior
+factorized-video family: the dynamics code is a \emph{global} per-frame vector,
+which the decoder can only broadcast uniformly across space. Such a code produces
+a spatially-uniform, rank-limited per-frame delta field --- enough for the
+near-rigid motion of synthetic scenes, but provably unable to represent the
+per-pixel, high-frequency temporal change of real textured video. Giving the
+dynamics code a \emph{spatial} axis --- a small per-frame feature grid rather than
+a vector, in line with what every real-video tokenizer converges on
+\citep{vidtwin,cosmos,magvitv2} --- raises held-out reconstruction on DROID from
+$16.1$ to $20.5$\,dB. A matched-rate ablation (\cref{tab:q4_recon}) attributes the
+gain to the spatial \emph{structure} ($+2.7$\,dB), not to the extra rate the
+change costs ($+0.6$\,dB). The lesson is concrete and transferable: the static
+code can be a shared grid, but \emph{the dynamics code must be spatial to survive
+real video}. On top of the now-reconstructable representation we add a
+known-camera-pose conditioning path, so the static code can be pushed toward
+viewpoint stability under a moving camera --- an add-on in the spirit of
+geometry-aware attention \citep{gta,prope} and explicit/implicit hybrid memory
+\citep{mosaicmem}.
+
+Our contributions are:
+\begin{itemize}
+  \item \textbf{Plug-in disentanglement of a \emph{frozen} video VAE}
+  (\cref{sec:method}): a lightweight adapter that factorizes any pretrained
+  video-VAE latent into named identity / object-motion / camera slots
+  \emph{without retraining the VAE}, recovering at a fraction of the cost the
+  structure that sequential and predictive video VAEs \citep{s3vae,cdsvae,pvvae}
+  obtain only by training a new VAE from scratch.
+  \item \textbf{A clean, controllable factorization} (\cref{sec:q2}): the
+  static / dynamic slots are \emph{independently} recoverable --- a cross-probe
+  matrix on CLEVRER is diagonal-dominant (identity from $\zs$, position and velocity
+  from $\zd$, each near chance on the other) --- and $\zs$ beats raw-latent, PCA, and
+  random-init at $288\times$ smaller size; this is an axis entangled latents (raw or
+  predictive) cannot expose.\footnote{Probe numbers marked \emph{[P]} in
+  \cref{sec:experiments} are from a prior model version and are being recomputed on
+  the final model.}
+  \item \textbf{The spatial-dynamics finding} (\cref{sec:spatial-dyn}): a
+  global per-frame dynamics code is rank-limited and fails to reconstruct real
+  video; the spatial-grid fix repairs it, and a matched-rate ablation isolates
+  the spatial structure as the dominant cause of the $+4.4$\,dB pixel-PSNR gain
+  on real moving-camera video.
+  \item \textbf{A known-pose, camera-aware path} (\cref{sec:q4}) --- separating
+  camera motion from object motion using known pose, with a two-sided pose-readout
+  protocol and an honest account of when camera-invariance can and cannot be
+  measured on single-trajectory robot data --- a capability no entangled or
+  camera-blind baseline provides.
+  \item \textbf{Downstream transfer} to a second, real robot dataset
+  (LIBERO \citep{libero}): the frozen dynamics code carries action-relevant
+  information, read out linearly above raw-latent and random-init controls
+  (\cref{sec:q4}).
+\end{itemize}
+
+We are explicit about scope. \method{} is a \emph{representation} method, not a
+codec: on rate--distortion it loses to H.264, and we report it in full
+(\cref{tab:q5_rd}). But that loss is the price of the position, not a defect ---
+moving off the generative end of the spectrum is \emph{how} a latent trades
+pixel-fidelity for named, low-rate, probeable structure. \method{}'s value is a
+compact, factorized, camera-aware embedding whose axes are useful downstream, which
+we test with frozen-feature probes rather than reconstruction quality.
+
+\begin{figure}[t]
+  \centering
+  \figplaceholder{2.6cm}{\textbf{[Figure reserved: the semantic--generative
+  spectrum.]} A one-axis diagram ordered by $I(z;x)$: language models and CLIP at
+  the \emph{semantic} (low-$I$, non-decodable) end; DINOv2, then multimodal hidden
+  states and DiT features in the middle; the frozen video-VAE latent at the
+  \emph{generative} (high-$I$, non-probeable) end. \method{} is marked at the
+  intermediate point that is \emph{simultaneously} decodable, factorized, and
+  forward-predictable. To be drawn.}
+  \caption{\method{} occupies a deliberate intermediate point on the
+  semantic--generative representation spectrum. \todo{draw}}
+  \label{fig:spectrum}
+\end{figure}

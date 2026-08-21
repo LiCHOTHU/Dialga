@@ -47,6 +47,7 @@ class ClevrerChunkPairs(Dataset):
         seed: int = 42,
         max_videos: int = 0,
         require_chunks_per_video: int = 3,
+        dino_cache_dir=None,
     ):
         cache_dir = Path(cache_dir)
         meta = json.loads((cache_dir / "metadata.json").read_text())
@@ -100,6 +101,26 @@ class ClevrerChunkPairs(Dataset):
         self.T_lat = int(probe["latent"].shape[1])
         self.W_pix = int(probe["collision_mask"].shape[0])
 
+        # Optional DINOv2 patch-feature cache (scripts/cache_dino_patch.py):
+        # one memmap whose row i is window idx i of THIS wan cache.
+        self.dino_cache_dir = Path(dino_cache_dir) if dino_cache_dir else None
+        self._dino_mm = None  # opened lazily per dataloader worker
+        if self.dino_cache_dir is not None:
+            dino_index = json.loads((self.dino_cache_dir / "index.json").read_text())
+            assert dino_index["wan_cache_dir"].rstrip("/") == str(cache_dir).rstrip("/"), \
+                f"dino cache built against {dino_index['wan_cache_dir']}, not {cache_dir}"
+            self._dino_shape = tuple(dino_index["shape"])
+            assert self._dino_shape[0] == len(windows), \
+                f"dino cache rows {self._dino_shape[0]} != wan windows {len(windows)}"
+
+    def _dino_features(self, win_idx: int) -> torch.Tensor:
+        """(T_lat, H, W, D_feat) float32 for one wan-cache window index."""
+        import numpy as np
+        if self._dino_mm is None:
+            self._dino_mm = np.memmap(self.dino_cache_dir / "features.f16.bin",
+                                      dtype=np.float16, mode="r", shape=self._dino_shape)
+        return torch.from_numpy(np.asarray(self._dino_mm[win_idx])).float()
+
     def __len__(self) -> int:
         return len(self.pairs)
 
@@ -115,7 +136,7 @@ class ClevrerChunkPairs(Dataset):
         # invariants
         assert obs["video_id"] == pred["video_id"] == b["video_id"], \
             "paired-chunk sampler broke video_id invariant"
-        return {
+        sample = {
             "chunk_obs":   obs["latent"],
             "chunk_pred":  pred["latent"],
             "chunk_obs_b": b["latent"],
@@ -126,6 +147,9 @@ class ClevrerChunkPairs(Dataset):
             "video_id":    int(obs["video_id"]),
             "start_frame": int(obs["start_frame"]),
         }
+        if self.dino_cache_dir is not None:
+            sample["dino_obs"] = self._dino_features(i_obs)   # (T, H, W, D_feat)
+        return sample
 
 
 def chunk_collate(batch):

@@ -1,0 +1,81 @@
+\documentclass{article} % For LaTeX2e
+\usepackage{iclr2026_conference,times}
+
+% Optional math commands from https://github.com/goodfeli/dlbook_notation.
+\input{math_commands.tex}
+
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage[table]{colortbl}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[capitalize,noabbrev]{cleveref}
+
+% --- draft convenience macros ---
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\figplaceholder}[2]{\fbox{\parbox[c][#1][c]{0.96\linewidth}{\centering\small\color{gray}#2}}}
+\newcommand{\method}{DIALGA}                 % working method name; rename in one place
+% number-status markers (see NUMBER PROVENANCE in sections/05_experiments.tex)
+\newcommand{\tbd}{\textcolor{gray}{--}}      % not yet run
+\newcommand{\done}{\textcolor{teal}{$\checkmark$}}
+\newcommand{\todomark}{\textcolor{orange}{$\circ$}}
+\newcommand{\pmark}{\textsuperscript{\textcolor{orange}{[P]}}}  % prior-model number
+% latent slot shorthands
+\newcommand{\zs}{z_{\mathrm{static}}}
+\newcommand{\zd}{z_{\mathrm{dyn}}}
+\newcommand{\ze}{z_{\mathrm{event}}}
+
+\title{\method{}: A Factorized, Camera-Aware Video Embedding\\ with a Spatial Dynamics Code}
+
+% Authors must not appear in the submitted version.
+\author{Anonymous authors\\
+Paper under double-blind review}
+
+\newcommand{\fix}{\marginpar{FIX}}
+\newcommand{\new}{\marginpar{NEW}}
+
+%\iclrfinalcopy % Uncomment for camera-ready version, but NOT for submission.
+\begin{document}
+
+\maketitle
+
+% === Abstract ===
+\begin{abstract}
+\input{sections/00_abstract}
+\end{abstract}
+
+% === Main Body ===
+\section{Introduction}
+\label{sec:introduction}
+\input{sections/01_introduction}
+
+\section{Related Work}
+\label{sec:related-work}
+\input{sections/02_related_work}
+
+\section{Method}
+\label{sec:method}
+\input{sections/04_method}
+
+\input{sections/05_experiments}
+
+\section{Conclusion}
+\label{sec:conclusion}
+\input{sections/06_conclusion}
+
+\subsubsection*{Reproducibility statement}
+\input{sections/07_reproducibility}
+
+\bibliography{iclr2026_conference}
+\bibliographystyle{iclr2026_conference}
+
+% === Appendix ===
+\appendix
+\input{sections/99_appendix}
+
+\end{document}

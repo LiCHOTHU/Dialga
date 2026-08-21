@@ -1,0 +1,158 @@
+% Method = the factorized encoder + the spatial dynamics code (headline) +
+% decoder no-mixing + camera path + objective.
+% Code refs: src/model/latent_encoder.py, latent_decoder.py (SpatialGridDecoder),
+%   camera_pose.py, scripts/train_v5.py.
+
+\method{} encodes a video as a sequence of independent short-chunk codes, each
+split into named slots by construction. We operate not on pixels but on the latent
+of a frozen video VAE: a $W$-frame chunk is mapped by the VAE encoder to a latent
+tensor $x \in \mathbb{R}^{C\times T\times H\times W}$ (in our instantiation a
+Wan-2.2 latent, $C{=}48$, $T{=}9$, $H{=}W{=}8$), and \method{} compresses each
+$x$ to two slots and decodes back to $x$; the frozen VAE decoder then renders
+pixels only for evaluation. Working in the VAE latent buys a strong appearance
+prior for free and lets the entire method be a small model; the price is a
+reconstruction ceiling (the VAE round-trip), against which we always report.
+
+The design has one principle: \emph{the slots must be separately usable, so the
+decoder is never allowed to reconstruct one factor's information out of another's}.
+This forces each slot to carry its own role. We first describe the encoder and the
+one architectural choice that makes it work on real video (\cref{sec:spatial-dyn}),
+then the decoder that enforces separation, the camera path, and the objective.
+
+\subsection{Factorized encoder}
+\label{sec:encoder}
+Two convolutional trunks read the chunk latent $x$, one for appearance and one for
+motion, and two heads emit the slots:
+\begin{align}
+  \zs \in \mathbb{R}^{c_s\times g\times g}, \qquad
+  \zd \in \mathbb{R}^{T\times c_d\times g_d\times g_d}. \nonumber
+\end{align}
+The \textbf{static grid} $\zs$ is a single spatial grid shared across all $T$
+frames of the chunk: the appearance trunk is pooled over time and adaptively
+pooled to a $g\times g$ lattice, then a $1{\times}1$ convolution projects it to
+$c_s$ channels. It is meant to hold \emph{what is where}, constant within the
+chunk. The \textbf{dynamics code}
+$\zd$ --- the slot whose form is the crux of this paper --- is described next. Total
+rate is $c_s g^2 + T c_d g_d^2$ floats per chunk, a few hundred, compressing
+the $C T H W$-float VAE latent by two to three orders of magnitude.
+(An optional per-frame event gate is available for benchmarks with collision
+labels; it is inert on real video and off by default, so we omit it here.)
+
+\subsection{The dynamics code must be spatial}
+\label{sec:spatial-dyn}
+The natural and near-universal choice in factorized-video models is to make the
+per-frame dynamics code a \emph{global} vector $d_t \in \mathbb{R}^{c_d}$, one per
+frame. A decoder can only inject such a vector by broadcasting it identically to
+every spatial cell. We show this is the reason a clean synthetic-video
+factorization collapses on real video, and that the fix is to give the dynamics
+code a spatial axis.
+
+Write the reconstructed latent at frame $t$, cell $u$, produced by a conv decoder
+$D$ from the (upsampled) static grid $S(u)$, a positional code $\gamma(u)$, and the
+dynamics injection. With a global dynamics vector the injection is constant in $u$,
+\begin{equation}
+  \hat{x}_t(u) \;=\; D\big(\,S(u),\; \gamma(u),\; \underbrace{d_t}_{\text{same at every }u}\,\big),
+  \label{eq:global-dyn}
+\end{equation}
+so, holding the static content and position fixed, the only thing that varies the
+frame-to-frame residual is a single $c_d$-vector: the per-frame delta field is a
+\emph{spatially smooth, rank-$c_d$} modulation of a fixed template. This suffices
+when motion is rigid and low-rank (a few objects translating on a blank
+background, as in synthetic benchmarks), but the frame-to-frame change of real,
+textured video --- specular highlights, occlusion edges, moving texture, camera
+parallax --- is spatially high-frequency and effectively full-rank over the
+$H\times W$ lattice. No spatially-uniform code can produce it, and the decoder is
+left to synthesize per-location change it was never handed; reconstruction plateaus
+far below the VAE ceiling regardless of any other component.
+
+\method{} instead makes the dynamics code a \emph{per-frame spatial grid}. The
+motion trunk is adaptively pooled per frame to a small $g_d\times g_d$ lattice and
+a $1{\times}1$ convolution yields $\zd = \{D_t\}_{t=1}^{T}$ with
+$D_t\in\mathbb{R}^{c_d\times g_d\times g_d}$; the decoder \emph{upsamples} $D_t$ to
+the latent resolution and concatenates it, rather than broadcasting a vector:
+\begin{equation}
+  \hat{x}_t(u) \;=\; D\big(\,S(u),\; \gamma(u),\; \underbrace{\mathrm{up}(D_t)(u)}_{\text{varies with }u}\,\big).
+  \label{eq:spatial-dyn}
+\end{equation}
+Now the per-frame delta field carries an independent value at each location, and
+real video becomes representable. This single change --- \cref{eq:global-dyn} to
+\cref{eq:spatial-dyn} --- accounts for the bulk of our reconstruction gain, and a
+matched-rate ablation (\cref{tab:q4_recon}) confirms the benefit comes from the
+spatial \emph{structure}, not from the extra floats the grid costs: enlarging a
+\emph{global} code four-fold barely helps, whereas re-shaping the same budget into
+a grid does. The static code can remain a shared grid because appearance is
+constant within a chunk; the dynamics code cannot, because change is where the
+information is.
+
+\subsection{Decoder and structural separation}
+\label{sec:decoder}
+The decoder consumes $(\zs, \zd)$ and reconstructs $x$ per frame, with no temporal
+mixing and no cross-slot leakage path: the static grid is upsampled and shared over
+$T$, each frame's dynamics grid is upsampled and concatenated only into its own
+frame, and a shallow convolution with fixed coordinate channels produces
+$\hat{x}_t$. Because each frame is decoded from $(\zs,\, D_t)$ alone, the only way
+to reduce reconstruction error for a moving scene is to route per-frame change
+through $\zd$ and per-frame-invariant content through $\zs$ --- the separation is a
+property of the wiring, not of an auxiliary loss.
+
+\subsection{Camera-pose conditioning}
+\label{sec:camera}
+When a known per-frame camera pose is available (e.g.\ a robot's end-effector pose
+for a wrist camera), \method{} conditions the static aggregation on it so that
+$\zs$ is encouraged toward a viewpoint-canonical frame under a moving camera. The
+raw pose is relativized to the chunk's first frame and log-compressed for stability
+\citep{prope}, embedded by a small MLP, and used to (i) aggregate the per-frame
+static grids into a single camera-canonical grid --- a pose-conditioned,
+depth-recovering multi-frame aggregation rather than a plain temporal mean --- and
+(ii) re-applied by the decoder per frame so each frame renders its own viewpoint,
+in the spirit of a known operator inverted at encode and re-applied at decode
+\citep{gta,mosaicmem}. The pose path is an add-on: it is inert when pose is
+withheld, and its effect on viewpoint invariance of the state is evaluated
+directly in \cref{sec:q4}.
+
+\subsection{Training objective}
+\label{sec:objective}
+All slots are trained jointly by reconstruction plus a small set of terms that pin
+each to its role; there is no supervision from ground-truth attributes or states.
+Reconstruction, $\mathcal{L}_{\mathrm{rec}} = \|\hat{x}-x\|^2$, is the primary
+anchor and is by itself sufficient to prevent latent collapse: a slot that went
+constant could not reconstruct a varying scene. A \textbf{forward-dynamics
+predictor} $f$ rolls the dynamics code one chunk ahead from the last observed frame
+and is trained to reconstruct the next chunk,
+$\mathcal{L}_{\mathrm{pred}} = \|\hat{x}^{+}-x^{+}\|^2$ with
+$\zd^{+}=f(\zd)$, which makes $\zd$ a \emph{predictable} state rather than an
+arbitrary code. Crucially we weight this term \emph{lightly}: a strong prediction
+loss forces $\zd$ to trade reconstruction for predictability and re-introduces the
+plateau, so $\lambda_{\mathrm{pred}}$ is kept small (its rebalancing contributes a
+further $+1.1$\,dB in \cref{tab:q4_recon}). A \textbf{consistency} term applies
+InfoNCE to $\zs$ across two chunks of the same clip, pulling same-clip identity
+together and pushing different clips apart, which both enforces
+appearance-constancy and provides an explicit anti-collapse signal for the static
+code. When camera pose is used, an optional \textbf{invariance} term penalizes
+drift of $\zs$ under the known transform. The total objective is
+\begin{equation}
+  \mathcal{L} = \mathcal{L}_{\mathrm{rec}}
+  + \lambda_{\mathrm{pred}}\mathcal{L}_{\mathrm{pred}}
+  + \lambda_{\mathrm{cons}}\mathcal{L}_{\mathrm{cons}}
+  + \lambda_{\mathrm{cam}}\mathcal{L}_{\mathrm{cam}},
+  \label{eq:objective}
+\end{equation}
+with the frozen VAE fixed throughout. \Cref{eq:objective} is deliberately spare:
+the factorization is meant to emerge from the wiring (\cref{sec:decoder}) and the
+compression bottleneck, not from hand-tuned auxiliary losses tying each slot to a
+label.
+
+\begin{figure}[t]
+  \centering
+  \figplaceholder{4.8cm}{\textbf{[Figure reserved: method overview.]}
+  Left: a frozen video-VAE encodes a $W$-frame chunk to a latent $x$. Middle:
+  \method{}'s two trunks emit a shared static grid $\zs$, a \emph{per-frame
+  spatial} dynamics grid $\zd$; the contrast between
+  broadcasting a global $d_t$ (\cref{eq:global-dyn}) and upsampling a grid $D_t$
+  (\cref{eq:spatial-dyn}) is called out as the crux. Right: the decoder
+  reconstructs each frame from $(\zs, D_t)$ with re-applied camera pose; a
+  forward-dynamics head rolls $\zd$ ahead. To be drawn.}
+  \caption{\method{} overview: a factorized, low-rate embedding of a frozen
+  video-VAE latent, with a spatial dynamics code. \todo{draw}}
+  \label{fig:method}
+\end{figure}

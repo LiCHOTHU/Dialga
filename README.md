@@ -1,231 +1,125 @@
 # DIALGA
 
-Object- and physics-aware video **representation** learning on CLEVRER.
+**Plug-in disentanglement of a frozen video-VAE latent.**
 
-The headline claim is about the representation, not the renderings. Decoding,
-forward prediction, and counterfactual editing are probes that test whether
-the representation actually carries identity, dynamics, and causal events.
+Modern video VAEs (Wan-2.2, and predictive variants like PV-VAE) compress video
+into rich but **entangled** latents: identity, object motion, and camera motion are
+fused into one code that cannot be read, edited, or predicted factor by factor.
+Recovering that structure normally means *training a new VAE from scratch*. DIALGA is
+a lightweight adapter that re-encodes the latent of **any frozen** video VAE into
+named, independently accessible slots — a spatial static code (identity), a per-frame
+spatial dynamics code (object motion), and an optional camera code — **without
+retraining the VAE**.
 
----
+Decoding, forward prediction, and counterfactual editing are treated as *probes* of
+the factorization, not as the objective.
 
-## Problem
+## What we claim (and don't)
 
-A video of bouncing CLEVRER objects contains three kinds of information that
-should live in different places in a good representation:
+We are explicit about the regime. At extreme compression (96–352 floats/chunk,
+distilled from a frozen VAE latent) DIALGA does **not** beat web-pretrained encoders
+(DINOv2/VideoMAE/VideoFlexTok) on semantic accuracy, nor the frozen VAE on
+reconstruction — we report both plainly. The contribution is the **decomposition
+itself**, and the properties it enables, measured against the *fair* peer class
+(methods on the same frozen latent, matched rate):
 
-1. **Identity** — color / material / shape of each object. Constant over time.
-2. **Dynamics** — per-frame position and motion of each object. Smooth except
-   at events.
-3. **Events** — discrete moments where dynamics change (collisions, entries,
-   exits). Sparse in time.
+- **Efficient encoding (Table: decodability).** DIALGA's code retains **94.6%** of the
+  full-latent reconstruction quality at ~11× compression — ahead of VideoMAE /
+  VideoFlexTok (77%) and DINOv2 (61%).
+- **Label efficiency (Table: Q1b).** At 360 labels its 96-float code reads attributes
+  at **0.854 mAP**, above a PCA of the same latent (0.814) *and* the full 27,648-float
+  latent (0.819) — more sample-efficient than the latent it is distilled from.
+- **Spatial-dynamics reconstruction fix (Table: Q4a).** Giving `z_dyn` a spatial axis
+  raises held-out DROID reconstruction by **+4.4 dB**; a matched-rate ablation
+  attributes it to spatial *structure* (+2.7 dB), not added rate (+0.6 dB).
+- **Factorization / camera-awareness.** A diagonal-dominant cross-probe (identity from
+  `z_static`, motion from `z_dyn`), and a known-pose path for viewpoint stability that
+  entangled and camera-blind baselines lack.
 
-Existing video models tend to entangle these. A pixel-reconstruction objective
-will happily memorize episode-specific surface statistics — the model "knows
-the video" without learning anything transferable across videos. We want a
-factorization where each axis is independently accessible: identity-only
-swaps, frozen-dynamics rollouts, and event localization should all be cheap
-read-outs from the latent state.
+Honest open item: the static/dynamic separation is **partial** — identity still leaks
+into `z_dyn` (a shared-trunk entangled baseline is nearly as clean), so the
+"disentanglement beats entangled" claim needs an independence-loss retrain to become
+airtight. See `DEVLOG.md`.
 
-## Hypothesis
-
-A bottlenecked encoder that splits its output into three named slots —
-`z_static`, `z_dyn`, `event_logits` — and a decoder structurally prevented
-from cheating across them, is enough to produce that factorization
-**without** auxiliary losses tying each slot to ground-truth state. At
-sufficient data scale, the model will choose to use each slot for its
-intended role because no other path lets the decoder reconstruct.
-
-Concretely we predict:
-
-- A linear/MLP probe on `z_static` recovers color, material, and shape on
-  **held-out videos**, well above the majority-class baseline.
-- Freezing `z_dyn` on a held-out video produces a decoded video with no
-  detectable motion variation (counterfactual locality).
-- `event_logits` fires at GT collisions on held-out videos.
-
-These are testable disentanglement properties, not just reconstruction
-quality.
-
-## Method
-
-### Representation
-
-For a `T`-frame video the encoder emits three tensors per `K`-slot batch:
-
-| Tensor | Shape | Role |
-|---|---|---|
-| `z_static` | `(B, K, 16)` | per-slot identity, constant over time |
-| `z_dyn` | `(B, T, K, 32)` | per-slot dynamics state per frame |
-| `event_logits` | `(B, T, K)` | per-slot event presence per frame |
-
-A visibility envelope `α[t, k] = cumsum_t softmax_t(event_logits[:, k])`
-turns the event channel into a soft mask over time — slots can "enter" but
-not exit, in line with CLEVRER physics.
-
-### Architecture
+## Architecture
 
 ```
-RGB video (T, 3, 128, 128)
+RGB video chunk (33 frames, 128×128)
         │
-        ▼   (frozen Wan-2.2 VAE, 705M params)
-Wan latent (48, T_lat, 8, 8)
+        ▼   frozen Wan-2.2 VAE (TI2V-5B)
+Wan latent (48, 9, 8, 8)
         │
-        ▼   TrajectoryEncoder (1.8M params)
-  z_static, z_dyn, event_logits
+        ▼   LatentEncoder3D  (src/model/latent_encoder.py)
+   z_static  (spatial grid, ~96 floats)      → identity
+   z_dyn     (per-frame spatial grid, ~256)  → object motion   [--dyn_spatial]
+   z_cam     (optional)                      → camera motion   [--use_camera_pose]
         │
-        ▼   TrajectoryDecoder (2.4M params, time-blinded)
+        ▼   SpatialGridDecoder (src/model/latent_decoder.py)
 Wan latent reconstruction
 ```
 
-Two architectural details do the load-bearing work:
-
-- **Time-blinded decoder.** No temporal positional embedding on the output
-  queries. The decoder cannot know *when* it is querying unless the
-  information comes through `z_dyn`. This forces motion to live in `z_dyn`
-  rather than leaking into `z_static`.
-- **Block-diagonal cross-attention.** Each output query attends only to its
-  own temporal slice of slot tokens. Information about frame `t` cannot
-  enter the reconstruction of frame `t'`. This *architecturally* enforces
-  per-frame dynamics exclusivity; we verified by freezing `z_dyn` at
-  inference and observing zero latent variation.
-
-### Losses
-
-```
-L = recon                                    # Wan-latent MSE
-  + 0.10 · ‖Δ² z_dyn · α‖²                   # smoothness
-  + 0.01 · H(event_logits)                   # event sparsity
-  + 0.01 · VICReg(z_static)                  # identity variance/covariance
-  + 0.02 · event NLL (first-visible frame)   # weak event supervision
-```
-
-No pixel-level photometric loss enters the encoder. The decoder is the only
-path that touches pixels, and it is symmetric — so the encoder is free to
-allocate capacity wherever the latent objective rewards.
-
-### Pipeline
-
-1. **Cache stage** — `scripts/cache_wan_latents.py` encodes CLEVRER videos
-   into Wan-VAE latent windows (48 channels × 3 latent frames × 8×8 spatial),
-   stored as `<idx>.pt` blobs alongside per-window metadata
-   (positions, attrs, slot_mask, collisions). Resume-safe.
-2. **Train stage** — `scripts/train_trajectory.py` consumes the cache, splits
-   by `video_id`, and trains the encoder/decoder pair end-to-end with random
-   PV-VAE-style frame masking.
-3. **Probe stage** — separate scripts evaluate each disentanglement claim on
-   the held-out split.
-
-## Experiments
-
-### Iter 21 — does the recipe generalize?
-
-The 500-video Iter 18 model fit the training set well but probed *below
-chance* on val for identity. Iter 21 tests whether 20× more videos closes
-the train/val gap with **no other recipe change**.
-
-**Setup.** 10,000 train videos × 4 windows = 40,000 windows. 80/20 split by
-`video_id` (8,000 / 2,000 videos). 60 epochs, batch=4, lr=5e-4 cosine→0,
-dropout 0.1. Single H200, ~3 h wall-clock.
-
-**Results.**
-
-| Run | Train recon | Val recon | Ratio | Verdict |
-|---|---:|---:|---:|---|
-| Iter 18 (500 vids) | 0.0090 | 0.0216 | 2.40× | overfit |
-| **Iter 21 (10k vids)** | **0.0104** | **0.0078** | **0.76×** | val < train |
-
-The train/val ratio inverts. At 10k scale, dropout and weight-decay are not
-doing the regularization — the data is. This is a necessary condition for
-the disentanglement claim but not sufficient: a model could still reconstruct
-well by encoding everything into `z_dyn` and ignoring `z_static`.
-
-### Probes (in progress)
-
-The recon generalization above is a precondition. The actual hypothesis tests
-are the four probes below. Identity is the load-bearing one.
-
-| # | Probe | Question | Pass criterion |
-|---|---|---|---|
-| 1 | Identity (`probe_iter21_identity.py`) | Does `z_static` encode color/material/shape on held-out videos? | val_acc clearly above majority baseline (color: chance 12.5%) |
-| 2 | Event localization | Do `event_logits` fire at GT collisions on val? | F1 above trivial baseline |
-| 3 | Counterfactual | Freeze `z_dyn` on a val video → no decoded motion? | latent Δ ≈ 0 (verified architecturally; needs scale test) |
-| 4 | Val GIFs + PSNR | Are reconstructions visually faithful at scale? | qualitative + PSNR vs Wan-VAE ceiling |
-
-Per-experiment results land in `DEVLOG.md` as they finish.
-
-## Moving-camera extension (v5.9)
-
-The factorization above assumes a roughly static camera (CLEVRER). To carry it
-to **real, moving-camera video** (DROID wrist camera), two changes were needed —
-one is the current headline result.
-
-**Spatial `z_dyn` (the reconstruction fix).** The original dynamics code was a
-*global* per-frame vector, broadcast to every latent cell by the decoder. That
-is rank-limited: it can only produce a spatially-uniform per-frame delta, which
-suffices for CLEVRER's low-rank rigid-body motion but collapses on real textured
-video (DROID reconstructed at only 16 dB vs a 33 dB VAE ceiling). Following what
-every real-video tokenizer does (VidTwin, Hi-VAE, Cosmos, MAGVIT-v2), `z_dyn`
-becomes a **per-frame spatial grid** `[B, T, c_dyn, g, g]` (`--dyn_spatial
---dyn_grid`): the encoder projects the per-frame feature grid with a 1×1 conv,
-and the decoder bilinearly upsamples it to the latent lattice instead of
-broadcasting one vector. Combined with rebalancing the forward-prediction weight
-(`--lambda_pred 1.0 → 0.1`, which was strangling `z_dyn`), this raises held-out
-DROID reconstruction from **16.1 → 20.5 dB (+4.4 dB)**. A matched-rate ablation
-attributes the gain to the **spatial structure, not the extra rate**:
-
-| z_dyn | rate | λ_pred | pixel PSNR |
-|---|---|---|---|
-| global | 96 | 1.0 | 16.10 dB |
-| global | 256 | 0.1 | 16.73 dB |
-| spatial | 256 | 1.0 | 19.45 dB |
-| **spatial** | **256** | **0.1** | **20.53 dB** |
-
-→ spatial structure **+2.7 dB**, λ_pred rebalance +1.1 dB, extra rate +0.6 dB.
-
-**Camera-trajectory conditioning (`src/model/camera_pose.py`).** A known
-per-frame camera pose is injected so `z_static` can be made viewpoint-stable
-(pose-conditioned multi-frame aggregation of the static grid: `PlaneSweep` /
-`WorldMemory` aggregators, `--use_camera_pose --static_agg`). This is an add-on
-on top of the reconstruction fix; its camera-invariance benefit on real DROID is
-still open (the within-episode metric compares non-overlapping windows, so it
-cannot yet cleanly isolate camera-invariance — see `DEVLOG.md`).
-
-See `DEVLOG.md` ("v5.9 — Spatial z_dyn") for the full diagnosis, method, and open
-items (CLEVRER generality cross-check pending; rate grew 96→256).
+Training (`scripts/train_v5.py`) uses a latent reconstruction loss + InfoNCE
+consistency + a light forward-prediction term (`--lambda_fwd`, the predictive
+component) + optional DINOv2-feature distillation (`--lambda_mae`). No pixel loss
+enters the encoder. Key flags:
+`--pool_type spatial --dyn_spatial --dyn_grid 8` (the spatial factorization),
+`--shared_trunk` (the entangled-AE ablation), `--use_camera_pose --static_agg`
+(camera path).
 
 ## Repository layout
 
 ```
-DEVLOG.md                          # per-experiment log, paper-ready
+DEVLOG.md                       # dated per-experiment log (paper-ready)
+iclr2026/                       # the paper (main.tex + sections/, LaTeX)
 scripts/
-  cache_wan_latents.py             # CLEVRER → Wan latents (cache builder)
-  train_trajectory.py              # main training entry
-  probe_iter21_identity.py         # probe 1: z_static → color/material/shape
-  run_iter21_cache_h200.sh         # cluster runner: cache stage
-  run_iter21_train_h200.sh         # cluster runner: train stage
-  download_clevrer{,_annotations}.sh
+  train_v5.py                   # main training entry (all datasets)
+  cache_wan_latents.py          # CLEVRER  → Wan latents
+  cache_wan_ssv2.py / _ucf101.py# SSv2 / UCF101 → Wan latents
+  cache_dino_patch.py / _ssv2.py# DINOv2 patch-feature cache (for --lambda_mae)
+  extract_droid_wrist.py        # DROID wrist-camera latents + pose
+  probes/                       # all evaluation probes (see below)
+  sbatch/                       # SLURM launchers (embers-qos, bad-node guarded)
 src/
-  model/trajectory_encoder.py      # TrajectoryEncoder + Decoder + loss
-  data/clevrer_paired.py           # paired window dataset (frames + state)
-  data/clevrer_states.py           # vocabs (color/material/shape) + state ds
+  model/latent_encoder.py       # LatentEncoder3D (static/dyn/camera slots)
+  model/latent_decoder.py       # SpatialGridDecoder
+  model/camera_pose.py          # known-pose aggregation (PlaneSweep/WorldMemory)
+  data/clevrer_window.py        # CLEVRER paired-chunk dataset
+  data/{ssv2,droid,libero}_window.py
 ```
+
+### Key probes (`scripts/probes/`)
+
+| Probe | Fills | What it measures |
+|---|---|---|
+| `baseline_probe_table.py`      | semantic mAP | z_static vs PCA/mean/full-latent/random/DINOv2 |
+| `semantic_efficiency.py`       | rate + label curves | more-semantic-per-float, label efficiency |
+| `clevrer_semantic_probe.py`    | cross-probe | identity from z_static vs leakage into z_dyn |
+| `clevrer_decode_baselines.py`  | decodability | latent-MSE of each frozen rep + ablation |
+| `clevrer_baselines_probe.py`   | pretrained refs | VideoMAE/VideoFlexTok/DINOv2 on CLEVRER |
+| `ssv2_action_probe.py`         | SSv2 top-1 | motion read-out (+ full-latent ceiling) |
+| `rollout_eval.py`              | forward dynamics | z_dyn rollout vs copy-last |
 
 ## Quick start
 
 ```bash
-# 1. Cache Wan-VAE latents (one-time, ~70 min on H200 for 10k videos)
-bash scripts/run_iter21_cache_h200.sh
+conda activate river          # training / probes  (LaTeX: env `tex`, tectonic)
 
-# 2. Train (auto-launches when cache marker appears, ~3 h on H200)
-bash scripts/run_iter21_train_h200.sh
+# 1. Cache Wan-VAE latents (one-time)
+python scripts/cache_wan_latents.py --data_dir <CLEVRER> --out_dir <CACHE> --max_videos 10000
 
-# 3. Probe identity on val z_static
-python scripts/probe_iter21_identity.py \
-    --cache_dir /storage/scratch1/8/lwang831/cache/wan_10000vid_W12 \
-    --ckpt outputs/iter21_10000vid_<stamp>/trajectory.pt \
-    --val_frac 0.2 --seed 42
+# 2. Train the factorized adapter on the frozen latent
+python scripts/train_v5.py --dataset clevrer --cache_dir <CACHE> --out_dir <OUT> \
+    --pool_type spatial --decoder_type spatial --dyn_spatial --dyn_grid 8 \
+    --d_static 96 --d_dyn 256 --lambda_mae 0.5 --lambda_fwd 0.1
+
+# 3. Probe (example: semantic efficiency vs the fair peer class)
+python scripts/probes/semantic_efficiency.py --ckpt <OUT>/v5_best.pt \
+    --cache_dir <CACHE> --out results/semantic_efficiency.json
 ```
 
-Environment: Python 3.12, PyTorch 2.6+cu124, `diffusers` 0.36 (for
-`AutoencoderKLWan`). Wan-2.2 weights pulled from
+Cluster jobs go through `scripts/sbatch/*.sbatch` (SLURM, `--qos=embers`, guarded
+against the known bad-ECC node). Environment: Python 3.12, PyTorch 2.6+cu124,
+`diffusers` 0.36 (`AutoencoderKLWan`); Wan-2.2 weights from
 `Wan-AI/Wan2.2-TI2V-5B-Diffusers`.
+
+Per-experiment results and the full method/diagnosis history land in `DEVLOG.md`.

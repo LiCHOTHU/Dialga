@@ -728,7 +728,7 @@ def main():
                          "loss, but feed ZERO pose (camera withheld). Proves the "
                          "pose content, not the extra params, is what de-contaminates.")
     ap.add_argument("--dataset", type=str, default="clevrer",
-                    choices=["clevrer", "droid"],
+                    choices=["clevrer", "droid", "ssv2", "libero"],
                     help="clevrer = CLEVRER wan cache; droid = DROID wrist-cam cache "
                          "(real moving camera, per-chunk pose in the batch).")
     ap.add_argument("--cam_source", type=str, default="synth",
@@ -794,11 +794,21 @@ def main():
         raise SystemExit("--lambda_mae > 0 requires --dino_cache_dir")
 
     def _make_ds(split):
+        if args.dataset == "libero":
+            from src.data.libero_window import LiberoChunkPairs
+            sp = split if args.val_frac > 0 else "train"
+            return LiberoChunkPairs(args.cache_dir, split=sp,
+                                    max_episodes=args.max_videos)
         kw = dict(seed=args.seed, max_videos=args.max_videos)
         if args.val_frac > 0:
             kw.update(split=split, val_frac=args.val_frac)
         if args.dataset == "droid":
             return DroidChunkPairs(args.cache_dir, **kw)
+        if args.dataset == "ssv2":
+            from src.data.ssv2_window import SSv2ChunkPairs
+            if args.lambda_mae > 0.0 and args.dino_cache_dir:
+                kw["dino_cache_dir"] = args.dino_cache_dir
+            return SSv2ChunkPairs(args.cache_dir, **kw)
         if args.lambda_mae > 0.0:
             kw.update(dino_cache_dir=args.dino_cache_dir)
         if args.use_pixels:
