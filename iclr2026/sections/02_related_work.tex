@@ -18,12 +18,14 @@ per-frame motion code: DSVAE \citep{dsvae}, S3VAE \citep{s3vae}, C-DSVAE
 \citep{cdsvae}, MoCoGAN \citep{mocogan}; VidTwin \citep{vidtwin} carries this into
 a modern video VAE with separate structure and dynamics latents, and object-centric
 SlotFormer \citep{slotformer} validates its factorization by downstream physical
-reasoning. Two properties are near-universal in this family and matter for us: the
-disentanglement is demonstrated almost only on synthetic or narrow data, and the
-\emph{motion} code is a global per-frame vector. Our analysis explains why that
-second choice caps real-video reconstruction; our spatial-dynamics code is the
-fix, and unlike this literature we demonstrate the split on \emph{real} video at
-a two-to-three-order-of-magnitude smaller code.
+reasoning. Three properties are near-universal in this family and matter for us: the
+disentanglement is demonstrated almost only on synthetic or narrow data, the
+\emph{motion} code is a global per-frame vector, and --- most importantly --- each
+method obtains its factorization by \emph{training a VAE from scratch}. Our analysis
+explains why the global motion code caps real-video reconstruction; our
+spatial-dynamics code is the fix, and unlike this literature we demonstrate the split
+on \emph{real} moving-camera video and, crucially, \emph{on top of an already-trained
+frozen video VAE} rather than by training a new one.
 
 \paragraph{Video tokenizers and world models.}
 Tokenizers --- MAGVIT-v2 \citep{magvitv2}, Cosmos \citep{cosmos}, PVDM
@@ -34,7 +36,14 @@ per-frame \emph{spatial} token grid and are judged by generation quality
 optimize reconstruction or control rather than an interpretable factorization; we
 borrow their spatial-latent design for the dynamics code and their rollout/utility
 evaluations for our dynamics probe, while keeping the factorized, low-rate
-embedding as the object of study.
+embedding as the object of study. Most directly related, PV-VAE \citep{pvvae}
+enriches a video VAE's latent with a \emph{predictive} reconstruction objective and
+reports improved motion-awareness and downstream understanding --- but its latent
+stays a single \emph{entangled} code and, like the tokenizers above, it is obtained
+by \emph{training the VAE}. We share the predictive ingredient (our
+forward-prediction term) yet differ on both axes that matter here: we \emph{factorize}
+the latent into named, controllable slots, and we do so on a \emph{frozen} VAE
+without retraining it.
 
 \paragraph{Camera- and viewpoint-aware representation.}
 Geometry-aware attention (GTA \citep{gta}) and projective positional encodings
@@ -53,8 +62,10 @@ probes, and sample efficiency on manipulation. We evaluate \method{}'s dynamics
 code with the same frozen-encoder protocol on LIBERO \citep{libero}, and use these
 methods as the baselines for downstream usefulness.
 
-In sum, prior factorized-video work demonstrates its split on synthetic data with
-a global motion code, and prior tokenizers keep spatial latents but no
-interpretable factorization; \method{} is, to our knowledge, the first to show
-that a named identity/dynamics/event factorization can be learned at high
-compression on real moving-camera video, once the dynamics code is made spatial.
+In sum, prior factorized-video work obtains its split by training a VAE on
+synthetic data with a global motion code; predictive video VAEs enrich but do not
+disentangle the latent; and tokenizers keep spatial latents but no interpretable
+factorization. \method{} is, to our knowledge, the first to recover a named
+identity/dynamics/camera factorization \emph{from a frozen, pretrained video VAE
+without retraining it}, at high compression and on real moving-camera video, once
+the dynamics code is made spatial.

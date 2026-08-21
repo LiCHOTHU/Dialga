@@ -1,12 +1,16 @@
-We presented \method{}, a factorized, high-compression embedding of a frozen
-video-VAE latent whose static and dynamic slots are separately usable, and
-we identified and fixed the one architectural choice --- a global per-frame
-dynamics code --- that made such a factorization collapse on real, moving-camera
-video. Re-shaping the dynamics code into a per-frame spatial grid raises real-video
-reconstruction by $+4.4$\,dB, attributable to the spatial structure rather than to
-rate, and the resulting embedding is factorized and useful for downstream control.
-The broader lesson --- that a shared static grid suffices but the dynamics code
-must be spatial to represent real video --- transfers to any content/motion
+We presented \method{}, a lightweight adapter that recovers a named
+identity/dynamics/camera factorization from the latent of \emph{any frozen,
+pretrained} video VAE --- without retraining the VAE, the expense every prior
+decomposition and predictive video VAE pays. Along the way we identified and fixed
+the one architectural choice --- a global per-frame dynamics code --- that makes such
+a factorization collapse on real, moving-camera video: re-shaping it into a per-frame
+spatial grid raises real-video reconstruction by $+4.4$\,dB, attributable to the
+spatial structure rather than to rate. On the fair peer class (methods on the same
+frozen latent, matched rate) the resulting code is the most decodable (retaining
+$94.6\%$ of the full-latent reconstruction quality at $\sim\!11\times$ compression)
+and the most label-efficient, while being decomposable and useful for downstream
+control. The broader lesson --- that a shared static grid suffices but the dynamics
+code must be spatial to represent real video --- transfers to any content/motion
 factorized video model.
 
 \paragraph{Limitations.}
@@ -18,6 +22,13 @@ robot data: the DROID within-episode metric compares \emph{non-overlapping}
 temporal windows, which see genuinely different scene content as the camera sweeps,
 and therefore cannot isolate camera-invariance from ordinary content change; a
 static-scene multi-view testbed (or overlapping windows) is required to measure it.
-Finally, several downstream and semantic numbers are currently reported on a prior
-model version and are being recomputed on the final model; the factorization and
-reconstruction claims are the ones we consider established.
+The static/dynamic separation is also only \emph{partial}: identity still leaks into
+the dynamics code (a matched-rate entangled autoencoder is nearly as clean on the
+identity-leakage probe), so the factorization is real and useful but not yet a strong
+disentanglement; an explicit independence objective that pushes identity out of the
+dynamics code is the natural next step. We also do not beat web-pretrained encoders on
+absolute semantic accuracy or classical codecs on rate--distortion --- a consequence
+of building on a frozen VAE latent at extreme compression, which we report rather than
+hide. Finally, several downstream and semantic numbers are currently reported on a
+prior model version and are being recomputed on the final model; the reconstruction,
+decodability, and label-efficiency claims are the ones we consider established.
