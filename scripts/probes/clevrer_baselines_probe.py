@@ -101,6 +101,9 @@ def main():
     ap.add_argument("--max_videos", type=int, default=1500)
     ap.add_argument("--window_frames", type=int, default=33)
     ap.add_argument("--pca_dims", type=int, nargs="*", default=[96])
+    ap.add_argument("--label_fracs", type=float, nargs="*", default=[],
+                    help="if set, also sweep label efficiency at each fraction "
+                         "(full-dim features) -> results['models'][name]['label_curve']")
     ap.add_argument("--epochs", type=int, default=400)
     ap.add_argument("--lr", type=float, default=1e-2)
     ap.add_argument("--weight_decay", type=float, default=1e-4)
@@ -145,6 +148,22 @@ def main():
             print(f"  {name} @dim {d:<5} color={m['color']:.3f} "
                   f"material={m['material']:.3f} shape={m['shape']:.3f} "
                   f"mean={sc:.3f}", flush=True)
+        # label-efficiency curve at full dim (fair vs ours: same #labels, full features)
+        if args.label_fracs:
+            lc = {}
+            Xt = torch.from_numpy(np.asarray(Xtr)).float()
+            Xv = torch.from_numpy(np.asarray(Xva)).float()
+            n = Xt.shape[0]
+            perm = torch.randperm(n, generator=torch.Generator().manual_seed(0))
+            for frac in args.label_fracs:
+                k = max(20, int(n * frac))
+                idx = perm[:k]
+                sc, _m, _pe = run_probe(Xt[idx], Ytr_m[idx], Xv, Yva_m,
+                                        device, args.epochs, args.lr, args.weight_decay)
+                lc[str(frac)] = {"n": int(k), "mean": round(float(sc), 4)}
+                print(f"  [label] {name:<12} frac={frac:<5} n={k:<5} mean={sc:.4f}",
+                      flush=True)
+            rows["label_curve"] = lc
         results["models"][name] = rows
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
