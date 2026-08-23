@@ -60,6 +60,16 @@ and interpretability at a small efficiency cost}, not free improvement. Separate
 spatial dynamics code is what makes real-video reconstruction viable at all (the
 $+4.4$\,dB finding, \cref{tab:q4_recon}).
 
+\textbf{Where \method{} wins.} In one line: \method{} \emph{wins on disentanglement and
+efficiency while reconstruction stays competitive}. It has the lowest identity leakage
+of any model, including a matched-rate entangled autoencoder (\cref{tab:q2_disent}) --- a
+separation that entangled representations (raw VAE, DINOv2/VideoMAE, predictive VAEs)
+cannot even express; it retains more reconstructable information per float than any other
+compression of the same substrate (\cref{tab:q7_decode}) and is the most label-efficient
+(\cref{tab:q1_labeleff}); and its reconstruction ties the un-regularized model rather than
+degrading. We do \emph{not} claim to beat web-pretrained encoders on raw accuracy or codecs
+on fidelity, and say so; the wins are on the axes the factorization is built for.
+
 Throughout, the comparison that matters is \emph{at matched, extreme compression}.
 We do not compete with full-rate codecs or the frozen VAE on pixel fidelity
 (\cref{tab:q5_rd}); the point is that \emph{among low-dimensional embeddings},
