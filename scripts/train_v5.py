@@ -416,6 +416,15 @@ def compute_losses(batch, models, args, stage: int, device, vae=None):
         L_vic_var = vs_var + vd_var
         L_vic_cov = vs_cov + vd_cov
 
+    # ---- L_indep (v6.1): cross-code independence -> push identity OUT of z_dyn ----
+    # Penalizes cross-correlation between z_static and the time-pooled z_dyn. InfoNCE
+    # already routes identity into z_static; this actively decorrelates z_dyn from it,
+    # fixing the residual identity leakage that a shared-trunk baseline also shows.
+    L_indep = torch.zeros((), device=device)
+    if getattr(args, "lambda_indep", 0.0) > 0.0:
+        from src.loss.vicreg import cross_decorr
+        L_indep = cross_decorr(z_static_a, z_dyn_obs.mean(dim=1))
+
     # ---- L_cam_inv (v5.8): the code from the warped view + known pose must match
     # the code from the clean view -> the encoder INVERTED the known camera. ----
     L_cam_inv = torch.zeros((), device=device)
@@ -472,6 +481,8 @@ def compute_losses(batch, models, args, stage: int, device, vae=None):
         if vic_on:
             total = (total + getattr(args, "lambda_vic_var", 0.0) * L_vic_var
                      + getattr(args, "lambda_vic_cov", 0.0) * L_vic_cov)
+        if getattr(args, "lambda_indep", 0.0) > 0.0:
+            total = total + args.lambda_indep * L_indep
 
     # ---- diagnostics (always logged, never contribute to loss) ----
     with torch.no_grad():
@@ -490,7 +501,7 @@ def compute_losses(batch, models, args, stage: int, device, vae=None):
         "event_aux": L_event_aux, "gate": L_gate, "attrs": L_attrs,
         "pixel": L_pixel, "pixel_pred": L_pixel_pred, "mae_sem": L_mae_sem,
         "mae_base": mae_base,
-        "vic_var": L_vic_var, "vic_cov": L_vic_cov,
+        "vic_var": L_vic_var, "vic_cov": L_vic_cov, "indep": L_indep,
         "cam_inv": L_cam_inv,
         "total": total,
         **diag,
@@ -571,6 +582,10 @@ def main():
     ap.add_argument("--lambda_vic_cov", type=float, default=0.0,
                     help="VICReg covariance weight on z_static & z_dyn. "
                          "Decorrelates dims to raise participation ratio.")
+    ap.add_argument("--lambda_indep", type=float, default=0.0,
+                    help="Cross-code independence weight: penalizes cross-correlation "
+                         "between z_static and time-pooled z_dyn -> pushes identity "
+                         "OUT of z_dyn (the disentanglement fix). 0 disables.")
     ap.add_argument("--vic_gamma", type=float, default=1.0,
                     help="Target per-dim std for the VICReg variance hinge.")
 

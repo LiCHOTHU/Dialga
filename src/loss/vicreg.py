@@ -46,4 +46,24 @@ def vicreg_var_cov(z: torch.Tensor, gamma: float = 1.0, eps: float = 1e-4):
     return var_loss, cov_loss
 
 
-__all__ = ["vicreg_var_cov"]
+def cross_decorr(za: torch.Tensor, zd: torch.Tensor, eps: float = 1e-4):
+    """Cross-code independence penalty: mean squared cross-CORRELATION between the
+    static code `za` (N, Ds) and the (time-pooled) dynamics code `zd` (N, Dd).
+
+    Standardizes each code per-dim, forms the Ds x Dd cross-correlation matrix, and
+    returns the mean squared entry. Minimizing it pushes z_dyn to be linearly
+    uninformative about z_static -> identity (which lives in z_static via InfoNCE)
+    is driven OUT of z_dyn. Label-free; scale-invariant (bounded in [0,1]).
+    """
+    if za.dim() != 2 or zd.dim() != 2:
+        raise ValueError(f"cross_decorr expects (N,Ds),(N,Dd); got {tuple(za.shape)},{tuple(zd.shape)}")
+    N = za.shape[0]
+    if N < 2:
+        return za.sum() * 0.0
+    za = (za - za.mean(0, keepdim=True)) / (za.std(0, keepdim=True) + eps)
+    zd = (zd - zd.mean(0, keepdim=True)) / (zd.std(0, keepdim=True) + eps)
+    xcorr = (za.T @ zd) / (N - 1)                                 # (Ds, Dd)
+    return xcorr.pow(2).mean()
+
+
+__all__ = ["vicreg_var_cov", "cross_decorr"]
