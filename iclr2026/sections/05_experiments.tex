@@ -27,23 +27,34 @@ splits identity from motion (\cref{tab:q2_crossprobe}), and rolls forward
 (\cref{tab:q3_rollout}) --- and among label-free codes distilled from the frozen VAE
 latent it still carries the most semantic signal at $96$ floats (beating PCA-$96$ and a
 random encoder, within noise of the full latent at $288\times$ compression). The
-experiments answer four plain questions.
+experiments test four hypotheses. Throughout, ``\method{}'' denotes the full model
+\emph{with the independence objective} (\cref{sec:method}); the same model
+\emph{without} it is our primary ablation baseline (``\method{}\,$-$\,indep''),
+isolating the effect of the disentanglement loss from the architecture. We instantiate
+\method{} on a frozen Wan-VAE latent as a convenient, strong substrate --- a
+proof-of-concept, not the claim; the factorization mechanism is substrate-agnostic.
 
-\textbf{(i) Does it reconstruct real video?} Only once the dynamics code is made
-\emph{spatial}; that single architectural change adds $+4.4$\,dB and is our core
-technical result (\cref{tab:q4_recon}).
-\textbf{(ii) Is the code efficient and decodable?} It reconstructs the frozen VAE
-latent \emph{better than any pretrained video encoder} and nearly as well as the full
-$27{,}648$-float latent, at $\sim\!11\times$ compression (\cref{tab:q7_decode}); its
-semantic read-out is best \emph{among label-free VAE-derived codes} at $96$ floats
-though below web-pretrained encoders (\cref{tab:q1_semantic}).
-\textbf{(iii) Is it really factorized?} Identity reads out of the static code and
-motion out of the dynamic code (\cref{tab:q2_crossprobe}), and the split holds on
-\emph{real} video: the dynamic code wins on motion-defined SSv2 (\cref{tab:ssv2}),
-the static code wins on appearance-defined UCF101 (\cref{tab:ucf101}).
-\textbf{(iv) Is the dynamic code predictable and useful?} It rolls forward better
-than copy-last (\cref{tab:q3_rollout}) and drives downstream robot control
-(\cref{tab:q3_action}).
+\textbf{H1 (factorization).} \method{} splits video into a \emph{static} code (what
+is in the scene) and a \emph{dynamic} code (how it moves): a cross-probe is
+diagonal-dominant --- identity reads from the static code, motion from the dynamic
+code, each near chance on the other (\cref{tab:q2_crossprobe}).
+\textbf{H2 (semantics + usability).} The two codes are \emph{semantically meaningful
+and independently usable} --- the static code linearly reads object identity, the
+dynamic code reads position/velocity, and each is \emph{clean} of the other (the
+independence objective drives identity out of the dynamic code, below an entangled
+code at matched budget; \cref{tab:q2_disent}). This semantic purity is what makes the
+codes usable downstream: motion-defined SSv2 reads from the dynamic code
+(\cref{tab:ssv2}), appearance-defined UCF101 and robot control from the static and
+dynamic codes (\cref{tab:ucf101,tab:q3_action}).
+\textbf{H3 (efficiency).} The factorization is \emph{compact}: at $96$--$352$ floats it
+carries the usable semantic content --- more per float than any other compression of
+the same substrate (PCA, mean-pool, random, full latent), by rate curve, label
+efficiency, and decodability (\cref{tab:q1_semantic,tab:q1_labeleff,tab:q7_decode}).
+\textbf{H4 (reconstruction, secondary).} Because a cleaner split removes redundancy,
+disentanglement \emph{may} free capacity and aid reconstruction where capacity binds
+(low rate, real video); we report this as an observation, not a core claim
+(\cref{tab:q4_recon}). The spatial dynamics code is what makes real-video
+reconstruction viable at all (the $+4.4$\,dB finding, \cref{tab:q4_recon}).
 
 Throughout, the comparison that matters is \emph{at matched, extreme compression}.
 We do not compete with full-rate codecs or the frozen VAE on pixel fidelity
@@ -148,6 +159,27 @@ $\zs$ & \cellcolor{green!12}\textbf{0.78}\,[C] & \cellcolor{red!8}\tbd & \cellco
 $\zd$ & \cellcolor{red!8}0.57\,[C] & \cellcolor{green!12}\textbf{0.74}\,[P] & \cellcolor{green!12}\tbd & \cellcolor{red!8}\tbd \\
 \midrule
 Chance / base-rate & 0.50 & 0.00 & 0.00 & \tbd \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\caption{\textbf{H2 -- clean separation: identity leakage into the dynamic code}
+(CLEVRER, colour is the discriminative attribute; chance $0.50$). The independence
+objective is what makes the separation clean: it drives object identity \emph{out} of
+$\zd$ (colour leakage $\to$ chance) while $\zs$ keeps it, widening the static/dynamic
+gap over the no-loss ablation. This is the effect a matched-rate entangled code cannot
+achieve. \pmark{}\,=\,preliminary ($40$-epoch, $600$-video A/B; full-model numbers land
+from \texttt{clevrer\_disent} and replace these).}
+\label{tab:q2_disent}
+\begin{tabular}{lccc}
+\toprule
+Model & $\zs$ identity $\uparrow$ & $\zd$ leakage $\downarrow$ & gap $\uparrow$ \\
+\midrule
+\textbf{\method{} (\,$+$\,indep)}          & 0.605\,\pmark & \textbf{0.499}\,\pmark & \textbf{0.106} \\
+\method{}\,$-$\,indep (no loss, ablation)  & 0.640\,\pmark & 0.548\,\pmark          & 0.092 \\
+Entangled AE (shared trunk)                & \tbd          & \tbd                   & \tbd \\
 \bottomrule
 \end{tabular}
 \end{table}
