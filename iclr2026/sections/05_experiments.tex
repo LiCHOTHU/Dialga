@@ -50,11 +50,15 @@ dynamic codes (\cref{tab:ucf101,tab:q3_action}).
 carries the usable semantic content --- more per float than any other compression of
 the same substrate (PCA, mean-pool, random, full latent), by rate curve, label
 efficiency, and decodability (\cref{tab:q1_semantic,tab:q1_labeleff,tab:q7_decode}).
-\textbf{H4 (reconstruction, secondary).} Because a cleaner split removes redundancy,
-disentanglement \emph{may} free capacity and aid reconstruction where capacity binds
-(low rate, real video); we report this as an observation, not a core claim
-(\cref{tab:q4_recon}). The spatial dynamics code is what makes real-video
-reconstruction viable at all (the $+4.4$\,dB finding, \cref{tab:q4_recon}).
+\textbf{H4 (reconstruction, secondary).} We tested whether a cleaner split, by
+removing redundancy, frees capacity and aids reconstruction where capacity binds. It
+does \emph{not}: the independence objective is a small reconstruction \emph{tradeoff}
+(recon-neutral at full rate on CLEVRER, but a modest cost at low rate and on SSv2), not
+a gain --- the constraint removes a useful degree of freedom faster than it frees one.
+We report this honestly; it is why we treat disentanglement as buying \emph{separation
+and interpretability at a small efficiency cost}, not free improvement. Separately, the
+spatial dynamics code is what makes real-video reconstruction viable at all (the
+$+4.4$\,dB finding, \cref{tab:q4_recon}).
 
 Throughout, the comparison that matters is \emph{at matched, extreme compression}.
 We do not compete with full-rate codecs or the frozen VAE on pixel fidelity
@@ -170,16 +174,16 @@ Chance / base-rate & 0.50 & 0.00 & 0.00 & \tbd \\
 objective is what makes the separation clean: it drives object identity \emph{out} of
 $\zd$ (colour leakage $\to$ chance) while $\zs$ keeps it, widening the static/dynamic
 gap over the no-loss ablation. This is the effect a matched-rate entangled code cannot
-achieve. \pmark{}\,=\,preliminary ($40$-epoch, $600$-video A/B; full-model numbers land
-from \texttt{clevrer\_disent} and replace these).}
+achieve: \method{}(\,$+$\,indep) has the \emph{lowest} identity leakage of the three
+(at chance), and the widest static/dynamic gap. Full $200$-epoch CLEVRER models [C].}
 \label{tab:q2_disent}
 \begin{tabular}{lccc}
 \toprule
 Model & $\zs$ identity $\uparrow$ & $\zd$ leakage $\downarrow$ & gap $\uparrow$ \\
 \midrule
-\textbf{\method{} (\,$+$\,indep)}          & 0.605\,\pmark & \textbf{0.499}\,\pmark & \textbf{0.106} \\
-\method{}\,$-$\,indep (no loss, ablation)  & 0.640\,\pmark & 0.548\,\pmark          & 0.092 \\
-Entangled AE (shared trunk)                & \tbd          & \tbd                   & \tbd \\
+\textbf{\method{} (\,$+$\,indep)}          & 0.646 & \textbf{0.507} & \textbf{0.139} \\
+\method{}\,$-$\,indep (no loss, ablation)  & 0.679 & 0.564          & 0.115 \\
+Entangled AE (shared trunk)                & 0.674 & 0.545          & 0.129 \\
 \bottomrule
 \end{tabular}
 \end{table}
