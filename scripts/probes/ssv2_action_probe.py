@@ -105,11 +105,45 @@ def probe(train_X, train_y, val_X, val_y):
     return top1 * 100, top5 * 100
 
 
+def probe_mlp(train_X, train_y, val_X, val_y, device, hidden=1024, epochs=80, bs=256):
+    """Nonlinear (1-hidden-layer MLP) probe. Tests whether info is present in the
+    features but NON-LINEARLY encoded (a reconstruction-optimized latent packs
+    semantics non-linearly, so a linear probe understates the accessible ceiling)."""
+    import torch.nn as nn
+    mu = train_X.mean(0, keepdims=True); sd = train_X.std(0, keepdims=True) + 1e-6
+    classes = np.unique(train_y); cmap = {c: i for i, c in enumerate(classes)}
+    Xtr = torch.tensor((train_X - mu) / sd, dtype=torch.float32)
+    ytr = torch.tensor([cmap[c] for c in train_y], dtype=torch.long)
+    Xva = torch.tensor((val_X - mu) / sd, dtype=torch.float32).to(device)
+    net = nn.Sequential(nn.Linear(train_X.shape[1], hidden), nn.GELU(),
+                        nn.Dropout(0.5), nn.Linear(hidden, len(classes))).to(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    lossf = nn.CrossEntropyLoss()
+    n = len(Xtr)
+    for ep in range(epochs):
+        net.train(); perm = torch.randperm(n)
+        for i in range(0, n, bs):
+            idx = perm[i:i + bs]
+            opt.zero_grad()
+            out = net(Xtr[idx].to(device))
+            loss = lossf(out, ytr[idx].to(device))
+            loss.backward(); opt.step()
+    net.eval()
+    with torch.no_grad():
+        logits = net(Xva).cpu().numpy()
+    top1 = (classes[logits.argmax(1)] == val_y).mean()
+    top5idx = np.argsort(-logits, axis=1)[:, :5]
+    top5 = np.mean([val_y[i] in classes[top5idx[i]] for i in range(len(val_y))])
+    return top1 * 100, top5 * 100
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--train_cache", required=True)
     ap.add_argument("--val_cache", required=True)
+    ap.add_argument("--mlp", action="store_true",
+                    help="also run a nonlinear MLP probe (accessible-ceiling test)")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -138,8 +172,10 @@ def main():
     rows = [("random", "z_dyn (rand-init)"), ("wanmean", "raw Wan mean"),
             ("wanflat", "raw Wan FULL (ceiling)"),
             ("zstatic", "z_static"), ("zdyn", "z_dyn"), ("both", "z_static+z_dyn")]
-    print(f"{'feature':22s} {'dim':>5s} {'top1':>7s} {'top5':>7s}")
-    print("-" * 44)
+    hdr = f"{'feature':22s} {'dim':>5s} {'lin_top1':>9s} {'lin_top5':>9s}"
+    if args.mlp:
+        hdr += f" {'mlp_top1':>9s} {'mlp_top5':>9s}"
+    print(hdr); print("-" * len(hdr))
     results = {}
     for key, name in rows:
         # val features pooled to one row per clip; train uses per-window rows
@@ -147,11 +183,17 @@ def main():
         val_lab = np.array([va["_labels"][va["_vids"] == v][0]
                             for v in np.unique(va["_vids"])])
         t1, t5 = probe(tr[key], tr["_labels"], val_feat, val_lab)
-        results[key] = (tr[key].shape[1], t1, t5)
-        print(f"{name:22s} {tr[key].shape[1]:5d} {t1:6.2f}% {t5:6.2f}%")
+        line = f"{name:22s} {tr[key].shape[1]:5d} {t1:8.2f}% {t5:8.2f}%"
+        rec = {"dim": tr[key].shape[1], "lin_top1": round(t1, 2), "lin_top5": round(t5, 2)}
+        if args.mlp:
+            m1, m5 = probe_mlp(tr[key], tr["_labels"], val_feat, val_lab, device)
+            line += f" {m1:8.2f}% {m5:8.2f}%"
+            rec["mlp_top1"] = round(m1, 2); rec["mlp_top5"] = round(m5, 2)
+        results[key] = rec
+        print(line, flush=True)
     print(f"\n[chance] top1={chance:.2f}%  top5={5*chance:.2f}%")
-    print("[json] " + json.dumps({k: {"dim": v[0], "top1": round(v[1], 2),
-                                       "top5": round(v[2], 2)} for k, v in results.items()}))
+    print("[json] " + json.dumps(results))
+    print("SSV2_PROBE_DONE", flush=True)
 
 
 if __name__ == "__main__":

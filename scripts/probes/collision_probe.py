@@ -26,6 +26,8 @@ import numpy as np, torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.probes.clevrer_decode_baselines import build_our_encoder
+from scripts.probes.clevrer_baselines_probe import mp4_path, build_extractor
+from scripts.cache_wan_ssv2 import read_clip
 from src.data.clevrer_window import ClevrerChunkPairs, chunk_collate
 from torch.utils.data import DataLoader
 
@@ -36,7 +38,7 @@ def collect(cache_dir, split, a, enc, rnd, device, max_videos):
                            seed=int(a.get("seed", 42)), max_videos=max_videos)
     dl = DataLoader(ds, batch_size=32, shuffle=False, num_workers=4, collate_fn=chunk_collate)
     F = {k: [] for k in ("z_dyn", "z_static", "wanmean", "wanflat", "random")}
-    y, seen = [], set()
+    y, seen, keys = [], set(), []
     # collision GT isn't in the collate batch -> reload the blob per window
     cd = Path(cache_dir)
     win = {(int(w["video_id"]), int(w["start_frame"])): w["path"] for w in ds.windows}
@@ -60,7 +62,29 @@ def collect(cache_dir, split, a, enc, rnd, device, max_videos):
                 else int(len(blob.get("collisions", [])) > 0)
             F["z_static"].append(zs[j]); F["z_dyn"].append(zd[j]); F["random"].append(rd[j])
             F["wanmean"].append(wm[j]); F["wanflat"].append(wf[j]); y.append(coll)
-    return {k: np.stack(v) for k, v in F.items()}, np.array(y)
+            keys.append(key)
+    return {k: np.stack(v) for k, v in F.items()}, np.array(y), keys
+
+
+@torch.no_grad()
+def extract_rgb(keys, video_root, models, device, W=33):
+    """RGB-baseline (VideoMAE/VideoFlexTok) features aligned to `keys` order."""
+    out = {m: [] for m in models}
+    exts = {m: build_extractor(m, device) for m in models}
+    clip_id, clip = -1, None
+    for i, (vid, sf) in enumerate(keys):
+        if vid != clip_id:
+            clip = read_clip(str(mp4_path(video_root, vid))); clip_id = vid
+        for m in models:
+            f = np.zeros(exts[m].dim, np.float32) if clip is None \
+                else np.asarray(exts[m].feat(clip, [sf], W), np.float32)
+            out[m].append(f)
+        if (i + 1) % 400 == 0:
+            print(f"  [rgb] {i+1}/{len(keys)}", flush=True)
+    for e in exts.values():
+        del e
+    torch.cuda.empty_cache()
+    return {m: np.stack(v) for m, v in out.items()}
 
 
 def probe(Xtr, ytr, Xva, yva):
@@ -80,6 +104,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True); ap.add_argument("--cache_dir", required=True)
     ap.add_argument("--max_videos", type=int, default=2000)
+    ap.add_argument("--rgb_models", nargs="*", default=[],
+                    help="RGB baselines (e.g. videomae videoflextok); needs --video_root")
+    ap.add_argument("--video_root", default="")
     ap.add_argument("--device", default="cuda"); ap.add_argument("--out", required=True)
     args = ap.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -91,12 +118,18 @@ def main():
         if hasattr(m, "reset_parameters"):
             m.reset_parameters()
     rnd.eval()
-    Ftr, ytr = collect(args.cache_dir, "train", a, enc, rnd, device, args.max_videos)
-    Fva, yva = collect(args.cache_dir, "val", a, enc, rnd, device, args.max_videos)
+    Ftr, ytr, ktr = collect(args.cache_dir, "train", a, enc, rnd, device, args.max_videos)
+    Fva, yva, kva = collect(args.cache_dir, "val", a, enc, rnd, device, args.max_videos)
+    methods = ["z_dyn", "z_static", "wanmean", "wanflat", "random"]
+    if args.rgb_models and args.video_root:
+        rtr = extract_rgb(ktr, args.video_root, args.rgb_models, device)
+        rva = extract_rgb(kva, args.video_root, args.rgb_models, device)
+        for m in args.rgb_models:
+            Ftr[m] = rtr[m]; Fva[m] = rva[m]; methods.append(m)
     base = float(yva.mean())
     print(f"[data] train={len(ytr)} val={len(yva)} collision base-rate={base:.3f}", flush=True)
     res = {"base_rate": round(base, 4), "methods": {}}
-    for m in ("z_dyn", "z_static", "wanmean", "wanflat", "random"):
+    for m in methods:
         r = probe(Ftr[m], ytr, Fva[m], yva)
         res["methods"][m] = r
         print(f"  {m:<10} AP={r['AP']:.3f} AUROC={r['AUROC']:.3f} F1={r['F1']:.3f}", flush=True)

@@ -212,8 +212,18 @@ def main():
             vae = None
 
     from sklearn.decomposition import PCA
+    # preemption-resilient: reload any partial results and skip methods already done.
     results = {}
+    if Path(args.out).exists():
+        try:
+            results = json.load(open(args.out))
+            print(f"[resume] loaded {len(results)} done methods: {list(results)}", flush=True)
+        except Exception:
+            results = {}
     for method in args.methods:
+        if method in results:
+            print(f"[skip] {method} already in {args.out}", flush=True)
+            continue
         t0 = time.time()
         Ftr, Ltr = gather(method, "train", a, args, enc, device)
         Fva, Lva = gather(method, "val", a, args, enc, device)
@@ -231,17 +241,21 @@ def main():
             best, dec, norm = train_decoder(Zt, Ltr, Zv, Lva, device,
                                             args.epochs, args.lr, args.dec_hidden)
             entry = {"val_latent_mse": round(best, 6)}
-            if args.pixel and vae is not None and d == full_dim:
+            # pixel PSNR at EVERY dim (incl. matched PCA budgets) so the matched-
+            # dimension pixel-reconstruction comparison across encoders is possible.
+            if args.pixel and vae is not None:
                 entry["val_pixel_psnr"] = round(
                     pixel_psnr(dec, norm, Zv, Lva, vae, device, args.pixel_n), 3)
             row["at_dim"][str(d)] = entry
-            print(f"[{method}] @dim {d:<5} val_latent_mse={best:.6f}", flush=True)
+            px = entry.get("val_pixel_psnr", "-")
+            print(f"[{method}] @dim {d:<5} val_latent_mse={best:.6f} pixel_psnr={px}", flush=True)
         row["val_latent_mse"] = row["at_dim"][str(full_dim)]["val_latent_mse"]  # back-compat
         results[method] = row
-        print(f"[{method}] full_dim={full_dim} ({time.time()-t0:.0f}s)", flush=True)
+        # save after EACH method so preemption never loses completed work.
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        json.dump(results, open(args.out, "w"), indent=2)
+        print(f"[{method}] full_dim={full_dim} ({time.time()-t0:.0f}s) [saved]", flush=True)
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    json.dump(results, open(args.out, "w"), indent=2)
     print(f"[saved] {args.out}\nDECODE_BASELINES_DONE", flush=True)
 
 
