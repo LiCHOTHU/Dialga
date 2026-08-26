@@ -22,9 +22,14 @@ source /home/licho/anaconda3/etc/profile.d/conda.sh; conda activate dialga
 export PYTHONPATH=/home/licho/workspace/Dialga
 CACHE=outputs/cache/clevrer_W33_10k; OUT=outputs/vstatic_sweep
 EPOCHS="${EPOCHS:-60}"; BS="${BS:-16}"; mkdir -p "$OUT"
+# SKIP_WAIT=1 runs concurrently with the earlier sweeps (the models are ~10M params
+# and the box has 32 GB of VRAM with <5 GB in use; compute is shared, memory is not
+# a constraint). Default is to queue politely behind them.
+if [ "${SKIP_WAIT:-0}" != "1" ]; then
 while pgrep -f 'train_memory.py .*--out_dir outputs/(mem_sweep|rate_sweep|vark_sweep)' >/dev/null 2>&1; do
   echo "[wait] earlier CLEVRER sweeps running"; sleep 180
 done
+fi
 R384="--d_static 384 --static_grid 8"
 FAILED=0
 run(){ n="$1"; shift; d="$OUT/$n"; [ -f "$d/DONE" ] && { echo "[skip] $n"; return; }

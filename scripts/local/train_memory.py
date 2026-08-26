@@ -292,17 +292,23 @@ def main():
     ap.add_argument("--lambda_consist", type=float, default=1.0)
     ap.add_argument("--num_workers", type=int, default=6)
     ap.add_argument("--preload", action="store_true")
+    ap.add_argument("--eval_every", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
     out = Path(args.out_dir); out.mkdir(parents=True, exist_ok=True)
     dev = torch.device(args.device)
-    torch.manual_seed(0)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     DS = ClevrerSequence if args.dataset == "clevrer" else SSv2Sequence
     tr = DS(args.cache_dir, args.n_chunks, args.max_videos, "train",
             preload=args.preload)
-    va = DS(args.cache_dir, args.n_chunks, 0, "val", preload=args.preload)
+    # cap val with the train budget: the action probe (sklearn, ~170 classes)
+    # dominates eval time on the full val split.
+    n_val = max(200, args.max_videos // 4) if args.max_videos else 0
+    va = DS(args.cache_dir, args.n_chunks, n_val, "val", preload=args.preload)
     print(f"[data] train {len(tr)} videos | val {len(va)} videos "
           f"| {args.n_chunks} chunks each", flush=True)
     dl = DataLoader(tr, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -372,7 +378,7 @@ def main():
         agg = {k: v / max(1, nb) for k, v in agg.items()}
         row = {"epoch": ep, "sec": round(time.time() - t0, 1), **agg}
 
-        if ep % 5 == 4 or ep == args.epochs - 1:
+        if ep % args.eval_every == args.eval_every - 1 or ep == args.epochs - 1:
             pc, dr, rt, ab, idem, ZS, ZD, ATT, MASK, SPD = evaluate(enc, dec, dlv, dev, args)
             row["val_recon"] = pc
             row["drift"] = dr
