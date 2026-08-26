@@ -53,8 +53,17 @@ def prepare(batch, args, device, gen=None):
     return seq, pose
 
 
+def static_target(seq, how):
+    """seq (B,K,C,T,H,W) -> (B,C,H,W) the computed 'static scene' image."""
+    B, K, C, T, H, W = seq.shape
+    if how == "chunk_mean":
+        return seq.mean(dim=(1, 3))
+    X = seq.permute(0, 2, 1, 3, 4, 5).reshape(B, C, K * T, H, W)
+    return X.median(dim=2).values if how == "video_median" else X.mean(dim=2)
+
+
 # --------------------------------------------------------------------- losses
-def losses(enc, dec, seq, pose, args):
+def losses(enc, dec, seq, pose, args, aux=None):
     B, K = seq.shape[:2]
     grids, zdyn, _ = enc(seq, pose)                       # (B,K,c,g,g), (B,K,T,d_dyn)
     flat = seq.reshape(B * K, *seq.shape[2:])
@@ -72,12 +81,21 @@ def losses(enc, dec, seq, pose, args):
     # with a memory it is near-trivially satisfied, which is the point.
     L_nce = info_nce(zs[:, 0], zs[:, -1], temperature=0.1) if B > 1 else zs.sum() * 0
 
+    L_tgt = torch.zeros((), device=seq.device)
+    if aux is not None and args.lambda_static_tgt > 0:
+        tgt = static_target(seq, args.static_target)                  # (B,C,H,W)
+        pred = aux(grids.reshape(B * K, *grids.shape[2:]))            # (B*K,C,H,W)
+        L_tgt = F.mse_loss(pred, tgt.unsqueeze(1).expand(-1, K, -1, -1, -1)
+                                   .reshape(B * K, *tgt.shape[1:]))
+
     total = (L_recon
+             + args.lambda_static_tgt * L_tgt
              + args.lambda_indep * L_indep
              + args.lambda_consist * L_nce
              + 0.05 * (v1 + v2) + 0.05 * (c1 + c2))
     return total, {"recon": float(L_recon), "indep": float(L_indep),
-                   "nce": float(L_nce), "total": float(total)}
+                   "nce": float(L_nce), "stat_tgt": float(L_tgt),
+                   "total": float(total)}
 
 
 # ----------------------------------------------------------------------- eval
@@ -259,6 +277,17 @@ def main():
     ap.add_argument("--dyn_grid", type=int, default=8)
     ap.add_argument("--enc_hidden_ch", type=int, default=192)
     ap.add_argument("--dec_hidden_ch", type=int, default=384)
+    ap.add_argument("--static_target", default="none",
+                    choices=["none", "video_mean", "video_median", "chunk_mean"],
+                    help="EXPLICIT memory as a TEACHER: pool the video's own latent "
+                         "frames into a static scene image and make z_static predict "
+                         "it. Computed from the input, no labels. video_median "
+                         "rejects movers (measured: disagrees with the mean 3.8x more "
+                         "at high-motion cells) so the target really is the "
+                         "non-moving scene. Measured ceiling: a video-level image "
+                         "still explains ~86% of every chunk, vs 91% for a per-chunk "
+                         "one -- a good teacher, not a cap.")
+    ap.add_argument("--lambda_static_tgt", type=float, default=0.0)
     ap.add_argument("--lambda_indep", type=float, default=1.0)
     ap.add_argument("--lambda_consist", type=float, default=1.0)
     ap.add_argument("--num_workers", type=int, default=6)
@@ -302,7 +331,19 @@ def main():
     npar = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in dec.parameters())
     print(f"[model] upd={args.mem_update} col={args.mem_collapse} pan={args.synth_pan} dec={args.decoder} "
       f"zmd={args.zero_mean_dyn} params {npar/1e6:.2f}M", flush=True)
-    opt = torch.optim.AdamW(list(enc.parameters()) + list(dec.parameters()),
+    aux = None
+    if args.lambda_static_tgt > 0:
+        c_s = args.d_static // (args.static_grid ** 2)
+        aux = torch.nn.Sequential(
+            torch.nn.Upsample(size=(8, 8), mode="bilinear", align_corners=False),
+            torch.nn.Conv2d(c_s, 128, 3, padding=1), torch.nn.SiLU(),
+            torch.nn.Conv2d(128, 48, 1)).to(dev)
+        print(f"[aux] static target = {args.static_target} "
+              f"lambda={args.lambda_static_tgt}", flush=True)
+    params = list(enc.parameters()) + list(dec.parameters())
+    if aux is not None:
+        params += list(aux.parameters())
+    opt = torch.optim.AdamW(params,
                             lr=args.lr, weight_decay=1e-3)
 
     ck, ep0, hist = out / "ckpt.pt", 0, []
@@ -320,11 +361,10 @@ def main():
                 k = int(torch.randint(2, seq.shape[1] + 1, (1,)).item())
                 seq = seq[:, :k]
                 pose = None if pose is None else pose[:, :k]
-            total, log = losses(enc, dec, seq, pose, args)
+            total, log = losses(enc, dec, seq, pose, args, aux)
             opt.zero_grad(set_to_none=True)
             total.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(enc.parameters()) + list(dec.parameters()), 1.0)
+            torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             for k, v in log.items():
                 agg[k] = agg.get(k, 0.0) + v

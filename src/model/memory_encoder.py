@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from src.model.camera_pose import CameraConditioner
 from src.model.latent_encoder import _conv3d_trunk
 from src.model.static_memory import StaticMemory
+from src.model.video_static import VideoStatic
 
 
 class MemoryEncoder(nn.Module):
@@ -51,7 +52,15 @@ class MemoryEncoder(nn.Module):
         self.d_pose = int(d_pose)
         self.cc = (CameraConditioner(pose_dim=pose_dim, d_pose=d_pose)
                    if d_pose > 0 else None)
-        self.mem = StaticMemory(update=mem_update, collapse=mem_collapse,
+        # video-level: ONE static code for the whole clip (non-causal). Makes
+        # "static" true by construction -- anything that changes cannot live in a
+        # code that must serve every chunk.
+        self.vstatic = None
+        if mem_update in ("video", "video_proj"):
+            self.vstatic = VideoStatic(hidden_ch, grid=static_grid,
+                                       project=(mem_update == "video_proj"))
+        self.mem = StaticMemory(update="none" if mem_update.startswith("video")
+                                else mem_update, collapse=mem_collapse,
                                 ch=hidden_ch, grid=static_grid, d_pose=d_pose,
                                 n_frames=chunk_size_lat,
                                 attn_gate_bias=attn_gate_bias)
@@ -93,6 +102,34 @@ class MemoryEncoder(nn.Module):
             rel = self.cc.relative_to(pose.reshape(B, K * T, P), anchor)
             pe = self.cc.embed(rel).reshape(B, K, T, self.d_pose)
             rel_pose = rel.reshape(B, K, T, P)
+        if self.vstatic is not None:
+            K = seq.shape[1]
+            ev, dyns = [], []
+            for k in range(K):
+                B, _, T, H, W = seq[:, k].shape
+                g, gd = self.static_grid, self.dyn_grid
+                hs = self.trunk_static(seq[:, k])
+                hs_pf = F.adaptive_avg_pool2d(
+                    hs.permute(0, 2, 1, 3, 4).reshape(B * T, -1, H, W), (g, g)
+                ).reshape(B, T, -1, g, g)
+                ev.append(self.mem.collapse(hs_pf,
+                                            None if pe is None else pe[:, k]))
+                hd = self.trunk_dyn(seq[:, k])
+                hd_pf = F.adaptive_avg_pool2d(
+                    hd.permute(0, 2, 1, 3, 4).reshape(B * T, -1, H, W), (gd, gd))
+                zd = self.proj_dyn(hd_pf).reshape(B, T, self.d_dyn)
+                if self.zero_mean_dyn:
+                    zd = zd - zd.mean(dim=1, keepdim=True)
+                dyns.append(zd)
+            cp = None if rel_pose is None else rel_pose.mean(dim=2)   # (B,K,P)
+            canon = self.vstatic.aggregate(torch.stack(ev, 1), cp)
+            grids = [self.proj_static(
+                        self.vstatic.to_view(canon,
+                                             None if cp is None else cp[:, k],
+                                             None if cp is None else cp[:, 0]))
+                     for k in range(K)]
+            return torch.stack(grids, 1), torch.stack(dyns, 1), canon
+
         for k in range(seq.shape[1]):
             gsz, zd, mem = self.encode_chunk(
                 seq[:, k], mem, None if pe is None else pe[:, k],

@@ -36,7 +36,7 @@ from src.model.patch_memory import PatchMemory
 from src.model.world_canvas import WorldCanvasMemory
 
 UPDATES = ("none", "ema", "gru", "attn", "canvas", "canvas_gru",
-           "patch", "patch_rope", "patch_latent")
+           "patch", "patch_rope", "patch_latent", "video", "video_proj")
 COLLAPSES = ("mean", "median", "sweep", "world")
 
 
