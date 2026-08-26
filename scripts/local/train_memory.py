@@ -28,6 +28,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.data.clevrer_sequence import ClevrerSequence
+from src.data.ssv2_sequence import SSv2Sequence
 from src.loss.info_nce import info_nce
 from src.loss.vicreg import cross_decorr, vicreg_var_cov
 from src.model.base_delta_decoder import BaseDeltaDecoder
@@ -118,7 +119,10 @@ def evaluate(enc, dec, loader, device, args):
             drift.setdefault(k, []).append(float(d.mean()))
         ZS.append(zs[:, -1].cpu())            # final memory = the video's static code
         ZD.append(zdyn.mean(dim=(1, 2)).cpu())
-        ATT.append(b["attrs"]); MASK.append(b["slot_mask"]); SPD.append(b["speeds"])
+        if "attrs" in b:
+            ATT.append(b["attrs"]); MASK.append(b["slot_mask"]); SPD.append(b["speeds"])
+        else:                                    # SSv2: one action class per clip
+            ATT.append(b["label_id"]); MASK.append(b["label_id"]); SPD.append(b["label_id"])
     enc.train(); dec.train()
     return (
         {f"chunk{k}": float(np.mean(v)) for k, v in sorted(per_chunk.items())},
@@ -158,8 +162,29 @@ def probe(X, Y, valid, n_splits=2):
     return float(np.mean(aps)) if aps else float("nan")
 
 
+def action_report(ZS, ZD, Y):
+    """SSv2: frozen-feature action-class top-1 from each code."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    out = {"n_classes": int(len(np.unique(Y))), "n": int(len(Y))}
+    n = len(Y) // 2
+    for tag, X in (("static_code", ZS), ("dyn_code", ZD)):
+        sc = StandardScaler().fit(X[:n])
+        m = LogisticRegression(max_iter=400, C=1.0).fit(sc.transform(X[:n]), Y[:n])
+        out[f"{tag}_top1"] = float((m.predict(sc.transform(X[n:])) == Y[n:]).mean())
+    # concatenating both is the honest "how much is in the pair" reference
+    XB = np.concatenate([ZS, ZD], 1)
+    sc = StandardScaler().fit(XB[:n])
+    m = LogisticRegression(max_iter=400, C=1.0).fit(sc.transform(XB[:n]), Y[:n])
+    out["both_top1"] = float((m.predict(sc.transform(XB[n:])) == Y[n:]).mean())
+    out["chance"] = float(np.bincount(Y).max() / len(Y))
+    return out
+
+
 def semantic_report(ZS, ZD, ATT, MASK, SPD):
     """Overall attribute mAP, plus the stationary/moving split."""
+    if ATT.ndim == 1:                            # SSv2 carries a class id, not attrs
+        return action_report(ZS, ZD, ATT.astype(int))
     out = {}
     allp, n = _presence(ATT, MASK)
     ok = n > 0
@@ -184,6 +209,8 @@ def semantic_report(ZS, ZD, ATT, MASK, SPD):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache_dir", required=True)
+    ap.add_argument("--dataset", default="clevrer", choices=["clevrer", "ssv2"])
+    ap.add_argument("--chunk_size_lat", type=int, default=9)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--mem_update", default="none")
     ap.add_argument("--mem_collapse", default="mean")
@@ -216,10 +243,10 @@ def main():
     dev = torch.device(args.device)
     torch.manual_seed(0)
 
-    tr = ClevrerSequence(args.cache_dir, args.n_chunks, args.max_videos, "train",
-                         preload=args.preload)
-    va = ClevrerSequence(args.cache_dir, args.n_chunks, 0, "val",
-                         preload=args.preload)
+    DS = ClevrerSequence if args.dataset == "clevrer" else SSv2Sequence
+    tr = DS(args.cache_dir, args.n_chunks, args.max_videos, "train",
+            preload=args.preload)
+    va = DS(args.cache_dir, args.n_chunks, 0, "val", preload=args.preload)
     print(f"[data] train {len(tr)} videos | val {len(va)} videos "
           f"| {args.n_chunks} chunks each", flush=True)
     dl = DataLoader(tr, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -233,6 +260,7 @@ def main():
                         static_grid=args.static_grid, d_dyn=args.d_dyn,
                         dyn_grid=args.dyn_grid, mem_update=args.mem_update,
                         mem_collapse=args.mem_collapse, d_pose=args.d_pose,
+                        chunk_size_lat=args.chunk_size_lat,
                         zero_mean_dyn=args.zero_mean_dyn,
                         attn_gate_bias=args.attn_gate_bias).to(dev)
     if args.decoder == "basedelta":
@@ -242,7 +270,8 @@ def main():
     else:
         dec = SpatialGridDecoder(d_static=args.d_static, static_grid=args.static_grid,
                                  d_dyn=args.d_dyn, hidden_ch=args.dec_hidden_ch,
-                                 dyn_spatial=True, dyn_grid=args.dyn_grid).to(dev)
+                                 chunk_size_lat=args.chunk_size_lat,
+                             dyn_spatial=True, dyn_grid=args.dyn_grid).to(dev)
     npar = sum(p.numel() for p in enc.parameters()) + sum(p.numel() for p in dec.parameters())
     print(f"[model] upd={args.mem_update} col={args.mem_collapse} pan={args.synth_pan} dec={args.decoder} "
       f"zmd={args.zero_mean_dyn} params {npar/1e6:.2f}M", flush=True)

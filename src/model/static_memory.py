@@ -32,9 +32,11 @@ import torch
 import torch.nn as nn
 
 from src.model.camera_pose import PlaneSweepAggregator, WorldMemoryAggregator
+from src.model.patch_memory import PatchMemory
 from src.model.world_canvas import WorldCanvasMemory
 
-UPDATES = ("none", "ema", "gru", "attn", "canvas", "canvas_gru")
+UPDATES = ("none", "ema", "gru", "attn", "canvas", "canvas_gru",
+           "patch", "patch_rope", "patch_latent")
 COLLAPSES = ("mean", "median", "sweep", "world")
 
 
@@ -59,6 +61,12 @@ class StaticMemory(nn.Module):
         elif collapse == "world":
             self.agg = WorldMemoryAggregator(ch, d_pose, n_frames=n_frames, grid=grid)
 
+        self.patch = None
+        if update.startswith("patch"):
+            # retrieve-and-compose (MosaicMem) instead of fusing into a buffer
+            al = {"patch": "both", "patch_rope": "rope",
+                  "patch_latent": "latent"}[update]
+            self.patch = PatchMemory(ch, grid=grid, n_heads=n_heads, align=al)
         self.canvas = None
         if update in ("canvas", "canvas_gru"):
             # EXPLICIT world-frame buffer, larger than the view; needs raw pose.
@@ -101,6 +109,19 @@ class StaticMemory(nn.Module):
     def forward(self, state, feat: torch.Tensor, pose_emb=None, pose_raw=None):
         """state : opaque memory state (None on the first chunk).
         Returns (new_state, static_grid (B,C,g,g))."""
+        if self.patch is not None:
+            # pose is OPTIONAL here: without it the warps become identity and
+            # alignment is left to attention (the SSv2 / pose-free setting).
+            bank = [] if state is None else list(state)
+            s_cur = self.collapse(feat, pose_emb)
+            pose_q = None if pose_raw is None else pose_raw.mean(dim=1)
+            grid = self.patch(bank, s_cur, pose_q)
+            # Do NOT detach: if the bank is cut off from the graph the encoder is
+            # only ever trained to READ memory, never to WRITE evidence that is
+            # useful later. K is small (4 chunks), so full BPTT is affordable.
+            bank.append((s_cur, pose_q))
+            return bank, grid
+
         if self.canvas is not None:
             if pose_raw is None:
                 raise ValueError("update='canvas*' needs raw per-frame pose")
