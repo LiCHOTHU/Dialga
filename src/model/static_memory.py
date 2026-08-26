@@ -42,7 +42,8 @@ class StaticMemory(nn.Module):
     def __init__(self, update: str = "none", collapse: str = "mean",
                  ch: int = 192, grid: int = 4, n_heads: int = 4,
                  d_pose: int = 0, n_frames: int = 9,
-                 canvas_mult: int = 2, canvas_extent: float = 1.6):
+                 canvas_mult: int = 4, canvas_extent: float = 1.6,
+                 attn_gate_bias: float = -2.0):
         super().__init__()
         if update not in UPDATES:
             raise ValueError(f"update must be one of {UPDATES}, got {update!r}")
@@ -81,7 +82,11 @@ class StaticMemory(nn.Module):
             self.gate, self.out = nn.Linear(2 * c, c), nn.Linear(c, c)
             nn.init.zeros_(self.out.weight)      # M_0 == S_0 exactly at init
             nn.init.zeros_(self.out.bias)
-            nn.init.constant_(self.gate.bias, -2.0)
+            # bias -2.0 => sigmoid ~0.12: the memory barely writes and stays
+            # frozen at chunk 0 (measured: A5_attn drift 0.080 but zs_cost only
+            # 3.7%, BELOW the no-memory baseline -- a stale code the decoder
+            # learns to ignore). 0.0 gives a neutral write gate.
+            nn.init.constant_(self.gate.bias, float(attn_gate_bias))
 
     # ---------------------------------------------------------------- collapse
     def collapse(self, feat: torch.Tensor, pose_emb=None) -> torch.Tensor:

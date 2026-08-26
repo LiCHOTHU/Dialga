@@ -190,6 +190,7 @@ def main():
     ap.add_argument("--synth_pan", action="store_true",
                     help="pan one continuous camera across the whole video")
     ap.add_argument("--d_pose", type=int, default=0)
+    ap.add_argument("--attn_gate_bias", type=float, default=-2.0)
     ap.add_argument("--decoder", default="grid", choices=["grid", "basedelta"])
     ap.add_argument("--zero_mean_dyn", action="store_true",
                     help="project z_dyn onto the zero-temporal-mean subspace")
@@ -232,7 +233,8 @@ def main():
                         static_grid=args.static_grid, d_dyn=args.d_dyn,
                         dyn_grid=args.dyn_grid, mem_update=args.mem_update,
                         mem_collapse=args.mem_collapse, d_pose=args.d_pose,
-                        zero_mean_dyn=args.zero_mean_dyn).to(dev)
+                        zero_mean_dyn=args.zero_mean_dyn,
+                        attn_gate_bias=args.attn_gate_bias).to(dev)
     if args.decoder == "basedelta":
         dec = BaseDeltaDecoder(d_static=args.d_static, static_grid=args.static_grid,
                                d_dyn=args.d_dyn, dyn_grid=args.dyn_grid,

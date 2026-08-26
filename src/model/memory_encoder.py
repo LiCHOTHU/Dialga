@@ -28,7 +28,8 @@ class MemoryEncoder(nn.Module):
                  d_dyn: int = 256, dyn_grid: int = 8,
                  mem_update: str = "none", mem_collapse: str = "mean",
                  n_groups: int = 8, zero_mean_dyn: bool = False,
-                 d_pose: int = 0, pose_dim: int = 3, chunk_size_lat: int = 9):
+                 d_pose: int = 0, pose_dim: int = 3, chunk_size_lat: int = 9,
+                 attn_gate_bias: float = -2.0):
         super().__init__()
         # zero_mean_dyn: remove z_dyn's temporal mean inside the encoder, so the
         # dynamics code cannot represent anything CONSTANT over the chunk. Measured
@@ -52,7 +53,8 @@ class MemoryEncoder(nn.Module):
                    if d_pose > 0 else None)
         self.mem = StaticMemory(update=mem_update, collapse=mem_collapse,
                                 ch=hidden_ch, grid=static_grid, d_pose=d_pose,
-                                n_frames=chunk_size_lat)
+                                n_frames=chunk_size_lat,
+                                attn_gate_bias=attn_gate_bias)
         self.proj_static = nn.Conv2d(hidden_ch, self.c_static, 1)
         self.proj_dyn = nn.Conv2d(hidden_ch, self.c_dyn, 1)
 

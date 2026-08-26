@@ -47,6 +47,9 @@ run A1_base            --mem_update none --mem_collapse mean
 run A4_gru             --mem_update gru  --mem_collapse mean
 run A5_attn            --mem_update attn --mem_collapse mean
 
+# A5 under-writes (gate bias -2.0 => frozen at chunk 0). Neutral-gate rerun.
+run A5b_attn_open      --mem_update attn --mem_collapse mean --attn_gate_bias 0.0
+
 # --- B: base+delta decoder -- what actually gives z_static a job ---
 #   prescreen: zs_cost 17%->62%, swap 36%->94%; costs reconstruction.
 run B1_basedelta       --mem_update none --mem_collapse mean --decoder basedelta
