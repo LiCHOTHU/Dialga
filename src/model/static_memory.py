@@ -32,15 +32,17 @@ import torch
 import torch.nn as nn
 
 from src.model.camera_pose import PlaneSweepAggregator, WorldMemoryAggregator
+from src.model.world_canvas import WorldCanvasMemory
 
-UPDATES = ("none", "ema", "gru", "attn")
+UPDATES = ("none", "ema", "gru", "attn", "canvas", "canvas_gru")
 COLLAPSES = ("mean", "median", "sweep", "world")
 
 
 class StaticMemory(nn.Module):
     def __init__(self, update: str = "none", collapse: str = "mean",
                  ch: int = 192, grid: int = 4, n_heads: int = 4,
-                 d_pose: int = 0, n_frames: int = 9):
+                 d_pose: int = 0, n_frames: int = 9,
+                 canvas_mult: int = 2, canvas_extent: float = 1.6):
         super().__init__()
         if update not in UPDATES:
             raise ValueError(f"update must be one of {UPDATES}, got {update!r}")
@@ -56,9 +58,15 @@ class StaticMemory(nn.Module):
         elif collapse == "world":
             self.agg = WorldMemoryAggregator(ch, d_pose, n_frames=n_frames, grid=grid)
 
-        if update == "ema":
+        self.canvas = None
+        if update in ("canvas", "canvas_gru"):
+            # EXPLICIT world-frame buffer, larger than the view; needs raw pose.
+            self.canvas = WorldCanvasMemory(ch, grid=grid, extent=canvas_extent,
+                                            canvas_mult=canvas_mult,
+                                            learned_gate=True)
+        if update in ("ema",):
             self.alpha = nn.Parameter(torch.zeros(1))       # sigmoid(0)=0.5
-        elif update == "gru":
+        if update in ("gru", "canvas_gru"):
             c = self.ch
             self.conv_z = nn.Conv2d(2 * c, c, 3, padding=1)
             self.conv_r = nn.Conv2d(2 * c, c, 3, padding=1)
@@ -66,7 +74,7 @@ class StaticMemory(nn.Module):
             nn.init.zeros_(self.conv_z.bias)
             nn.init.zeros_(self.conv_h.weight)
             nn.init.zeros_(self.conv_h.bias)
-        elif update == "attn":
+        if update == "attn":
             c = self.ch
             self.norm_m, self.norm_s = nn.LayerNorm(c), nn.LayerNorm(c)
             self.attn = nn.MultiheadAttention(c, n_heads, batch_first=True)
@@ -85,19 +93,41 @@ class StaticMemory(nn.Module):
         return feat.mean(dim=1)
 
     # ------------------------------------------------------------------ update
-    def forward(self, mem, feat: torch.Tensor, pose_emb=None) -> torch.Tensor:
+    def forward(self, state, feat: torch.Tensor, pose_emb=None, pose_raw=None):
+        """state : opaque memory state (None on the first chunk).
+        Returns (new_state, static_grid (B,C,g,g))."""
+        if self.canvas is not None:
+            if pose_raw is None:
+                raise ValueError("update='canvas*' needs raw per-frame pose")
+            if state is None:
+                state = (self.canvas.empty(feat.shape[0], feat.device, feat.dtype), None)
+            cstate, prev = state
+            cstate = self.canvas.write(cstate, feat, pose_raw)
+            grid = self.canvas.read(cstate, pose_raw.mean(dim=1))
+            if self.update == "canvas_gru" and prev is not None:
+                grid = self._gru(prev, grid)          # hybrid: learned gate on readout
+            return (cstate, grid), grid
+
         s = self.collapse(feat, pose_emb)
-        if mem is None or self.update == "none":
-            return s
+        if state is None or self.update == "none":
+            return s, s
         if self.update == "ema":
             a = torch.sigmoid(self.alpha)
-            return (1.0 - a) * mem + a * s
-        if self.update == "gru":
-            x = torch.cat([mem, s], dim=1)
-            z = torch.sigmoid(self.conv_z(x))
-            r = torch.sigmoid(self.conv_r(x))
-            h = torch.tanh(self.conv_h(torch.cat([r * mem, s], dim=1)))
-            return (1.0 - z) * mem + z * h
+            m = (1.0 - a) * state + a * s
+        elif self.update == "gru":
+            m = self._gru(state, s)
+        else:
+            m = self._attn(state, s)
+        return m, m
+
+    def _gru(self, mem, s):
+        x = torch.cat([mem, s], dim=1)
+        z = torch.sigmoid(self.conv_z(x))
+        r = torch.sigmoid(self.conv_r(x))
+        h = torch.tanh(self.conv_h(torch.cat([r * mem, s], dim=1)))
+        return (1.0 - z) * mem + z * h
+
+    def _attn(self, mem, s):
         B, C, g, _ = mem.shape
         m = mem.flatten(2).transpose(1, 2)
         e = s.flatten(2).transpose(1, 2)

@@ -38,20 +38,30 @@ run () {  # run <name> <extra args...>
     && touch "$dir/DONE"
 }
 
-# --- A: does memory across chunks help? (static camera, grid decoder) ---
-run A1_base          --mem_update none --mem_collapse mean
-run A4_gru           --mem_update gru  --mem_collapse mean
-run A3_ema           --mem_update ema  --mem_collapse mean
-run A5_attn          --mem_update attn --mem_collapse mean
-run A2_median        --mem_update none --mem_collapse median
+# --- A: memory across chunks (static camera, grid decoder) ---
+run A1_base            --mem_update none --mem_collapse mean
+run A4_gru             --mem_update gru  --mem_collapse mean
+run A5_attn            --mem_update attn --mem_collapse mean
 
-# --- B: does the base+delta decoder give z_static a real job? ---
-run B1_basedelta     --mem_update none --mem_collapse mean --decoder basedelta
-run B2_basedelta_gru --mem_update gru  --mem_collapse mean --decoder basedelta
+# --- B: base+delta decoder -- what actually gives z_static a job ---
+#   prescreen: zs_cost 17%->62%, swap 36%->94%; costs reconstruction.
+run B1_basedelta       --mem_update none --mem_collapse mean --decoder basedelta
+run B2_basedelta_gru   --mem_update gru  --mem_collapse mean --decoder basedelta
 
-# --- C: moving camera, where a scene memory should actually pay ---
-run C1_pan_none      --synth_pan --mem_update none --mem_collapse mean
-run C2_pan_gru       --synth_pan --mem_update gru  --mem_collapse mean
-run C3_pan_gru_world --synth_pan --mem_update gru  --mem_collapse world --d_pose 32
+# --- C: moving camera. The 3D-memory question, across the whole taxonomy ---
+#   implicit  = learned state, no geometry           (gru)
+#   explicit  = world-frame canvas, pose in/pose out (canvas)
+#   hybrid    = explicit registration + learned gate (gru_world, canvas_gru)
+run C1_pan_none        --synth_pan --mem_update none   --mem_collapse mean
+run C2_pan_gru         --synth_pan --mem_update gru    --mem_collapse mean
+run C3_pan_gru_world   --synth_pan --mem_update gru    --mem_collapse world --d_pose 32
+run C4_pan_canvas      --synth_pan --mem_update canvas --mem_collapse mean  --d_pose 32
+run C5_pan_canvas_gru  --synth_pan --mem_update canvas_gru --mem_collapse mean --d_pose 32
+
+# --- D: the full proposal -- explicit scene memory AND a decoder that needs it ---
+run D1_canvas_bd       --synth_pan --mem_update canvas     --mem_collapse mean \
+                       --d_pose 32 --decoder basedelta
+run D2_canvas_gru_bd   --synth_pan --mem_update canvas_gru --mem_collapse mean \
+                       --d_pose 32 --decoder basedelta
 
 echo "SWEEP_DONE"

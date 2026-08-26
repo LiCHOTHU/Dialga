@@ -56,7 +56,7 @@ class MemoryEncoder(nn.Module):
         self.proj_static = nn.Conv2d(hidden_ch, self.c_static, 1)
         self.proj_dyn = nn.Conv2d(hidden_ch, self.c_dyn, 1)
 
-    def encode_chunk(self, x: torch.Tensor, mem, pose_emb=None):
+    def encode_chunk(self, x: torch.Tensor, mem, pose_emb=None, pose_raw=None):
         """x : (B, C, T, H, W). Returns (z_static_grid, z_dyn, mem)."""
         B, _, T, H, W = x.shape
         g, gd = self.static_grid, self.dyn_grid
@@ -65,8 +65,8 @@ class MemoryEncoder(nn.Module):
         hs_pf = F.adaptive_avg_pool2d(
             hs.permute(0, 2, 1, 3, 4).reshape(B * T, -1, H, W), (g, g)
         ).reshape(B, T, -1, g, g)                                   # (B,T,hid,g,g)
-        mem = self.mem(mem, hs_pf, pose_emb)                        # (B,hid,g,g)
-        z_static_grid = self.proj_static(mem)                       # (B,c_s,g,g)
+        mem, grid = self.mem(mem, hs_pf, pose_emb, pose_raw)
+        z_static_grid = self.proj_static(grid)                      # (B,c_s,g,g)
 
         hd = self.trunk_dyn(x)
         hd_pf = F.adaptive_avg_pool2d(
@@ -84,15 +84,17 @@ class MemoryEncoder(nn.Module):
         the DUSt3R move, and the precondition for accumulating them into a single
         scene memory."""
         mem, grids, dyns = None, [], []
-        pe = None
+        pe = rel_pose = None
         if self.cc is not None and pose is not None:
             B, K, T, P = pose.shape
             anchor = pose[:, 0, 0:1]                              # (B,1,P) video frame 0
             rel = self.cc.relative_to(pose.reshape(B, K * T, P), anchor)
             pe = self.cc.embed(rel).reshape(B, K, T, self.d_pose)
+            rel_pose = rel.reshape(B, K, T, P)
         for k in range(seq.shape[1]):
             gsz, zd, mem = self.encode_chunk(
-                seq[:, k], mem, None if pe is None else pe[:, k])
+                seq[:, k], mem, None if pe is None else pe[:, k],
+                None if rel_pose is None else rel_pose[:, k])
             grids.append(gsz)
             dyns.append(zd)
         return torch.stack(grids, 1), torch.stack(dyns, 1), mem
