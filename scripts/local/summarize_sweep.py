@@ -28,7 +28,9 @@ def main():
         if r is None:
             continue
         ab, sem = r["ablation"], r["semantics"]
+        ssv2 = "static_code_top1" in sem
         rows.append({
+            "idem": (min(r.get("idempotence") or [1.0])),
             "arm": d.name, "ep": r["epoch"],
             "recon": sum(r["val_recon"].values()) / len(r["val_recon"]),
             "drift1": r["drift"]["lag1"], "drift3": r["drift"].get("lag3", float("nan")),
@@ -44,9 +46,12 @@ def main():
             "zs_cost": ab["no_static"] / ab["full"] - 1,
             "zd_cost": ab["no_dyn"] / ab["full"] - 1,
             "swap_cost": ab["static_from_other_video"] / ab["full"] - 1,
-            "sem_zs": sem["static_code_mAP"], "sem_zd": sem["dyn_code_mAP"],
-            "still_zs": sem["stationary_from_static"], "still_zd": sem["stationary_from_dyn"],
-            "move_zs": sem["moving_from_static"], "move_zd": sem["moving_from_dyn"],
+            "sem_zs": sem["static_code_top1"] if ssv2 else sem["static_code_mAP"],
+            "sem_zd": sem["dyn_code_top1"] if ssv2 else sem["dyn_code_mAP"],
+            "still_zs": sem.get("both_top1", sem.get("stationary_from_static", float("nan"))),
+            "still_zd": sem.get("chance", sem.get("stationary_from_dyn", float("nan"))),
+            "move_zs": sem.get("moving_from_static", float("nan")),
+            "move_zd": sem.get("moving_from_dyn", float("nan")),
         })
 
     if not rows:
@@ -54,7 +59,7 @@ def main():
         return
     hdr = (f"{'arm':<18}{'ep':>4}{'recon':>9}{'drift1':>8}{'drift3':>8}{'ret/swap':>9}"
            f"{'zs_cost':>9}{'zd_cost':>9}{'swap':>8}{'sem_zs':>8}{'sem_zd':>8}"
-           f"{'still_zs':>9}{'still_zd':>9}{'move_zs':>9}{'move_zd':>9}")
+           f"{'sem_both':>9}{'chance':>9}{'move_zs':>9}{'move_zd':>9}")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:

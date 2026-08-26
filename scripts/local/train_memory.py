@@ -115,7 +115,15 @@ def evaluate(enc, dec, loader, device, args):
         zs = grids.flatten(2)                                   # (B,K,d_static)
         base = zs[:, 0]
         for k in range(1, K):
-            d = ((zs[:, k] - base) ** 2).sum(-1) / (base ** 2).sum(-1).clamp_min(1e-8)
+            # COSINE drift. The rel-MSE version is not scale-invariant, and several
+            # memories change the code's MAGNITUDE across chunks rather than its
+            # direction -- patch memory adds a residual each step and read 14.2 / 31.3
+            # on SSv2, a ConvGRU read 1.40 at lag1 and 0.005 at lag3. Those numbers
+            # measured norm growth and the recurrence's own trajectory, not scene
+            # consistency, so they are not comparable across arms. 1 - cos is bounded
+            # in [0,2] and answers the question actually being asked: has the static
+            # code turned into a different code?
+            d = 1.0 - F.cosine_similarity(zs[:, k], base, dim=-1)
             drift.setdefault(k, []).append(float(d.mean()))
         if not idem:
             # IDEMPOTENCE: feed the SAME chunk K times. A content-driven memory
