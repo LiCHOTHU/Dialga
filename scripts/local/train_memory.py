@@ -84,7 +84,7 @@ def losses(enc, dec, seq, pose, args):
 @torch.no_grad()
 def evaluate(enc, dec, loader, device, args):
     enc.eval(); dec.eval()
-    per_chunk, drift, retain, abl = {}, {}, {}, {}
+    per_chunk, drift, retain, abl, idem = {}, {}, {}, {}, []
     ZS, ZD, ATT, MASK, SPD = [], [], [], [], []
     gen = torch.Generator(device=device).manual_seed(1234)   # same views every eval
     for b in loader:
@@ -117,6 +117,17 @@ def evaluate(enc, dec, loader, device, args):
         for k in range(1, K):
             d = ((zs[:, k] - base) ** 2).sum(-1) / (base ** 2).sum(-1).clamp_min(1e-8)
             drift.setdefault(k, []).append(float(d.mean()))
+        if not idem:
+            # IDEMPOTENCE: feed the SAME chunk K times. A content-driven memory
+            # converges (cos -> 1); oscillation means the recurrence learned a
+            # position-dependent trajectory and "drift" is measuring that, not the
+            # scene. This is why drift alone must never be reported as consistency.
+            rep = seq[:, :1].repeat(1, K, 1, 1, 1, 1)
+            rp = None if pose is None else pose[:, :1].repeat(1, K, 1, 1)
+            gr, _, _ = enc(rep, rp)
+            zr = gr.flatten(2)
+            idem.extend([float(F.cosine_similarity(zr[:, k], zr[:, 0], dim=-1).mean())
+                         for k in range(K)])
         ZS.append(zs[:, -1].cpu())            # final memory = the video's static code
         ZD.append(zdyn.mean(dim=(1, 2)).cpu())
         if "attrs" in b:
@@ -129,6 +140,7 @@ def evaluate(enc, dec, loader, device, args):
         {f"lag{k}": float(np.mean(v)) for k, v in sorted(drift.items())},
         {f"chunk{k}": float(np.mean(v)) for k, v in sorted(retain.items())},
         {k: float(np.mean(v)) for k, v in abl.items()},
+        [round(x, 4) for x in idem],
         torch.cat(ZS).numpy(), torch.cat(ZD).numpy(),
         torch.cat(ATT).numpy(), torch.cat(MASK).numpy(), torch.cat(SPD).numpy(),
     )
@@ -222,6 +234,13 @@ def main():
     ap.add_argument("--zero_mean_dyn", action="store_true",
                     help="project z_dyn onto the zero-temporal-mean subspace")
     ap.add_argument("--n_chunks", type=int, default=4)
+    ap.add_argument("--rand_chunks", action="store_true",
+                    help="per batch, use a random prefix length K in [2, n_chunks]. "
+                         "With a FIXED K every video has the same length, so a "
+                         "recurrent memory can learn a position-dependent trajectory "
+                         "instead of a content-driven one -- measured: a ConvGRU fed "
+                         "the SAME chunk 4x returns cos(z_k,z_0)=[1,.63,.67,.999], "
+                         "i.e. it memorised chunk index, not scene content.")
     ap.add_argument("--max_videos", type=int, default=0)
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch_size", type=int, default=16)
@@ -289,6 +308,10 @@ def main():
         t0, agg, nb = time.time(), {}, 0
         for b in dl:
             seq, pose = prepare(b, args, dev)
+            if args.rand_chunks:
+                k = int(torch.randint(2, seq.shape[1] + 1, (1,)).item())
+                seq = seq[:, :k]
+                pose = None if pose is None else pose[:, :k]
             total, log = losses(enc, dec, seq, pose, args)
             opt.zero_grad(set_to_none=True)
             total.backward()
@@ -302,11 +325,12 @@ def main():
         row = {"epoch": ep, "sec": round(time.time() - t0, 1), **agg}
 
         if ep % 5 == 4 or ep == args.epochs - 1:
-            pc, dr, rt, ab, ZS, ZD, ATT, MASK, SPD = evaluate(enc, dec, dlv, dev, args)
+            pc, dr, rt, ab, idem, ZS, ZD, ATT, MASK, SPD = evaluate(enc, dec, dlv, dev, args)
             row["val_recon"] = pc
             row["drift"] = dr
             row["retention"] = rt
             row["ablation"] = ab
+            row["idempotence"] = idem
             row["semantics"] = semantic_report(ZS, ZD, ATT, MASK, SPD)
         hist.append(row)
         print(json.dumps(row), flush=True)
