@@ -25,7 +25,8 @@ from torch.utils.data import Dataset
 
 class ClevrerSequence(Dataset):
     def __init__(self, cache_dir, n_chunks: int = 4, max_videos: int = 0,
-                 split: str = "train", val_frac: float = 0.1, preload: bool = False):
+                 split: str = "train", val_frac: float = 0.1, preload: bool = False,
+                 dino_cache_dir=None):
         self.cache_dir = Path(cache_dir)
         self.n_chunks = int(n_chunks)
         index = _build_index(self.cache_dir)
@@ -43,6 +44,12 @@ class ClevrerSequence(Dataset):
         self.videos = [(v, sorted(index[v])[:n_chunks]) for v in vids]
         # The whole cache is ~5 GB; holding it in RAM as fp16 turns each epoch from
         # 4 x len(videos) disk reads into pure compute (this box has 60 GB).
+        # optional frozen-DINOv2 patch features, one row per wan-cache window
+        self.dino_dir = Path(dino_cache_dir) if dino_cache_dir else None
+        self._dino_mm = None
+        if self.dino_dir is not None:
+            idx = json.loads((self.dino_dir / "index.json").read_text())
+            self._dino_shape = tuple(idx["shape"])
         self.cache = None
         if preload:
             self.cache = [self._read(i) for i in range(len(self.videos))]
@@ -74,11 +81,25 @@ class ClevrerSequence(Dataset):
             p = b["positions"].float()                      # (W, Kobj, 2)
             sp = (p[1:] - p[:-1]).norm(dim=-1).mean(dim=0)  # (Kobj,)
             speeds = sp if speeds is None else torch.maximum(speeds, sp)
-        return {
+        out = {
             "latents": torch.stack(lat),                    # (K, C, T, H, W)
             "attrs": attrs, "slot_mask": slot_mask, "speeds": speeds,
             "video_id": torch.tensor(vid),
         }
+        if self.dino_dir is not None:
+            # DINOv2 target for z_static is the TIME-MEAN feature map: z_static is one
+            # grid for the whole chunk, so the part of the semantics it can be asked
+            # for is the part that does not change within the chunk.
+            import numpy as np
+            if self._dino_mm is None:
+                self._dino_mm = np.memmap(self.dino_dir / "features.f16.bin",
+                                          dtype=np.float16, mode="r",
+                                          shape=self._dino_shape)
+            rows = [int(Path(pth).stem) for _, pth in ws]
+            f = [torch.from_numpy(np.asarray(self._dino_mm[r])).float().mean(0)
+                 for r in rows]                             # each (H, W, D)
+            out["dino"] = torch.stack(f)                    # (K, H, W, D)
+        return out
 
 
 def _build_index(cache_dir: Path) -> dict[int, list[tuple[int, str]]]:

@@ -63,7 +63,7 @@ def static_target(seq, how):
 
 
 # --------------------------------------------------------------------- losses
-def losses(enc, dec, seq, pose, args, aux=None):
+def losses(enc, dec, seq, pose, args, aux=None, dino=None, dhead=None):
     B, K = seq.shape[:2]
     grids, zdyn, _ = enc(seq, pose)                       # (B,K,c,g,g), (B,K,T,d_dyn)
     flat = seq.reshape(B * K, *seq.shape[2:])
@@ -88,13 +88,24 @@ def losses(enc, dec, seq, pose, args, aux=None):
         L_tgt = F.mse_loss(pred, tgt.unsqueeze(1).expand(-1, K, -1, -1, -1)
                                    .reshape(B * K, *tgt.shape[1:]))
 
+    L_dino = torch.zeros((), device=seq.device)
+    if dhead is not None and dino is not None and args.lambda_dino > 0:
+        gin = grids.reshape(B * K, *grids.shape[2:])
+        if args.dino_to == "both":
+            zd_m = zdyn.mean(2).reshape(B * K, -1, 1, 1).expand(-1, -1, *gin.shape[-2:])
+            gin = torch.cat([gin, zd_m], 1)
+        pred = dhead(gin)                                   # (B*K, D, H, W)
+        tgt = dino.reshape(B * K, *dino.shape[2:]).permute(0, 3, 1, 2)
+        L_dino = (1.0 - F.cosine_similarity(pred, tgt, dim=1)).mean()
+
     total = (L_recon
+             + args.lambda_dino * L_dino
              + args.lambda_static_tgt * L_tgt
              + args.lambda_indep * L_indep
              + args.lambda_consist * L_nce
              + 0.05 * (v1 + v2) + 0.05 * (c1 + c2))
     return total, {"recon": float(L_recon), "indep": float(L_indep),
-                   "nce": float(L_nce), "stat_tgt": float(L_tgt),
+                   "nce": float(L_nce), "stat_tgt": float(L_tgt), "dino": float(L_dino),
                    "total": float(total)}
 
 
@@ -288,6 +299,14 @@ def main():
                          "still explains ~86% of every chunk, vs 91% for a per-chunk "
                          "one -- a good teacher, not a cap.")
     ap.add_argument("--lambda_static_tgt", type=float, default=0.0)
+    ap.add_argument("--dino_cache_dir", default=None)
+    ap.add_argument("--lambda_dino", type=float, default=0.0)
+    ap.add_argument("--dino_to", default="static", choices=["static", "both"],
+                    help="'both' is what train_v5's AuxSemanticDecoder does today: it "
+                         "feeds z_static AND z_dyn, so the semantic signal can be "
+                         "satisfied through z_dyn (24x the rate) and never lands on "
+                         "z_static -- while lambda_indep is simultaneously pushing "
+                         "identity OUT of z_dyn. 'static' routes it to z_static alone.")
     ap.add_argument("--lambda_indep", type=float, default=1.0)
     ap.add_argument("--lambda_consist", type=float, default=1.0)
     ap.add_argument("--num_workers", type=int, default=6)
@@ -303,12 +322,14 @@ def main():
     np.random.seed(args.seed)
 
     DS = ClevrerSequence if args.dataset == "clevrer" else SSv2Sequence
+    dkw = ({"dino_cache_dir": args.dino_cache_dir}
+           if (args.dino_cache_dir and args.dataset == "clevrer") else {})
     tr = DS(args.cache_dir, args.n_chunks, args.max_videos, "train",
-            preload=args.preload)
+            preload=args.preload, **dkw)
     # cap val with the train budget: the action probe (sklearn, ~170 classes)
     # dominates eval time on the full val split.
     n_val = max(200, args.max_videos // 4) if args.max_videos else 0
-    va = DS(args.cache_dir, args.n_chunks, n_val, "val", preload=args.preload)
+    va = DS(args.cache_dir, args.n_chunks, n_val, "val", preload=args.preload, **dkw)
     print(f"[data] train {len(tr)} videos | val {len(va)} videos "
           f"| {args.n_chunks} chunks each", flush=True)
     dl = DataLoader(tr, batch_size=args.batch_size, shuffle=True, drop_last=True,
@@ -346,7 +367,20 @@ def main():
             torch.nn.Conv2d(128, 48, 1)).to(dev)
         print(f"[aux] static target = {args.static_target} "
               f"lambda={args.lambda_static_tgt}", flush=True)
+    dhead = None
+    if args.lambda_dino > 0:
+        c_s = args.d_static // (args.static_grid ** 2)
+        din = c_s + (args.d_dyn if args.dino_to == "both" else 0)
+        d_feat = int(tr[0]["dino"].shape[-1])
+        dhead = torch.nn.Sequential(
+            torch.nn.Upsample(size=(8, 8), mode="bilinear", align_corners=False),
+            torch.nn.Conv2d(din, 256, 3, padding=1), torch.nn.SiLU(),
+            torch.nn.Conv2d(256, d_feat, 1)).to(dev)
+        print(f"[dino] teacher ON -> {args.dino_to}, d_feat={d_feat}, "
+              f"lambda={args.lambda_dino}", flush=True)
     params = list(enc.parameters()) + list(dec.parameters())
+    if dhead is not None:
+        params += list(dhead.parameters())
     if aux is not None:
         params += list(aux.parameters())
     opt = torch.optim.AdamW(params,
@@ -367,7 +401,8 @@ def main():
                 k = int(torch.randint(2, seq.shape[1] + 1, (1,)).item())
                 seq = seq[:, :k]
                 pose = None if pose is None else pose[:, :k]
-            total, log = losses(enc, dec, seq, pose, args, aux)
+            dn = b["dino"].to(dev) if "dino" in b else None
+            total, log = losses(enc, dec, seq, pose, args, aux, dn, dhead)
             opt.zero_grad(set_to_none=True)
             total.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)

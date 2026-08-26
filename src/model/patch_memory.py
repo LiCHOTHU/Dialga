@@ -61,6 +61,7 @@ class PatchMemory(nn.Module):
         self.register_buffer("freqs", 2.0 ** torch.arange(pos_dim // 4).float())
         self.pos_proj = nn.Linear(pos_dim, ch)
 
+        self.vquery = nn.Parameter(torch.randn(1, grid * grid, ch) * 0.02)
         self.q_norm, self.k_norm = nn.LayerNorm(ch), nn.LayerNorm(ch)
         self.attn = nn.MultiheadAttention(ch, n_heads, batch_first=True)
         self.gate = nn.Linear(2 * ch, ch)
@@ -123,6 +124,28 @@ class PatchMemory(nn.Module):
         f = torch.cat(feats, 1)
         p = torch.cat(poss, 1)
         return self.k_norm(f) + self._pos(p)
+
+    # ------------------------------------------------ compose (video-level read)
+    def read_video(self, bank, pose_q) -> torch.Tensor:
+        """ONE grid for the whole clip: read the entire bank with a learned query
+        set instead of anchoring on any single chunk's evidence.
+
+        The per-chunk forward() below returns `cur + gate*attn`, i.e. a code that
+        still varies chunk to chunk -- so it costs K*d_static per clip, not
+        d_static. Measured: that put PatchMemory at 6656 floats/clip against a
+        video-level code's 5504, and the two mechanisms then won about equally at
+        their own rate points. This read gives retrieve-and-compose the rate
+        saving as well: one code per clip, paid once."""
+        B = bank[0][0].shape[0]
+        base = self.cell_xy.reshape(1, -1, 2).expand(B, -1, -1)
+        q = self.q_norm(self.vquery.expand(B, self.grid ** 2, self.ch)) + self._pos(base)
+        kv = self.tokens(bank, pose_q)
+        att, _ = self.attn(q, kv, kv, need_weights=False)
+        anchor = torch.stack([f for f, _ in bank], 1).mean(1)      # plain mean anchor
+        a_t = anchor.flatten(2).transpose(1, 2)
+        gate = torch.sigmoid(self.gate(torch.cat([a_t, att], -1)))
+        out = a_t + gate * self.out(att)
+        return out.transpose(1, 2).reshape(B, self.ch, self.grid, self.grid)
 
     # ------------------------------------------------------------------ compose
     def forward(self, bank, cur: torch.Tensor, pose_q) -> torch.Tensor:

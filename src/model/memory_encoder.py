@@ -56,11 +56,13 @@ class MemoryEncoder(nn.Module):
         # "static" true by construction -- anything that changes cannot live in a
         # code that must serve every chunk.
         self.vstatic = None
-        if mem_update in ("video", "video_proj"):
+        self.patch_video = (mem_update == "patch_video")
+        if mem_update in ("video", "video_proj", "patch_video"):
             self.vstatic = VideoStatic(hidden_ch, grid=static_grid,
                                        project=(mem_update == "video_proj"))
-        self.mem = StaticMemory(update="none" if mem_update.startswith("video")
-                                else mem_update, collapse=mem_collapse,
+        self.mem = StaticMemory(update="patch" if mem_update == "patch_video"
+                                else ("none" if mem_update.startswith("video")
+                                      else mem_update), collapse=mem_collapse,
                                 ch=hidden_ch, grid=static_grid, d_pose=d_pose,
                                 n_frames=chunk_size_lat,
                                 attn_gate_bias=attn_gate_bias)
@@ -122,7 +124,12 @@ class MemoryEncoder(nn.Module):
                     zd = zd - zd.mean(dim=1, keepdim=True)
                 dyns.append(zd)
             cp = None if rel_pose is None else rel_pose.mean(dim=2)   # (B,K,P)
-            canon = self.vstatic.aggregate(torch.stack(ev, 1), cp)
+            if self.patch_video:
+                bank = [(ev[k], None if cp is None else cp[:, k]) for k in range(K)]
+                canon = self.mem.patch.read_video(
+                    bank, None if cp is None else cp[:, 0])
+            else:
+                canon = self.vstatic.aggregate(torch.stack(ev, 1), cp)
             grids = [self.proj_static(
                         self.vstatic.to_view(canon,
                                              None if cp is None else cp[:, k],

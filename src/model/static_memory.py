@@ -36,7 +36,8 @@ from src.model.patch_memory import PatchMemory
 from src.model.world_canvas import WorldCanvasMemory
 
 UPDATES = ("none", "ema", "gru", "attn", "canvas", "canvas_gru",
-           "patch", "patch_rope", "patch_latent", "video", "video_proj")
+           "patch", "patch_rope", "patch_latent", "video", "video_proj",
+           "patch_video")
 COLLAPSES = ("mean", "median", "sweep", "world")
 
 
@@ -65,7 +66,7 @@ class StaticMemory(nn.Module):
         if update.startswith("patch"):
             # retrieve-and-compose (MosaicMem) instead of fusing into a buffer
             al = {"patch": "both", "patch_rope": "rope",
-                  "patch_latent": "latent"}[update]
+                  "patch_latent": "latent", "patch_video": "both"}[update]
             self.patch = PatchMemory(ch, grid=grid, n_heads=n_heads, align=al)
         self.canvas = None
         if update in ("canvas", "canvas_gru"):
