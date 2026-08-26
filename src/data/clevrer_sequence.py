@@ -68,9 +68,12 @@ class ClevrerSequence(Dataset):
             lat.append(b["latent"].float())
             if attrs is None:
                 attrs, slot_mask = b["attrs"].float(), b["slot_mask"].bool()
-            if speeds is None:
-                p = b["positions"].float()                  # (W, Kobj, 2)
-                speeds = (p[1:] - p[:-1]).norm(dim=-1).mean(dim=0)   # (Kobj,)
+            # Speed must be measured over the WHOLE video, not the first chunk: a
+            # CLEVRER object commonly sits still and is struck later, so a chunk-0
+            # estimate labels exactly the interesting objects wrong.
+            p = b["positions"].float()                      # (W, Kobj, 2)
+            sp = (p[1:] - p[:-1]).norm(dim=-1).mean(dim=0)  # (Kobj,)
+            speeds = sp if speeds is None else torch.maximum(speeds, sp)
         return {
             "latents": torch.stack(lat),                    # (K, C, T, H, W)
             "attrs": attrs, "slot_mask": slot_mask, "speeds": speeds,
