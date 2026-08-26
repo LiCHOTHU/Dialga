@@ -515,3 +515,43 @@ __all__ = [
     "WorldMemoryAggregator", "PoseGridReapply",
     "CameraConditioner", "synthetic_pan", "camera_invariance_loss",
 ]
+
+
+def synthetic_pan_sequence(seq: torch.Tensor, max_shift: float = 0.6,
+                           max_zoom: float = 0.1,
+                           generator: Optional[torch.Generator] = None):
+    """Pan ONE CONTINUOUS camera across a whole video of K chunks.
+
+    ``synthetic_pan`` restarts its trajectory inside every chunk, so each chunk sees
+    the same scene window and a cross-chunk memory has nothing to accumulate. Here
+    the shift is a function of the GLOBAL frame index f = k*T + t over the whole
+    video, so chunk k sees a genuinely different part of the scene than chunk k-1.
+    That is what makes a static-scene memory non-trivial: no single chunk observes
+    the whole scene, and only registration + accumulation across chunks recovers it.
+
+    seq  : (B, K, C, T, H, W)
+    -> (warped (B,K,C,T,H,W), pose (B,K,T,3) = (t_x, t_y, log_scale))
+    """
+    if seq.dim() != 6:
+        raise ValueError(f"expected (B,K,C,T,H,W), got {tuple(seq.shape)}")
+    B, K, C, T, H, W = seq.shape
+    dev, dt = seq.device, seq.dtype
+    N = K * T
+    vel = (torch.rand(B, 2, generator=generator, device=dev) * 2 - 1) * max_shift
+    zoom = (torch.rand(B, 1, generator=generator, device=dev) * 2 - 1) * max_zoom
+    frac = (torch.arange(N, device=dev, dtype=dt) / max(1, N - 1)).view(1, N)
+    tx, ty = vel[:, 0:1] * frac, vel[:, 1:2] * frac          # (B,N)
+    log_scale = zoom * frac
+    s = torch.exp(log_scale).reshape(B * N)
+
+    x = seq.permute(0, 1, 3, 2, 4, 5).reshape(B * N, C, H, W)
+    theta = torch.zeros(B * N, 2, 3, device=dev, dtype=dt)
+    theta[:, 0, 0] = s
+    theta[:, 1, 1] = s
+    theta[:, 0, 2] = tx.reshape(B * N)
+    theta[:, 1, 2] = ty.reshape(B * N)
+    grid = F.affine_grid(theta, [B * N, C, H, W], align_corners=False)
+    w = F.grid_sample(x, grid, align_corners=False, padding_mode="border")
+    w = w.reshape(B, K, T, C, H, W).permute(0, 1, 3, 2, 4, 5).contiguous()
+    pose = torch.stack([tx, ty, log_scale], -1).reshape(B, K, T, 3)
+    return w, pose
