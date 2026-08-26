@@ -27,15 +27,19 @@ while ! grep -q "^\[done\]" "$CLOG" 2>/dev/null; do
 done
 echo "[wait] cache complete."
 
+FAILED=0
 run () {  # run <name> <extra args...>
   local name="$1"; shift
   local dir="$OUT/$name"
   if [ -f "$dir/DONE" ]; then echo "[skip] $name"; return; fi
   echo "=================== ARM $name @ $(date -Is) ==================="
-  python -u scripts/local/train_memory.py \
+  if python -u scripts/local/train_memory.py \
       --cache_dir "$CACHE" --out_dir "$dir" \
-      --epochs "$EPOCHS" --batch_size "$BS" --preload "$@" \
-    && touch "$dir/DONE"
+      --epochs "$EPOCHS" --batch_size "$BS" --preload "$@"; then
+    touch "$dir/DONE"
+  else
+    echo "[FAIL] arm $name"; FAILED=$((FAILED+1)); sleep 20
+  fi
 }
 
 # --- A: memory across chunks (static camera, grid decoder) ---
@@ -64,4 +68,10 @@ run D1_canvas_bd       --synth_pan --mem_update canvas     --mem_collapse mean \
 run D2_canvas_gru_bd   --synth_pan --mem_update canvas_gru --mem_collapse mean \
                        --d_pose 32 --decoder basedelta
 
+# Only claim success if every arm actually finished -- otherwise exit non-zero so
+# the restart wrapper retries instead of treating a wall of crashes as "done".
+if [ "$FAILED" -gt 0 ]; then
+  echo "[sweep] $FAILED arm(s) failed this pass; exiting non-zero to retry"
+  exit 1
+fi
 echo "SWEEP_DONE"

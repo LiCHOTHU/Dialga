@@ -84,7 +84,10 @@ def _build_index(cache_dir: Path) -> dict[int, list[tuple[int, str]]]:
     partially-built cache is still usable."""
     meta = cache_dir / "metadata.json"
     if meta.exists():
-        rows = json.loads(meta.read_text())
+        blob = json.loads(meta.read_text())
+        # cache_wan_latents writes {"args":..., "n_windows":..., "windows":[...]};
+        # tolerate a bare list too.
+        rows = blob["windows"] if isinstance(blob, dict) else blob
         idx = defaultdict(list)
         for r in rows:
             idx[int(r["video_id"])].append((int(r["start_frame"]), r["path"]))
