@@ -1381,3 +1381,70 @@ handled via self-chaining. Login-node probes get killed by policy → all probes
 run as embers jobs. New: `clevrer_{baselines,decode_baselines,rollout_baselines,
 decode_ablation}.py`, `semantic_efficiency.py`, `ssv2_action_probe.py` (+full-latent
 ceiling row), `clevrer_entangled`/`clevrer_scale`/`ssv2_{cache,train}_32k` sbatch.
+
+## v6.2 — Local single-GPU track: committed 24x factorized config; two metrics retracted (2026-08-27)
+
+All on the local RTX 5090 (env `dialga`, cloned from `river`; torch 2.7+cu128, sm_120).
+Code under `scripts/local/` + new `src/model/{base_delta_decoder,static_memory,
+patch_memory,world_canvas,video_static,memory_encoder}.py`. `train_v5.py` and the
+cluster pipeline are untouched.
+
+### Committed configuration
+
+```
+--decoder basedelta --d_static 576 --static_grid 8 --d_dyn 64 --dyn_grid 8
+--lambda_indep 0 --lambda_consist 3 --static_target video_median --lambda_static_tgt 1.0
+```
+z_static 576 floats (9ch on 8x8, ONE per chunk) + z_dyn 64/frame. CLEVRER (T_lat=9):
+1152 floats = **24.0x**, matching VideoFlexTok's rate; SSv2 (T_lat=5): 896 = 17.1x.
+
+| | today (96/256, 11.5x) | committed (24.0x) |
+|---|---|---|
+| delete z_static | 11% | **484% ± 43** (3 seeds) |
+| delete z_dyn | 714% | 149% ± 4 |
+| pixel PSNR | 34.63 dB | 32.35 dB |
+| code overlap (RBF-CKA) | 0.319 | 0.324 |
+
+Full SSv2 (163,717 train / 28,891 val, 60 ep, 896 floats): val recon 0.0746; delete
+z_static +331%, delete z_dyn +49% (**static-dominant**, the reverse of the 6k subset's
+42%/345%); action probe z_dyn **10.43%** vs z_static 6.41%, chance 1.88% — on a motion
+benchmark the dynamics code beats the static code, as the factorization claims.
+Table Q5 currently reports z_dyn 5.35 / z_static 2.00.
+
+### Two metrics retracted
+
+**Swap accuracy is confounded.** An ENTANGLED control (`--shared_trunk`: one conv trunk
+feeding both heads, an encoder that *cannot* separate the factors) scores +0.054 against
+the candidate's +0.053 ± 0.013, and reproduced at a second rate (+0.053 vs +0.055). The
+swap margin measures whether the DECODER routes identity through z_static — which
+base+delta guarantees structurally — not whether the encoder disentangled. Any
+factorization claim resting on swap accuracy (incl. the DiViD-style protocol) needs this
+control or it is not evidence.
+
+**`L_indep` does not measure what it is named for.** It sits at 0.0037 — near-perfect
+decorrelation — in a model whose z_static reconstructs 24.90 dB alone and does not
+improve (24.89 dB) when given 8x the rate; a NOISE z_static satisfies it perfectly. It
+reads 0.0039–0.0051 across models whose real overlap spans 0.29–0.38, and it is
+*anti*-correlated with the swap margin. **RBF-CKA between the codes** is the metric that
+discriminates (candidate 0.324 < entangled 0.376).
+
+### Other findings
+
+* **The rate allocation is inverted.** 91.5% of the latent's energy is time-constant,
+  8.5% is the per-frame residual — but today's code spends 4% on z_static and 96% on
+  z_dyn, paying for static content nine times over (once per frame).
+* **Rate alone does nothing.** Raising d_static 96 -> 768 moved z_static's solo
+  reconstruction 24.90 -> 24.89 dB and left 76% of its dimensions unused. The decoder
+  must be structurally unable to route around z_static first; then rate pays.
+* **`train_v5.py` bug**: `AuxSemanticDecoder` receives BOTH codes, so the DINOv2 target
+  is satisfied through z_dyn (24x the rate) while `lambda_indep` strips identity out of
+  z_dyn — the two terms fight. Routing to z_static alone: stationary/moving gap +0.065
+  vs +0.004, and 15% better reconstruction. One line.
+* **Not competitive per bit.** Under a matched protocol (frozen feature + equal-capacity
+  head) VideoMAE reads 27.40 dB at 768 floats vs ours 27.45 at 2400. The Q7 claim
+  (94.6% vs 77%) *reversed* locally (0.0337 vs 0.0328) — re-verify on the cluster model.
+* Semantics are substrate-capped: attribute mAP sat at ~0.75 across 80+ arms and every
+  lever (rate, shape, memory, teachers, InfoNCE weight, DINOv2 routing).
+* Dead ends: complementarity hinge + base+delta collapses training 10–100x; memory /
+  world-canvas / patch-retrieve machinery gave nothing over the plain encoder once the
+  objective was fixed; more InfoNCE negatives (batch 64) hurt reconstruction.
