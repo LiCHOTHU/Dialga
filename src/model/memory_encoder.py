@@ -30,7 +30,7 @@ class MemoryEncoder(nn.Module):
                  mem_update: str = "none", mem_collapse: str = "mean",
                  n_groups: int = 8, zero_mean_dyn: bool = False,
                  d_pose: int = 0, pose_dim: int = 3, chunk_size_lat: int = 9,
-                 attn_gate_bias: float = -2.0):
+                 attn_gate_bias: float = -2.0, shared_trunk: bool = False):
         super().__init__()
         # zero_mean_dyn: remove z_dyn's temporal mean inside the encoder, so the
         # dynamics code cannot represent anything CONSTANT over the chunk. Measured
@@ -48,7 +48,12 @@ class MemoryEncoder(nn.Module):
         self.d_static, self.d_dyn = d_static, d_dyn
 
         self.trunk_static = _conv3d_trunk(latent_ch, hidden_ch, n_groups)
-        self.trunk_dyn = _conv3d_trunk(latent_ch, hidden_ch, n_groups)
+        # shared_trunk: both heads pool from ONE trunk, so the encoder cannot
+        # route the factors apart. This is the entangled control the swap test
+        # needs -- it should FAIL, and if it does not, the swap margin is not
+        # measuring factorization.
+        self.trunk_dyn = (self.trunk_static if shared_trunk else
+                          _conv3d_trunk(latent_ch, hidden_ch, n_groups))
         self.d_pose = int(d_pose)
         self.cc = (CameraConditioner(pose_dim=pose_dim, d_pose=d_pose)
                    if d_pose > 0 else None)

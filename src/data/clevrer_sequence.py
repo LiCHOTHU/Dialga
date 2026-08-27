@@ -96,9 +96,18 @@ class ClevrerSequence(Dataset):
                                           dtype=np.float16, mode="r",
                                           shape=self._dino_shape)
             rows = [int(Path(pth).stem) for _, pth in ws]
-            f = [torch.from_numpy(np.asarray(self._dino_mm[r])).float().mean(0)
-                 for r in rows]                             # each (H, W, D)
-            out["dino"] = torch.stack(f)                    # (K, H, W, D)
+            raw = [torch.from_numpy(np.asarray(self._dino_mm[r])).float()
+                   for r in rows]                           # each (T, H, W, D)
+            # DECOMPOSED teacher: split the frame-wise features the same way the code
+            # is split, so each half is taught content the other is explicitly NOT
+            # taught. The median is what persists; the residual is the per-frame
+            # deviation from it. The two targets are disjoint by construction, which
+            # is the only mechanism here that acts on OVERLAP rather than on necessity.
+            med = [r.median(0).values for r in raw]          # (H,W,D) persists
+            res = [(r - m[None]).abs().mean(0) for r, m in zip(raw, med)]  # deviation
+            out["dino"] = torch.stack([r.mean(0) for r in raw])   # (K,H,W,D) legacy
+            out["dino_med"] = torch.stack(med)                    # (K,H,W,D)
+            out["dino_res"] = torch.stack(res)                    # (K,H,W,D)
         return out
 
 

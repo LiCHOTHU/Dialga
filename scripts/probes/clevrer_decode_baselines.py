@@ -61,6 +61,32 @@ class FeatBroadcastDecoder(nn.Module):
 
 
 def build_our_encoder(a, state, device):
+    # scripts/local/train_memory.py writes a MemoryEncoder under key "enc"; fall back
+    # to it so local checkpoints can be scored by the same protocol as the baselines.
+    if any(k.startswith("proj_static") for k in state):
+        from src.model.memory_encoder import MemoryEncoder
+        import torch.nn as _nn
+
+        class _Adapt(_nn.Module):
+            """MemoryEncoder takes a whole video (B,K,C,T,H,W) and returns tensors;
+            this probe feeds ONE chunk (B,C,T,H,W) and expects LatentEncoder3D's dict.
+            Adapt rather than special-case, so our code is scored by the exact same
+            path as every baseline."""
+            def __init__(self, m):
+                super().__init__(); self.m = m
+            def forward(self, x, pose_emb=None):
+                g, z, _ = self.m(x.unsqueeze(1))
+                return {"z_static": g[:, 0].flatten(1), "z_dyn": z[:, 0],
+                        "z_static_grid": g[:, 0]}
+
+        m = MemoryEncoder(hidden_ch=a["enc_hidden_ch"], d_static=a["d_static"],
+                          static_grid=a["static_grid"], d_dyn=a["d_dyn"],
+                          dyn_grid=a["dyn_grid"], mem_update=a.get("mem_update", "none"),
+                          mem_collapse=a.get("mem_collapse", "mean"),
+                          d_pose=a.get("d_pose", 0),
+                          chunk_size_lat=a.get("chunk_size_lat", 9)).to(device)
+        m.load_state_dict(state); m.eval()
+        return _Adapt(m).to(device).eval()
     def g(k, d):
         return a[k] if k in a else d
     d_pose = int(g("d_pose", 0)) if g("use_camera_pose", False) else 0
@@ -198,7 +224,12 @@ def main():
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     a = ck["args"]; a = a if isinstance(a, dict) else vars(a)
-    enc = build_our_encoder(a, ck["encoder"], device)
+    # Only our own arms need our encoder; the pretrained baselines do not. Loading it
+    # unconditionally made the script unusable for a baselines-only run (and with
+    # checkpoints written by scripts/local/train_memory.py, whose keys are enc/dec).
+    enc = None
+    if any(m in ("ours", "random") for m in args.methods):
+        enc = build_our_encoder(a, ck.get("encoder", ck.get("enc")), device)
 
     vae = None
     if args.pixel:

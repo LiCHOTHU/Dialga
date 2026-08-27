@@ -64,7 +64,8 @@ def static_target(seq, how):
 
 
 # --------------------------------------------------------------------- losses
-def losses(enc, dec, seq, pose, args, aux=None, dino=None, dhead=None):
+def losses(enc, dec, seq, pose, args, aux=None, dino=None, dhead=None,
+           dino_med=None, dino_res=None, dyhead=None):
     B, K = seq.shape[:2]
     grids, zdyn, _ = enc(seq, pose)                       # (B,K,c,g,g), (B,K,T,d_dyn)
     flat = seq.reshape(B * K, *seq.shape[2:])
@@ -81,6 +82,18 @@ def losses(enc, dec, seq, pose, args, aux=None, dino=None, dhead=None):
     # InfoNCE across two chunks of the same video (the existing consistency term);
     # with a memory it is near-trivially satisfied, which is the point.
     L_nce = info_nce(zs[:, 0], zs[:, -1], temperature=0.1) if B > 1 else zs.sum() * 0
+
+    # --- complementarity: neither code may be sufficient on its own ---
+    L_comp = torch.zeros((), device=seq.device)
+    if args.lambda_comp > 0:
+        gf = grids.reshape(B * K, *grids.shape[2:])
+        zf = zdyn.reshape(B * K, *zdyn.shape[2:])
+        solo_s = F.mse_loss(dec(gf, torch.zeros_like(zf)), flat)
+        solo_d = F.mse_loss(dec(torch.zeros_like(gf), zf), flat)
+        m = args.comp_margin
+        # each solo error must exceed the joint error by a factor of (1+m)
+        L_comp = (F.relu(m - (solo_s / L_recon.detach().clamp_min(1e-8) - 1.0))
+                  + F.relu(m - (solo_d / L_recon.detach().clamp_min(1e-8) - 1.0)))
 
     L_tgt = torch.zeros((), device=seq.device)
     if aux is not None and args.lambda_static_tgt > 0:
@@ -99,14 +112,26 @@ def losses(enc, dec, seq, pose, args, aux=None, dino=None, dhead=None):
         tgt = dino.reshape(B * K, *dino.shape[2:]).permute(0, 3, 1, 2)
         L_dino = (1.0 - F.cosine_similarity(pred, tgt, dim=1)).mean()
 
+    # decomposed teacher: each code gets the half of the semantic signal the other
+    # is not being taught
+    L_dyn_teach = torch.zeros((), device=seq.device)
+    if dyhead is not None and dino_res is not None and args.lambda_dyn_teach > 0:
+        zf = zdyn.reshape(B * K, *zdyn.shape[2:])            # (B*K, T, d_dyn)
+        pr = dyhead(zf.mean(1).unsqueeze(-1).unsqueeze(-1)
+                    .expand(-1, -1, 8, 8))                   # (B*K, D, H, W)
+        tg = dino_res.reshape(B * K, *dino_res.shape[2:]).permute(0, 3, 1, 2)
+        L_dyn_teach = (1.0 - F.cosine_similarity(pr, tg, dim=1)).mean()
+
     total = (L_recon
+             + args.lambda_dyn_teach * L_dyn_teach
+             + args.lambda_comp * L_comp
              + args.lambda_dino * L_dino
              + args.lambda_static_tgt * L_tgt
              + args.lambda_indep * L_indep
              + args.lambda_consist * L_nce
              + 0.05 * (v1 + v2) + 0.05 * (c1 + c2))
     return total, {"recon": float(L_recon), "indep": float(L_indep),
-                   "nce": float(L_nce), "stat_tgt": float(L_tgt), "dino": float(L_dino),
+                   "nce": float(L_nce), "stat_tgt": float(L_tgt), "dino": float(L_dino), "comp": float(L_comp), "dyn_teach": float(L_dyn_teach),
                    "total": float(total)}
 
 
@@ -307,12 +332,33 @@ def main():
     ap.add_argument("--lambda_static_tgt", type=float, default=0.0)
     ap.add_argument("--dino_cache_dir", default=None)
     ap.add_argument("--lambda_dino", type=float, default=0.0)
+    ap.add_argument("--lambda_dyn_teach", type=float, default=0.0,
+                    help="DECOMPOSED teacher. z_static is taught median_t f_t (what "
+                         "persists) and z_dyn is taught |f_t - median_t f_t| (the "
+                         "per-frame deviation). The two targets are disjoint by "
+                         "construction, so this is the only mechanism tried that acts "
+                         "on OVERLAP -- measured RBF-CKA between the codes sits at "
+                         "0.32-0.51 for every config so far, and lambda_indep is blind "
+                         "to it (reads ~0.003 for all of them).")
     ap.add_argument("--dino_to", default="static", choices=["static", "both"],
                     help="'both' is what train_v5's AuxSemanticDecoder does today: it "
                          "feeds z_static AND z_dyn, so the semantic signal can be "
                          "satisfied through z_dyn (24x the rate) and never lands on "
                          "z_static -- while lambda_indep is simultaneously pushing "
                          "identity OUT of z_dyn. 'static' routes it to z_static alone.")
+    ap.add_argument("--lambda_comp", type=float, default=0.0,
+                    help="COMPLEMENTARITY hinge. Orthogonality (lambda_indep) is the "
+                         "field-standard tool and it does not work here: measured "
+                         "L_indep=0.0037 (near-perfect decorrelation) in a model whose "
+                         "z_static holds nothing (solo recon 24.90 dB, vs 24.89 dB with "
+                         "8x the rate). Decorrelation is satisfied by a NOISE z_static. "
+                         "This instead requires each code ALONE to reconstruct at least "
+                         "`comp_margin` relatively worse than the pair -- i.e. it "
+                         "directly optimises the zs_cost/zd_cost we actually measure, "
+                         "which is the PID notion of unique information + synergy "
+                         "rather than mere redundancy.")
+    ap.add_argument("--comp_margin", type=float, default=1.0)
+    ap.add_argument("--shared_trunk", action="store_true")
     ap.add_argument("--lambda_indep", type=float, default=1.0)
     ap.add_argument("--lambda_consist", type=float, default=1.0)
     ap.add_argument("--num_workers", type=int, default=6)
@@ -351,7 +397,8 @@ def main():
                         mem_collapse=args.mem_collapse, d_pose=args.d_pose,
                         chunk_size_lat=args.chunk_size_lat,
                         zero_mean_dyn=args.zero_mean_dyn,
-                        attn_gate_bias=args.attn_gate_bias).to(dev)
+                        attn_gate_bias=args.attn_gate_bias,
+                        shared_trunk=args.shared_trunk).to(dev)
     if args.decoder == "basedelta":
         dec = BaseDeltaDecoder(d_static=args.d_static, static_grid=args.static_grid,
                                d_dyn=args.d_dyn, dyn_grid=args.dyn_grid,
@@ -373,6 +420,14 @@ def main():
             torch.nn.Conv2d(128, 48, 1)).to(dev)
         print(f"[aux] static target = {args.static_target} "
               f"lambda={args.lambda_static_tgt}", flush=True)
+    dyhead = None
+    if args.lambda_dyn_teach > 0:
+        d_feat = int(tr[0]["dino_res"].shape[-1])
+        dyhead = torch.nn.Sequential(
+            torch.nn.Conv2d(args.d_dyn, 256, 1), torch.nn.SiLU(),
+            torch.nn.Conv2d(256, d_feat, 1)).to(dev)
+        print(f"[teach] decomposed: z_static<-median, z_dyn<-residual "
+              f"(lambda={args.lambda_dyn_teach})", flush=True)
     dhead = None
     if args.lambda_dino > 0:
         c_s = args.d_static // (args.static_grid ** 2)
@@ -387,6 +442,8 @@ def main():
     params = list(enc.parameters()) + list(dec.parameters())
     if dhead is not None:
         params += list(dhead.parameters())
+    if dyhead is not None:
+        params += list(dyhead.parameters())
     if aux is not None:
         params += list(aux.parameters())
     opt = torch.optim.AdamW(params,
@@ -426,8 +483,11 @@ def main():
                 k = int(torch.randint(2, seq.shape[1] + 1, (1,)).item())
                 seq = seq[:, :k]
                 pose = None if pose is None else pose[:, :k]
-            dn = b["dino"].to(dev) if "dino" in b else None
-            total, log = losses(enc, dec, seq, pose, args, aux, dn, dhead)
+            dn = b["dino_med"].to(dev) if "dino_med" in b else (
+                 b["dino"].to(dev) if "dino" in b else None)
+            dres = b["dino_res"].to(dev) if "dino_res" in b else None
+            total, log = losses(enc, dec, seq, pose, args, aux, dn, dhead,
+                                dn, dres, dyhead)
             opt.zero_grad(set_to_none=True)
             total.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
