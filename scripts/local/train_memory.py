@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 
@@ -282,6 +283,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=30)
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr_schedule", default="constant", choices=["constant", "cosine"],
+                    help="lr has been fixed at 3e-4 with no schedule for every run so "
+                         "far; cosine decay is the standard free win on reconstruction "
+                         "and had never been tried here.")
+    ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--d_static", type=int, default=96)
     ap.add_argument("--static_grid", type=int, default=4)
     ap.add_argument("--d_dyn", type=int, default=256)
@@ -386,12 +392,31 @@ def main():
     opt = torch.optim.AdamW(params,
                             lr=args.lr, weight_decay=1e-3)
 
+    sched = None
+    if args.lr_schedule == "cosine":
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda e: (
+            (e + 1) / max(1, args.warmup) if e < args.warmup else
+            0.5 * (1 + math.cos(math.pi * (e - args.warmup)
+                                / max(1, args.epochs - args.warmup)))))
     ck, ep0, hist = out / "ckpt.pt", 0, []
     if ck.exists():                                    # resume (restart wrapper)
-        s = torch.load(ck, map_location="cpu", weights_only=False)
-        enc.load_state_dict(s["enc"]); dec.load_state_dict(s["dec"])
-        opt.load_state_dict(s["opt"]); ep0 = s["epoch"] + 1; hist = s.get("hist", [])
-        print(f"[resume] from epoch {ep0}", flush=True)
+        st = torch.load(ck, map_location="cpu", weights_only=False)
+        # Only resume into an IDENTICAL model. The restart wrapper relaunches on any
+        # exit, so a checkpoint left by a different config would otherwise crash the
+        # arm forever (or, worse, load partially) instead of just starting over.
+        SHAPE = ("d_static", "static_grid", "d_dyn", "dyn_grid", "mem_update",
+                 "mem_collapse", "d_pose", "decoder", "enc_hidden_ch", "dec_hidden_ch",
+                 "chunk_size_lat", "dataset")
+        prev = st.get("args", {})
+        mismatch = [k for k in SHAPE if prev.get(k) != getattr(args, k, None)]
+        if mismatch:
+            print(f"[resume] IGNORING checkpoint: config differs on {mismatch}; "
+                  f"starting fresh", flush=True)
+        else:
+            enc.load_state_dict(st["enc"]); dec.load_state_dict(st["dec"])
+            opt.load_state_dict(st["opt"])
+            ep0 = st["epoch"] + 1; hist = st.get("hist", [])
+            print(f"[resume] from epoch {ep0}", flush=True)
 
     for ep in range(ep0, args.epochs):
         t0, agg, nb = time.time(), {}, 0
@@ -410,6 +435,8 @@ def main():
             for k, v in log.items():
                 agg[k] = agg.get(k, 0.0) + v
             nb += 1
+        if sched is not None:
+            sched.step()
         agg = {k: v / max(1, nb) for k, v in agg.items()}
         row = {"epoch": ep, "sec": round(time.time() - t0, 1), **agg}
 
