@@ -7,11 +7,11 @@ cd /home/licho/workspace/Dialga
 source /home/licho/anaconda3/etc/profile.d/conda.sh; conda activate dialga
 export PYTHONPATH=/home/licho/workspace/Dialga
 python -u scripts/probes/clevrer_decode_baselines.py \
-  --ckpt outputs/final/BASE60_s0/ckpt.pt \
+  --ckpt outputs/FINAL/F_cand_s0/ckpt.pt \
   --cache_dir outputs/cache/clevrer_W33_10k \
   --video_root datasets/CLEVRER/train_video \
-  --methods videoflextok dinov2 wanmean \
+  --methods ours \
   --max_videos 1200 --epochs 60 --dec_hidden 384 \
   --pixel --pixel_n 64 \
-  --out outputs/logs/baseline_psnr_b.json
+  --out outputs/logs/matched_committed.json
 echo BASELINE_PSNR_DONE

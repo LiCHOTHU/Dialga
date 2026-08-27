@@ -1448,3 +1448,43 @@ discriminates (candidate 0.324 < entangled 0.376).
 * Dead ends: complementarity hinge + base+delta collapses training 10–100x; memory /
   world-canvas / patch-retrieve machinery gave nothing over the plain encoder once the
   objective was fixed; more InfoNCE negatives (batch 64) hurt reconstruction.
+
+### v6.2 addendum — matched-protocol baseline table (2026-08-27)
+
+Every representation frozen, decoded back to the Wan latent by an IDENTICAL-capacity
+head, same 1,200 CLEVRER videos, 60 epochs, then Wan-decoded to pixels. This is the
+only comparison in which our number and the baselines' are produced the same way; the
+jointly-trained figures (32.29 dB etc.) are NOT comparable to these, because the
+protocol's own ceiling — the full 27,648-float latent — is 27.72 dB.
+
+| representation | floats | compression | latent MSE | pixel PSNR |
+|---|---|---|---|---|
+| full Wan latent (ceiling) | 27,648 | 1.0x | 0.0296 | 27.72 |
+| **DIALGA committed** | **1,152** | **24.0x** | **0.0327** | **27.49** |
+| VideoFlexTok | 1,152 | 24.0x | 0.0330 | 27.29 |
+| VideoMAE (mean-pooled) | 768 | 36.0x | 0.0328 | 27.40 |
+| DIALGA today (96/256) | 2,400 | 11.5x | 0.0337 | 27.45 |
+| DINOv2 (mean-pooled) | 768 | 36.0x | 0.0401 | 26.50 |
+
+VideoFlexTok at 1,152 floats is the like-for-like row: same budget, same head, no
+pooling artefact. We are +0.20 dB / -0.0003 MSE against it, and reach 99.2% of the
+full-latent PSNR at 24x fewer floats.
+
+CAVEATS. All single-seed, CLEVRER only. The top three span 0.0327-0.0330 latent MSE,
+which is inside plausible seed noise — "comparable to VideoFlexTok at matched rate" is
+supported, "beats" is not yet. VideoMAE's 768 is a MEAN-POOLED summary (`o.mean(1)`
+over 1,568 tokens); its native output is 1,568 x 768 = 1.2M floats, i.e. 43x LARGER
+than the Wan latent, so its "36x" is an artefact of the probe's pooling choice and
+must be stated as such. And VideoFlexTok is a generative tokenizer judged on rFVD, so
+this measures it on its weakest axis.
+
+The result that is not marginal: at 1,152 floats we match or beat both while carrying a
+factorization neither has a mechanism for — zs_cost 484%+-43 (3 seeds) and code overlap
+0.324 vs 0.376 for an entangled shared-trunk control.
+
+REPRODUCING THE VideoFlexTok BASELINE (cost three failed attempts):
+  1. `git clone https://github.com/apple/ml-videoflextok` into the repo root — the
+     probe does `sys.path.insert(0, "ml-videoflextok")` and .gitignore excludes it.
+  2. `pip install mup` — muP scaling, not in the env.
+  3. `TORCHDYNAMO_DISABLE=1` — otherwise InductorError: PassManager::run failed on
+     Blackwell + torch 2.7. The cluster sbatch scripts already set this.
