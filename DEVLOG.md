@@ -1676,3 +1676,38 @@ absolute 0.976.
 Scene labels come from the LIBERO task template (KITCHEN_SCENE10_... -> KITCHEN_SCENE10),
 20 scenes over 90 tasks. Scene is scored only on scenes present in probe training, since a
 held-out task whose scene never appears is unpredictable by construction.
+
+## v6.7 — Seed error bars on the SSv2 table; CLEVRER retrained (2026-08-28)
+
+Added `--seed` and `--feat_cache` to `ssv2_decode_baselines.py` so a seed sweep decodes
+each webm once, and ran all six rows across three seeds.
+
+| representation | floats | latent MSE | PSNR |
+|---|---|---|---|
+| frozen VAE alone | — | — | 15.66 |
+| full Wan latent (ceiling) | 15360 | 0.1312±.0037 | 15.51±.05 |
+| **DIALGA** | **896** | **0.1360±.0003** | **15.02±.03** |
+| VideoFlexTok | 1152 | 0.2084±.0002 | 13.63±.08 |
+| Wan latent, mean-pooled | 48 | 0.2019±.0009 | 13.64±.03 |
+| VideoMAE (pooled) | 768 | 0.2228±.0012 | 13.48±.07 |
+| DINOv2 (pooled) | 768 | 0.3108±.0009 | 11.97±.02 |
+
+**A claim I had to weaken.** The single-seed run put us "within 0.0005 latent MSE of the
+full latent". Across seeds the ceiling row is noisier than our row (±.0037 vs ±.0003) and
+sits at 0.1312, so the real gap is **0.0048**, and we are 0.49 dB below it. The paper now
+says compression at a cost rather than parity. The PSNR margins over the baselines
+(+1.39 / +1.54 / +3.05 dB) are unaffected and are more than an order of magnitude larger
+than the seed spread.
+
+**CLEVRER retrained at the committed config**, 3 seeds (`outputs/FINAL_CLEVRER_s{0,1,2}`),
+because no surviving checkpoint matched it. Rate: 576 + 64*9 = 1152 floats = 24.0x on the
+(48,9,8,8) latent, the same shape rule as the committed SSv2 model (576 + 64*5 = 896).
+The matched-protocol eval for tab:matched is running.
+
+**Dataset coverage, checked rather than assumed.** SSv2 is the whole released set:
+192,608 of 193,690 clips cached (~1k fail to decode), 163,717 train / 28,891 val, trained
+with max_videos=0. CLEVRER is *not*: the cache holds 10,000 videos (the full train split)
+while 15,000 mp4s are on disk, and ClevrerSequence holds out 10% internally, so the model
+sees 9,000 train / 1,000 val. **tab:matched's caption still says "1,200 clips" and calls
+them val** — that predates this session and is wrong on both counts; it needs correcting
+to 1,000 held out from the train split, or the 5,000 official val videos need caching.

@@ -152,7 +152,7 @@ frozen substrate costs, and what our code costs on top of it.
 \begin{table}[t]
 \centering\small
 \caption{\textbf{Q3b --- matched-protocol reconstruction on real video} (SSv2 val, $600$
-held-out windows, $96$ decoded to pixels; frozen representation $\to$ equal-capacity head
+held-out windows, $96$ decoded to pixels, three seeds; frozen representation $\to$ equal-capacity head
 $\to$ Wan latent $\to$ pixels, scored against the source frames). The first row uses no
 head at all: it decodes the true latent, and so measures the frozen VAE alone. It sits
 only $0.18$\,dB above the full-latent row, which establishes that the shared head is
@@ -164,28 +164,30 @@ only $0.18$\,dB above the full-latent row, which establishes that the shared hea
 Representation & Floats & Compression & Latent MSE $\downarrow$ & PSNR $\uparrow$ \\
 \midrule
 Frozen VAE alone, no head (substrate) & --- & --- & --- & 15.66 \\
-Full Wan latent (protocol ceiling) & 15360 & $1.0\times$ & 0.1357 & 15.48 \\
+Full Wan latent (protocol ceiling) & 15360 & $1.0\times$ & $0.1312${\tiny$\pm.0037$} & $15.51${\tiny$\pm.05$} \\
 \midrule
-\textbf{\method{}} & \textbf{896} & $\mathbf{17.1\times}$ & \textbf{0.1362} & \textbf{15.11} \\
-VideoFlexTok \citep{videoflextok} & 1152 & $13.3\times$ & 0.2097 & 13.67 \\
-Wan latent, mean-pooled & 48 & $320\times$ & 0.2011 & 13.65 \\
-VideoMAE \citep{videomae} (pooled) & 768 & $20.0\times$ & 0.2206 & 13.40 \\
-DINOv2 \citep{dinov2} (pooled) & 768 & $20.0\times$ & 0.3096 & 11.80 \\
+\textbf{\method{}} & \textbf{896} & $\mathbf{17.1\times}$ & $\mathbf{0.1360}${\tiny$\pm.0003$} & $\mathbf{15.02}${\tiny$\pm.03$} \\
+VideoFlexTok \citep{videoflextok} & 1152 & $13.3\times$ & $0.2084${\tiny$\pm.0002$} & $13.63${\tiny$\pm.08$} \\
+Wan latent, mean-pooled & 48 & $320\times$ & $0.2019${\tiny$\pm.0009$} & $13.64${\tiny$\pm.03$} \\
+VideoMAE \citep{videomae} (pooled) & 768 & $20.0\times$ & $0.2228${\tiny$\pm.0012$} & $13.48${\tiny$\pm.07$} \\
+DINOv2 \citep{dinov2} (pooled) & 768 & $20.0\times$ & $0.3108${\tiny$\pm.0009$} & $11.97${\tiny$\pm.02$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-The margin that was absent on CLEVRER is present here. \method{} lands within $0.0005$
-latent MSE of the full latent while using $17.1\times$ fewer floats, and reconstructs
-$1.44$\,dB above VideoFlexTok, $1.71$\,dB above VideoMAE and $3.31$\,dB above DINOv2 ---
-gaps far outside the $0.0003$ spread that made the CLEVRER ordering unresolvable. Two
-caveats belong with it. The absolute numbers are low because the frozen VAE tops out at
-$15.66$\,dB on handheld $128^2$ video, so every row is compressed into a $3.9$\,dB band
-beneath a hard ceiling; and one baseline row is diagnostic rather than competitive ---
-mean-pooling the raw latent to $48$ floats reconstructs as well as VideoFlexTok and
-better than VideoMAE, which says that on this substrate the pooled self-supervised
-features retain little that a channel mean does not already carry. These are
-single-seed.
+The margin that was absent on CLEVRER is present here. \method{} reconstructs
+$1.39$\,dB above VideoFlexTok, $1.54$\,dB above VideoMAE and $3.05$\,dB above DINOv2,
+using $17.1\times$ fewer floats than the latent it is compressing --- gaps more than an
+order of magnitude larger than the seed spread ($\pm0.03$--$0.08$\,dB), and far outside
+the $0.0003$ latent-MSE band that made the CLEVRER ordering unresolvable. Three caveats
+belong with it. The absolute numbers are low because the frozen VAE tops out at
+$15.66$\,dB on handheld $128^2$ video, so every row is compressed into a $3.7$\,dB band
+beneath a hard ceiling. We remain $0.49$\,dB below the full-latent row and $0.0048$ above
+it in latent MSE, so this is compression at a cost, not a free lunch. And one baseline row
+is diagnostic rather than competitive --- mean-pooling the raw latent to $48$ floats
+reconstructs as well as VideoFlexTok and better than VideoMAE, which says that on this
+substrate the pooled self-supervised features retain little that a channel mean does not
+already carry.
 
 \subsection{Q3c: The same controls on real video --- where CKA stops working}
 \label{sec:ssv2diag}
@@ -208,7 +210,7 @@ delete, and it reads actions far worse (\cref{tab:libero}).}
 & CKA lin.\ $\downarrow$ & CKA rbf $\downarrow$ & del.\ $\zs$ & del.\ $\zd$ & PSNR $\uparrow$ \\
 \midrule
 \textbf{\method{}} & $0.182${\tiny$\pm.021$} & $\mathbf{0.289}${\tiny$\pm.018$}
-  & $332\%${\tiny$\pm9$} & $\mathbf{48\%}${\tiny$\pm1$} & $\mathbf{15.05}${\tiny$\pm.07$} \\
+  & $332\%${\tiny$\pm9$} & $\mathbf{48\%}${\tiny$\pm1$} & $\mathbf{15.02}${\tiny$\pm.03$} \\
 Entangled (shared trunk) & $\mathbf{0.022}$ & $0.300$ & $351\%$ & $35\%$ & $14.94$ \\
 \bottomrule
 \end{tabular}
