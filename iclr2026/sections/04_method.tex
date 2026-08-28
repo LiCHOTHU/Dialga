@@ -46,9 +46,10 @@ Nothing above forces $\zs$ to hold anything. $\zd$ is paid once per frame, so it
 naturally the larger code, and a decoder that may read both freely will simply use it
 for the whole scene. This is not a tendency but a measured fact. In a model trained
 exactly as described, \textbf{deleting $\zs$ raises reconstruction error by only
-$11\%$, while deleting $\zd$ raises it by $714\%$}. Decoding from $\zs$ alone gives
-$24.90$\,dB --- and giving $\zs$ eight times the rate changes that to $24.89$\,dB,
-leaving $76\%$ of its dimensions unused. The static code is not merely weak; it is
+$11\%$, while deleting $\zd$ raises it by $714\%$} (three seeds; $\pm2$ and $\pm47$).
+Decoding from $\zs$ alone gives $24.90$\,dB; giving it eight times the rate \emph{and}
+full $8\times8$ resolution changes that to $24.89$\,dB, leaving $76\%$ of its
+dimensions unused. The static code is not merely weak; it is
 close to decorative, and more capacity does not help because the model has no reason to
 use it.
 
@@ -63,10 +64,10 @@ it says nothing about $\zs$ being \emph{useful}.
 
 The measurements bear this out. In the model above the penalty is essentially fully
 satisfied ($3.7\times10^{-3}$ mean squared cross-correlation) while $\zs$ holds almost
-nothing. Across models whose actual code overlap ranges from $0.32$ to $0.51$ (kernel
-CKA), the penalty reads $0.0028$--$0.0053$ --- it does not order them, and where it does
-it orders them backwards. Removing it entirely \emph{improves} reconstruction by $21\%$
-at no measurable cost to attribute readout. We therefore drop it, and report code
+nothing. Across models whose actual code overlap ranges from $0.32$ to $0.40$ (kernel
+CKA \citep{cka}), the penalty reads $0.0028$--$0.0051$ --- it does not order them, and
+where it does it orders them backwards. Removing it entirely \emph{improves}
+reconstruction by $22\%$ ($0.0103\!\to\!0.0081$) for $0.004$ mAP. We therefore drop it, and report code
 overlap with CKA rather than with the quantity we optimise.
 
 \subsection{Making the split structural}
