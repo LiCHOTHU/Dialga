@@ -263,61 +263,78 @@ far more data. The properly-fit ceiling is $13.70\%$, so the gap to fully-superv
 video encoders is smaller than we claimed, and the ``input-capped'' argument should not
 be relied on.
 
-\subsection{Q4b: Reading actions --- the asymmetry is produced by training}
+\subsection{Q4b: A double dissociation between the two codes}
 \label{sec:libero}
-SSv2 action classes are coarse. LIBERO gives a continuous, physically-grounded target:
-the $6$-DoF end-effector command and the binary gripper state. We make the target
-\emph{window-local} --- for the chunk spanning frames $[s,s{+}W)$ the label is the action
-commanded over exactly those frames --- which is what sharpens the test. There is a
-single $\zs$ for the whole demonstration, so it cannot know \emph{which} window it is
-being asked about; if it still matched $\zd$, the codes would not be split. Whole tasks
-are held out ($15$ of $90$), so no probe sees its test task's action statistics.
+This is the experiment that tests the decomposition directly. Every result so far shows
+one code doing well at one thing, which is also what a code that is merely bigger, or
+merely better trained, produces. A decomposition makes a stronger, two-sided prediction:
+each code should win on the factor it owns \emph{and lose on the other}. LIBERO supplies
+both factors over identical inputs --- the $6$-DoF end-effector command commanded over a
+window (motion, $\zd$'s factor) and which of $20$ scenes the demonstration takes place in
+(static, $\zs$'s factor). Neither probe sees the other's target.
+
+The action target is \emph{window-local}: for the chunk spanning frames $[s,s{+}W)$ the
+label is the action commanded over exactly those frames. There is a single $\zs$ per
+demonstration, so it cannot know which window it is being asked about. Whole tasks are
+held out ($15$ of $90$), and the scene is scored only on scenes that appear in training.
 
 \begin{table}[t]
 \centering\small
-\caption{\textbf{Q4b --- LIBERO action read-out}, $4{,}499$ demonstrations, $14{,}996$
-train / $3{,}000$ held-out windows over $15$ unseen tasks; three seeds. Ridge for the
-$6$ continuous DoF ($R^2$ against the train mean), logistic for the gripper (base rate
-$0.393$). \emph{random} is the committed architecture untrained. Two controls: untrained, the static
-code reads actions \emph{better} than the dynamics code and training reverses the
-ordering, so the asymmetry is produced by the objective rather than by the architecture
-or the codes' differing widths; and the entangled encoder, which cannot route the factors
-apart, produces a gap of $0.061$ against our $0.177$.}
+\caption{\textbf{Q4b --- double dissociation on LIBERO}, $4{,}499$ demonstrations,
+$14{,}996$ train / $3{,}000$ held-out windows over $15$ unseen tasks; three seeds for
+\method{}. Ridge for the action ($R^2$), logistic for scene ($20$ classes,
+majority-class $0.067$) and gripper (base rate $0.393$). \textbf{The result is the
+crossover}: $\zd$ reads actions better than $\zs$ and scenes \emph{worse}. Both controls
+fail to reproduce it --- untrained, the action ordering inverts; entangled, both gaps
+shrink about threefold.}
 \label{tab:libero}
 \begin{tabular}{llccc}
 \toprule
-Model & Feature & Floats & $R^2$ $\uparrow$ & Gripper acc.\ $\uparrow$ \\
+Model & Feature & Floats & Action $R^2$ $\uparrow$ & Scene acc.\ $\uparrow$ \\
 \midrule
 \multirow{4}{*}{\method{}}
- & $\zs$                      & 576 & $0.485${\tiny$\pm.027$} & $0.785${\tiny$\pm.018$} \\
- & $\zd$ (full temporal)      & 320 & $\mathbf{0.662}${\tiny$\pm.009$} & $0.770${\tiny$\pm.005$} \\
- & $\zd$ (time-pooled)        & 64  & $0.540${\tiny$\pm.032$} & $0.751${\tiny$\pm.013$} \\
- & $\zs + \zd$                & 896 & $0.666${\tiny$\pm.005$} & $\mathbf{0.805}${\tiny$\pm.008$} \\
+ & $\zs$                 & 576 & $0.485${\tiny$\pm.027$} & $\mathbf{0.976}${\tiny$\pm.005$} \\
+ & $\zd$ (full temporal) & 320 & $\mathbf{0.662}${\tiny$\pm.009$} & $0.924${\tiny$\pm.005$} \\
+ & $\zd$ (time-pooled)   & 64  & $0.540${\tiny$\pm.032$} & $0.862${\tiny$\pm.025$} \\
+ & $\zs + \zd$           & 896 & $0.666${\tiny$\pm.005$} & $0.959${\tiny$\pm.003$} \\
+\cmidrule(l){2-5}
+ & \emph{dissociation} $\zd-\zs$ & & $\mathbf{+0.177}$ & $\mathbf{-0.052}$ \\
 \midrule
-\multirow{2}{*}{entangled}
- & $\zs$                      & 576 & $0.503$ & $0.789$ \\
- & $\zd$ (full temporal)      & 320 & $0.564$ & $0.767$ \\
+\multirow{3}{*}{Entangled}
+ & $\zs$                 & 576 & $0.503$ & $0.976$ \\
+ & $\zd$ (full temporal) & 320 & $0.564$ & $0.956$ \\
+\cmidrule(l){2-5}
+ & \emph{dissociation} $\zd-\zs$ & & $+0.061$ & $-0.020$ \\
 \midrule
-\multirow{2}{*}{random init}
- & $\zs$                      & 576 & $0.525$ & $0.760$ \\
- & $\zd$ (full temporal)      & 320 & $0.298$ & $0.719$ \\
+\multirow{3}{*}{Random init}
+ & $\zs$                 & 576 & $0.508$ & $0.974$ \\
+ & $\zd$ (full temporal) & 320 & $0.286$ & $0.969$ \\
+\cmidrule(l){2-5}
+ & \emph{dissociation} $\zd-\zs$ & & $-0.222$ & $-0.005$ \\
 \midrule
-Reference & raw Wan latent, mean-pooled & 48 & $0.591$ & $0.745$ \\
+Reference & raw Wan latent, mean-pooled & 48 & $0.591$ & $0.916$ \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-Trained, $\zd$ reads actions at $R^2\,0.662$ against $\zs$'s $0.485$ --- a gap of
-$0.177$, against the entangled control's $0.061$ ($0.564$ vs $0.503$) --- and adding
-$\zs$ to $\zd$ moves the result by $0.004$ --- the static code contributes essentially nothing
-to a motion target, which is the intended behaviour. Time-pooling $\zd$ costs $0.12$
-$R^2$, confirming that the signal lives in its time axis and that pooling it, as the
-probes in \cref{tab:ssv2} do, understates it. Two honest qualifications. The gripper
-runs the other way: $\zs$ reads it at $0.785$ against $\zd$'s $0.770$, which is
-consistent with grasp state being visible as scene appearance rather than as motion. And
-the mean-pooled raw latent reaches $R^2\,0.591$ at $48$ floats, above our static code and
-below our dynamics code; on this task the factorized codes bracket the trivial baseline
-rather than dominating it.
+The crossover holds in both directions and on every seed: $\zd$ is $+0.177$ $R^2$ above
+$\zs$ on the motion factor and $0.052$ \emph{below} it on the static factor. This is the
+claim the rest of the paper could not make. A larger or better-trained code improves at
+everything; only a code that has been relieved of appearance gets worse at naming the
+scene while getting better at reading the motion. The controls confirm the reading. The
+untrained network inverts the action ordering ($-0.222$) and shows no scene gap
+($-0.005$), so neither the architecture nor the codes' differing widths produces the
+effect. The entangled encoder --- same configuration, same data, one shared trunk ---
+preserves the sign but shrinks both gaps by roughly threefold, which is what a network
+that cannot route the factors apart should do.
+
+Two qualifications. The scene margin is small in absolute terms ($0.976$ vs $0.924$)
+because the task is easy: a $48$-float mean-pool of the raw latent already reaches
+$0.916$, so the static factor is largely recoverable from the substrate and $\zs$'s
+advantage over $\zd$ is the informative quantity rather than its absolute accuracy. And
+adding $\zs$ to $\zd$ moves action $R^2$ by $0.004$ while recovering scene accuracy to
+$0.959$ --- the pair is jointly sufficient for both factors, which is the property we
+asked for, but the two codes are not equally load-bearing on either one.
 
 \subsection{Q5: The dynamics code must be spatial (moving camera)}
 \label{sec:droid}

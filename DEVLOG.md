@@ -1648,3 +1648,31 @@ the cache instead of assuming CLEVRER, and added `--seed` + `--feat_cache` to
 **Note.** No CLEVRER checkpoint matching the committed config still exists on disk (133
 CLEVRER checkpoints, none basedelta at the committed rate), so tab:matched cannot be
 given seed error bars without retraining. Left as-is with its single-seed caveat.
+
+## v6.6 — LIBERO double dissociation (2026-08-28)
+
+The LIBERO table showed z_dyn > z_static on actions, which a code that is merely bigger
+or merely better trained also produces. Added the second direction so the experiment
+actually tests the decomposition: LIBERO carries both factors over identical inputs —
+the window-local 6-DoF command (motion) and which of 20 scenes the demo is in (static).
+
+| | action R² | scene acc |
+|---|---|---|
+| z_static (576) | 0.485±.027 | **0.976±.005** |
+| z_dyn (320) | **0.662±.009** | 0.924±.005 |
+| dissociation z_dyn − z_static | **+0.177** | **−0.052** |
+| entangled | +0.061 | −0.020 |
+| random init | −0.222 | −0.005 |
+
+z_dyn reads motion better and scenes worse, on every seed. Untrained inverts the action
+ordering and shows no scene gap, so neither the architecture nor the codes' differing
+widths (576 vs 320) produces it. The entangled shared-trunk control keeps the sign but
+shrinks both gaps ~3x.
+
+Caveat kept in the paper: the scene task is easy — a 48-float mean-pool of the raw latent
+scores 0.916 — so z_static's *margin over z_dyn* is the informative quantity, not its
+absolute 0.976.
+
+Scene labels come from the LIBERO task template (KITCHEN_SCENE10_... -> KITCHEN_SCENE10),
+20 scenes over 90 tasks. Scene is scored only on scenes present in probe training, since a
+held-out task whose scene never appears is unpredictable by construction.

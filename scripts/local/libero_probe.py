@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -39,6 +40,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.data.ssv2_sequence import SSv2Sequence                   # noqa: E402
 from scripts.local.eval_psnr import build                          # noqa: E402
 from src.model.memory_encoder import MemoryEncoder                 # noqa: E402
+
+
+def load_scenes(split_json):
+    """video_id -> scene id. The scene is the STATIC target for the dissociation: it is a
+    property of the environment that holds for the whole demo and is unchanged by what the
+    arm does, so a correctly split z_static should read it and z_dyn should not."""
+    rows = json.loads(Path(split_json).read_text())
+    names, out = {}, {}
+    for r in rows:
+        m = re.match(r"([A-Z_]*SCENE\d+)", r["template"])
+        nm = m.group(1) if m else "NA"
+        out[int(r["id"])] = names.setdefault(nm, len(names))
+    return out, {v: k for k, v in names.items()}
 
 
 def load_actions(split_json, act_root):
@@ -53,9 +67,9 @@ def load_actions(split_json, act_root):
 
 
 @torch.no_grad()
-def features(enc, loader, dev, acts, W):
+def features(enc, loader, dev, acts, W, scenes):
     """One row per (demo, chunk); z_dyn keeps its time axis."""
-    ZS, ZD, ZDP, WM, A, G, TASK = [], [], [], [], [], [], []
+    ZS, ZD, ZDP, WM, A, G, TASK, SC = [], [], [], [], [], [], [], []
     for b in loader:
         seq = b["latents"].to(dev)
         g, z, _ = enc(seq)
@@ -69,6 +83,7 @@ def features(enc, loader, dev, acts, W):
                     continue
                 w = a[s: s + W]
                 A.append(w[:, :6].mean(0)); G.append(int(w[:, 6].mean() > 0))
+                SC.append(scenes.get(int(vid), -1))
                 keep.append(n)
             if not keep:
                 continue
@@ -79,7 +94,8 @@ def features(enc, loader, dev, acts, W):
             WM.append(seq[kp, k].mean(dim=(2, 3, 4)).cpu())
             TASK.extend([b["label_id"][n].item() for n in keep])
     return (torch.cat(ZS).numpy(), torch.cat(ZD).numpy(), torch.cat(ZDP).numpy(),
-            torch.cat(WM).numpy(), np.stack(A), np.array(G), np.array(TASK))
+            torch.cat(WM).numpy(), np.stack(A), np.array(G), np.array(TASK),
+            np.array(SC))
 
 
 def probe(Xtr, Xte, Atr, Ate, Gtr, Gte):
@@ -97,6 +113,17 @@ def probe(Xtr, Xte, Atr, Ate, Gtr, Gte):
     else:
         acc = float("nan")
     return mse, r2, acc
+
+
+def scene_probe(Xtr, Xte, Str, Ste):
+    """Accuracy on the STATIC target, plus the majority-class rate for reference."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    sc = StandardScaler().fit(Xtr)
+    m = LogisticRegression(max_iter=1000).fit(sc.transform(Xtr), Str)
+    acc = float((m.predict(sc.transform(Xte)) == Ste).mean())
+    maj = float((Ste == np.bincount(Str).argmax()).mean())
+    return acc, maj
 
 
 def main():
@@ -139,7 +166,8 @@ def main():
                 print("[warn] entangled ckpt shape mismatch; using random init", flush=True)
         enc.eval()
 
-    ZS, ZD, ZDP, WM, A, G, TASK = features(enc, dl, dev, acts, W)
+    scenes, scene_names = load_scenes(args.split_json)
+    ZS, ZD, ZDP, WM, A, G, TASK, SC = features(enc, dl, dev, acts, W, scenes)
     tasks = np.unique(TASK)
     # Cap the holdout at a third of the tasks: with few distinct tasks an unclamped
     # request empties the probe's training set instead of holding anything out.
@@ -153,18 +181,33 @@ def main():
           f"({n_hold} unseen tasks of {len(tasks)}); gripper base rate "
           f"{G[te].mean():.3f}\n", flush=True)
 
+    # A held-out task whose scene never appears in training is unpredictable by
+    # construction; score the static target only on scenes the probe has seen.
+    seen = set(np.unique(SC[tr]).tolist())
+    sm = np.array([s in seen for s in SC])
+    te_s = te & sm
+    print(f"[scene] {len(seen)} scenes seen in train; scoring {te_s.sum()} of "
+          f"{te.sum()} held-out windows\n", flush=True)
+
     res = {}
-    print(f"{'feature':<24}{'dim':>6}{'6DoF-MSE':>11}{'R2':>8}{'gripper':>10}")
-    print('-' * 60)
+    print(f"{'feature':<24}{'dim':>6}{'ACTION R2':>11}{'SCENE acc':>11}{'gripper':>9}")
+    print('-' * 62)
     rows = (("z_static", ZS), ("z_dyn (full temporal)", ZD), ("z_dyn (time-pooled)", ZDP),
             ("z_static+z_dyn", np.concatenate([ZS, ZD], 1)), ("raw latent mean-pool", WM))
+    maj = None
     for nm, X in rows:
         m, r2, acc = probe(X[tr], X[te], A[tr], A[te], G[tr], G[te])
-        res[nm] = {"mse_6dof": m, "r2": r2, "gripper_acc": acc, "dim": int(X.shape[1])}
-        print(f"{nm:<24}{X.shape[1]:>6}{m:>11.5f}{r2:>8.3f}{acc:>10.3f}", flush=True)
+        sacc, maj = scene_probe(X[tr], X[te_s], SC[tr], SC[te_s])
+        res[nm] = {"mse_6dof": m, "r2": r2, "gripper_acc": acc,
+                   "scene_acc": sacc, "dim": int(X.shape[1])}
+        print(f"{nm:<24}{X.shape[1]:>6}{r2:>11.3f}{sacc:>11.3f}{acc:>9.3f}", flush=True)
+    res["_scene_majority"] = maj
+    res["_n_scenes"] = len(seen)
     Path(args.out).write_text(json.dumps({args.label: res}, indent=2))
-    print("\nA working split predicts z_dyn below z_static on 6DoF-MSE: the action is "
-          "\nmotion, and z_static cannot even tell which window it is being asked about.")
+    print(f"\n(scene majority-class baseline {maj:.3f}, {len(seen)} scenes)")
+    print("\nDOUBLE DISSOCIATION: a real split needs z_dyn ABOVE z_static on the action"
+          "\ntarget AND BELOW it on the scene target. One direction alone is also produced"
+          "\nby a code that is merely bigger or merely better trained.")
     print("LIBERO_PROBE_OK")
 
 
