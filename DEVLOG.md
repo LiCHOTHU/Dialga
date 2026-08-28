@@ -1553,3 +1553,56 @@ not verify it.
 Seeds for the matched-protocol table (top three rows within 0.0003 latent MSE) and for
 the loss-term ablations; the DROID numbers are reported from the prior model version and
 were not re-run.
+
+## v6.4 — SSv2 reconstruction + LIBERO action tables (2026-08-28)
+
+Re-ran the headline experiments for the committed base+delta model on real video.
+
+**New code.** `scripts/local/ssv2_decode_baselines.py` runs the matched decode protocol on
+SSv2 (the previous script was CLEVRER-only: it took ground truth from `ClevrerPairedDataset`
+and could not read SSv2's `.webm`). Ground truth is now the *source* clip at the cached
+`start_frame`, not the VAE's own round trip, so substrate loss and code loss are separable.
+Added a `vae` row that skips the head entirely and decodes the true latent.
+
+**Table Q3b (SSv2 reconstruction, 600 val windows, 96 to pixels).**
+
+| representation | floats | latent MSE | PSNR |
+|---|---|---|---|
+| frozen VAE alone, no head | — | — | 15.66 |
+| full Wan latent (protocol ceiling) | 15360 | 0.1357 | 15.48 |
+| **DIALGA** | **896** | **0.1362** | **15.11** |
+| VideoFlexTok | 1152 | 0.2097 | 13.67 |
+| Wan latent, mean-pooled | 48 | 0.2011 | 13.65 |
+| VideoMAE (pooled) | 768 | 0.2206 | 13.40 |
+| DINOv2 (pooled) | 768 | 0.3096 | 11.80 |
+
+The margin absent on CLEVRER is present here: +1.44 dB over VideoFlexTok, within 0.0005
+latent MSE of the full latent at 17.1x fewer floats. I initially read the low absolute
+numbers as the 384-wide head bottlenecking the protocol; the no-head row disproves that —
+the head costs only 0.18 dB, and the frozen VAE itself tops out at 15.66 dB on handheld
+128^2 video. Diagnostic row worth keeping: mean-pooling the raw latent to 48 floats beats
+VideoMAE, so the pooled SSL features retain little a channel mean does not.
+
+**Table Q4b (LIBERO actions).** Two bugs found and fixed in `libero_probe.py` before it
+produced anything trustworthy:
+1. It regressed all 7 action dims continuously, but dim 6 is a *binary* gripper (±1);
+   and its demo-level gripper label was near-constant (100/400 demos never open), giving
+   0.039 "accuracy" on every row.
+2. Target and `z_dyn` were both pooled over the whole demo — pooling away exactly the
+   temporal signal actions are made of. Targets are now **window-local** (the action
+   commanded over that chunk's own frames), and `z_dyn` keeps its time axis.
+Also fixed a degenerate held-out split that emptied the probe's training set.
+
+Result (3 seeds, 15 of 90 tasks held out): z_dyn R² 0.662±.009 vs z_static 0.485±.027;
+z_static adds 0.004 on top of z_dyn. The control is the point — **untrained**, the
+ordering is *reversed* (z_static 0.525, z_dyn 0.298), so the asymmetry is produced by the
+objective, not by the architecture or the codes' differing widths. Time-pooling z_dyn
+costs 0.12 R², so the pooled probes in Table Q4 understate it. Counter-results kept in
+the paper: the gripper reads better from z_static (0.785 vs 0.770), and the mean-pooled
+raw latent (0.591) sits between our two codes.
+
+**Still open.** Entangled shared-trunk control training on SSv2 (needed for the LIBERO
+control row and CKA); no SSv2 entangled checkpoint existed. The CLEVRER OOD shortcut probe
+remains unusable — neither code linearly encodes CLEVRER motion (fast-vs-slow 0.497/0.530
+at chance 0.50), which also invalidates the prior "position R² 0.74 from z_dyn" claim for
+this model.

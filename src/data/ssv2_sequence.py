@@ -67,6 +67,7 @@ class SSv2Sequence(Dataset):
             label = int(b.get("label_id", -1))
         return {"latents": torch.stack(lat),
                 "label_id": torch.tensor(label),
+                "start_frames": torch.tensor([int(sf) for sf, _ in ws]),
                 "video_id": torch.tensor(vid)}
 
 

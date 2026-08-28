@@ -142,6 +142,49 @@ $0.0327$--$0.0330$ latent MSE, these are single-seed, and VideoFlexTok is a gene
 tokenizer normally judged by rFVD. The supported claim is \emph{parity at matched rate},
 not a win.
 
+CLEVRER is synthetic and its scenes are near-identical across clips, so we repeat the
+protocol unchanged on real video. Ground truth here is the \emph{source} clip rather
+than the VAE's own round trip, which lets us separate two different losses: what the
+frozen substrate costs, and what our code costs on top of it.
+
+\begin{table}[t]
+\centering\small
+\caption{\textbf{Q3b --- matched-protocol reconstruction on real video} (SSv2 val, $600$
+held-out windows, $96$ decoded to pixels; frozen representation $\to$ equal-capacity head
+$\to$ Wan latent $\to$ pixels, scored against the source frames). The first row uses no
+head at all: it decodes the true latent, and so measures the frozen VAE alone. It sits
+only $0.18$\,dB above the full-latent row, which establishes that the shared head is
+\emph{not} the binding constraint --- on real video at $128^2$ the substrate is. As in
+\cref{tab:matched}, VideoMAE and DINOv2 are mean-pooled.}
+\label{tab:ssv2recon}
+\begin{tabular}{lcccc}
+\toprule
+Representation & Floats & Compression & Latent MSE $\downarrow$ & PSNR $\uparrow$ \\
+\midrule
+Frozen VAE alone, no head (substrate) & --- & --- & --- & 15.66 \\
+Full Wan latent (protocol ceiling) & 15360 & $1.0\times$ & 0.1357 & 15.48 \\
+\midrule
+\textbf{\method{}} & \textbf{896} & $\mathbf{17.1\times}$ & \textbf{0.1362} & \textbf{15.11} \\
+VideoFlexTok \citep{videoflextok} & 1152 & $13.3\times$ & 0.2097 & 13.67 \\
+Wan latent, mean-pooled & 48 & $320\times$ & 0.2011 & 13.65 \\
+VideoMAE \citep{videomae} (pooled) & 768 & $20.0\times$ & 0.2206 & 13.40 \\
+DINOv2 \citep{dinov2} (pooled) & 768 & $20.0\times$ & 0.3096 & 11.80 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The margin that was absent on CLEVRER is present here. \method{} lands within $0.0005$
+latent MSE of the full latent while using $17.1\times$ fewer floats, and reconstructs
+$1.44$\,dB above VideoFlexTok, $1.71$\,dB above VideoMAE and $3.31$\,dB above DINOv2 ---
+gaps far outside the $0.0003$ spread that made the CLEVRER ordering unresolvable. Two
+caveats belong with it. The absolute numbers are low because the frozen VAE tops out at
+$15.66$\,dB on handheld $128^2$ video, so every row is compressed into a $3.9$\,dB band
+beneath a hard ceiling; and one baseline row is diagnostic rather than competitive ---
+mean-pooling the raw latent to $48$ floats reconstructs as well as VideoFlexTok and
+better than VideoMAE, which says that on this substrate the pooled self-supervised
+features retain little that a channel mean does not already carry. These are
+single-seed.
+
 \subsection{Q4: Does it transfer to real video at scale?}
 \label{sec:q4}
 We train the same configuration on all of SSv2 ($163{,}717$ clips) and probe the frozen
@@ -176,6 +219,56 @@ on an $8$k-clip subset and was underfit; a linear probe on $15{,}360$ dimensions
 far more data. The properly-fit ceiling is $13.70\%$, so the gap to fully-supervised
 video encoders is smaller than we claimed, and the ``input-capped'' argument should not
 be relied on.
+
+\subsection{Q4b: Reading actions --- the asymmetry is produced by training}
+\label{sec:libero}
+SSv2 action classes are coarse. LIBERO gives a continuous, physically-grounded target:
+the $6$-DoF end-effector command and the binary gripper state. We make the target
+\emph{window-local} --- for the chunk spanning frames $[s,s{+}W)$ the label is the action
+commanded over exactly those frames --- which is what sharpens the test. There is a
+single $\zs$ for the whole demonstration, so it cannot know \emph{which} window it is
+being asked about; if it still matched $\zd$, the codes would not be split. Whole tasks
+are held out ($15$ of $90$), so no probe sees its test task's action statistics.
+
+\begin{table}[t]
+\centering\small
+\caption{\textbf{Q4b --- LIBERO action read-out}, $4{,}499$ demonstrations, $14{,}996$
+train / $3{,}000$ held-out windows over $15$ unseen tasks; three seeds. Ridge for the
+$6$ continuous DoF ($R^2$ against the train mean), logistic for the gripper (base rate
+$0.393$). \emph{random} is the committed architecture untrained. It is the row that
+matters: untrained, the static code reads actions \emph{better} than the dynamics code,
+and training reverses the ordering. The asymmetry is therefore produced by the
+objective, not by the architecture or by the codes' differing widths.}
+\label{tab:libero}
+\begin{tabular}{llccc}
+\toprule
+Model & Feature & Floats & $R^2$ $\uparrow$ & Gripper acc.\ $\uparrow$ \\
+\midrule
+\multirow{4}{*}{\method{}}
+ & $\zs$                      & 576 & $0.485${\tiny$\pm.027$} & $0.785${\tiny$\pm.018$} \\
+ & $\zd$ (full temporal)      & 320 & $\mathbf{0.662}${\tiny$\pm.009$} & $0.770${\tiny$\pm.005$} \\
+ & $\zd$ (time-pooled)        & 64  & $0.540${\tiny$\pm.032$} & $0.751${\tiny$\pm.013$} \\
+ & $\zs + \zd$                & 896 & $0.666${\tiny$\pm.005$} & $\mathbf{0.805}${\tiny$\pm.008$} \\
+\midrule
+\multirow{2}{*}{random init}
+ & $\zs$                      & 576 & $0.525$ & $0.760$ \\
+ & $\zd$ (full temporal)      & 320 & $0.298$ & $0.719$ \\
+\midrule
+Reference & raw Wan latent, mean-pooled & 48 & $0.591$ & $0.745$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Trained, $\zd$ reads actions at $R^2\,0.662$ against $\zs$'s $0.485$, and adding $\zs$
+to $\zd$ moves the result by $0.004$ --- the static code contributes essentially nothing
+to a motion target, which is the intended behaviour. Time-pooling $\zd$ costs $0.12$
+$R^2$, confirming that the signal lives in its time axis and that pooling it, as the
+probes in \cref{tab:ssv2} do, understates it. Two honest qualifications. The gripper
+runs the other way: $\zs$ reads it at $0.785$ against $\zd$'s $0.770$, which is
+consistent with grasp state being visible as scene appearance rather than as motion. And
+the mean-pooled raw latent reaches $R^2\,0.591$ at $48$ floats, above our static code and
+below our dynamics code; on this task the factorized codes bracket the trivial baseline
+rather than dominating it.
 
 \subsection{Q5: The dynamics code must be spatial (moving camera)}
 \label{sec:droid}
