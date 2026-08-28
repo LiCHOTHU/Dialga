@@ -11,7 +11,7 @@ for s in 0 1 2; do
   python -u scripts/probes/clevrer_decode_baselines.py \
     --ckpt outputs/FINAL_CLEVRER_s$s/ckpt.pt \
     --cache_dir outputs/cache/clevrer_W33_10k \
-    --video_root datasets/CLEVRER \
+    --video_root datasets/CLEVRER/train_video \
     --methods ours videoflextok videomae dinov2 wanflat \
     --seed $s --pixel \
     --out outputs/logs/clevrer_matched_s$s.json || echo "!!! seed $s failed rc=$?"
