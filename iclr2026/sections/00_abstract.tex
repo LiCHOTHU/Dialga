@@ -1,24 +1,20 @@
-% Keep to one paragraph, ~210 words. Refresh numbers when final endpoints land.
-Powerful pretrained video VAEs compress video into rich but \emph{entangled}
-latents: object identity, object motion, and camera motion are fused into one code
-that cannot be read, edited, or predicted factor by factor. Recovering such
-structure normally means training a new VAE from scratch. We present \method{}, a
-lightweight adapter that re-encodes the latent of \emph{any frozen} video VAE into
-named, independently accessible slots --- a spatial static code (identity), a
-per-frame spatial dynamics code (object motion), and a camera code --- with a
-decoder structurally prevented from mixing them, and \emph{no} VAE retraining.
-Carrying this factorization to real moving-camera robot video exposed a general
-failure: a \emph{global} per-frame dynamics vector reconstructs real textured video
-$17$\,dB below the frozen-VAE ceiling, because the decoder can only broadcast it
-uniformly across space. Giving the dynamics code a spatial axis raises held-out
-reconstruction by $+4.4$\,dB, which a matched-rate ablation attributes to spatial
-\emph{structure} ($+2.7$\,dB) rather than added rate ($+0.6$\,dB). We show the code
-is cleanly \emph{disentangled} (a diagonal-dominant cross-probe), controllable
-(identity/motion swap), and camera-aware (a known-pose path for viewpoint stability
-that entangled and camera-blind baselines lack), and that its dynamics code
-transfers to robot action read-out. We are explicit about what \method{} is
-\emph{not}: at extreme compression it does not beat foundation encoders on semantic
-accuracy or classical codecs on rate--distortion --- we report both. Its
-contribution is a cheap, camera-aware \emph{disentanglement} of frozen video-VAE
-latents that entangled predictive VAEs and camera-blind decomposition VAEs do not
-provide.
+% ~215 words. Numbers: [3 seeds] CLEVRER 24x + full-SSv2 (163,717 clips); matched-
+% protocol baseline table in sec:experiments. See DEVLOG v6.2 for provenance.
+Video VAEs compress video into a rich but \emph{entangled} latent: what a scene
+contains and how it moves are fused into one code. Splitting them normally means
+training a new VAE. We present \method{}, a small adapter that re-encodes the latent
+of a \emph{frozen} video VAE into two codes --- a static code for the scene and a
+per-frame dynamics code --- and we find that the split is won or lost in the
+\emph{decoder}, not in the loss. Given a decoder that may read both codes freely, the
+dynamics code simply absorbs everything: deleting the static code costs only $11\%$
+reconstruction, and an independence penalty does not help, because it is satisfied
+perfectly by a static code carrying \emph{noise}. We instead make the split
+structural. The decoder reconstructs each frame as a static image plus a
+\emph{zero-mean} per-frame residual, so the time-constant part of the output can only
+come from the static code. Deleting that code now costs $484\%$. Freed of redundancy,
+the same model runs at $24\times$ compression --- half the rate of our prior design ---
+where it matches VideoFlexTok and VideoMAE on reconstruction under a matched protocol
+while carrying a factorization neither expresses. On $163{,}717$ Something-Something-v2
+clips the dynamics code reads actions at $10.3\%$ against the static code's $6.1\%$.
+We report the costs plainly: absolute fidelity drops $2.3$\,dB, and semantic accuracy
+is capped by the frozen latent, not by our encoder.
