@@ -1,71 +1,68 @@
-% Citation map: keys in iclr2026_conference.bib. VERIFY every arXiv id / venue
-% before submission (several reconstructed from memory; the uncertain ones are
-% marked VERIFY inside the .bib).
+% Citation map: keys in iclr2026_conference.bib. VERIFY every arXiv id / venue before
+% submission; entries added in this revision (divid, decovae, mem4d, cka) are marked.
+
+\paragraph{Factorized and disentangled video.}
+A long line of sequential VAEs splits video into a time-invariant content code and a
+per-frame motion code: DSVAE \citep{dsvae}, S3VAE \citep{s3vae}, C-DSVAE \citep{cdsvae},
+MoCoGAN \citep{mocogan}; VidTwin \citep{vidtwin} carries this into a modern video VAE
+with separate structure and dynamics latents, and DeCo-VAE \citep{decovae} decomposes
+into keyframe, motion and residual with dedicated encoders and a shared 3D decoder.
+DiViD \citep{divid} moves the idea to diffusion, extracting a global static token from
+the first frame and per-frame dynamics as \emph{residuals} against it. Two properties
+are near-universal in this family and matter here. First, every method obtains its
+factorization by \emph{training a generative model from scratch}, where we adapt a
+frozen VAE. Second, and more consequentially, they enforce the split with an
+\emph{independence-style objective} --- an orthogonality penalty in DiViD, mutual-
+information or adversarial terms elsewhere. Our central negative result
+(\cref{sec:indep}) is that such penalties are satisfied by a static code carrying pure
+noise, and that in our setting the penalty is fully satisfied by a model whose static
+code is nearly unused. We enforce the split in the decoder instead.
+
+\paragraph{Evaluating disentanglement.}
+This literature evaluates by cross-leakage probes and by swap accuracy: encode two
+clips, cross their codes, and check which donor the hybrid resembles \citep{s3vae,
+cdsvae,divid}. We report in \cref{sec:q2} that an encoder with a \emph{shared} trunk ---
+one that cannot route the factors apart --- passes the swap test as well as ours, at two
+different rates. The test measures the decoder's routing rather than the encoder's
+split. We therefore report code overlap with kernel CKA \citep{cka}, which does separate
+the two, and recommend the shared-trunk control accompany any swap result.
 
 \paragraph{Self-supervised video representation.}
 Masked and predictive video encoders --- VideoMAE \citep{videomae}, V-JEPA
-\citep{vjepa}, and image-level DINOv2 \citep{dinov2} --- learn strong transferable
-features that are evaluated by frozen-feature probes (linear, attentive-pool,
-$k$-NN) and label efficiency on Kinetics and Something-Something. They produce a
-single unstructured feature grid and are trained on human-action video; they do
-not expose a named identity/dynamics/event factorization, nor are they aimed at
-object-physics or robot data. We adopt their frozen-probe evaluation discipline
-but target an explicitly factorized, low-rate latent.
-
-\paragraph{Factorized and disentangled video.}
-A line of sequential VAEs splits video into a time-invariant content code and a
-per-frame motion code: DSVAE \citep{dsvae}, S3VAE \citep{s3vae}, C-DSVAE
-\citep{cdsvae}, MoCoGAN \citep{mocogan}; VidTwin \citep{vidtwin} carries this into
-a modern video VAE with separate structure and dynamics latents, and object-centric
-SlotFormer \citep{slotformer} validates its factorization by downstream physical
-reasoning. Three properties are near-universal in this family and matter for us: the
-disentanglement is demonstrated almost only on synthetic or narrow data, the
-\emph{motion} code is a global per-frame vector, and --- most importantly --- each
-method obtains its factorization by \emph{training a VAE from scratch}. Our analysis
-explains why the global motion code caps real-video reconstruction; our
-spatial-dynamics code is the fix, and unlike this literature we demonstrate the split
-on \emph{real} moving-camera video and, crucially, \emph{on top of an already-trained
-frozen video VAE} rather than by training a new one.
+\citep{vjepa}, image-level DINOv2 \citep{dinov2} --- learn strong transferable features
+evaluated by frozen-feature probes. They produce a single unstructured feature grid and
+expose no named factorization. We adopt their frozen-probe discipline, and compare
+against them under a matched decode protocol (\cref{sec:q3}); we note there that their
+commonly-quoted compression figures are a property of the mean-pooling applied by the
+probe, since their native token grids are larger than the VAE latent itself.
 
 \paragraph{Video tokenizers and world models.}
-Tokenizers --- MAGVIT-v2 \citep{magvitv2}, Cosmos \citep{cosmos}, PVDM
-\citep{pvdm} --- and latent world models --- DreamerV3 \citep{dreamerv3}, TD-MPC2
-\citep{tdmpc2}, iVideoGPT \citep{ivideogpt}, Genie \citep{genie} --- all keep a
-per-frame \emph{spatial} token grid and are judged by generation quality
-(FVD/PSNR) and, for world models, by planning return and sample efficiency. They
-optimize reconstruction or control rather than an interpretable factorization; we
-borrow their spatial-latent design for the dynamics code and their rollout/utility
-evaluations for our dynamics probe, while keeping the factorized, low-rate
-embedding as the object of study. Most directly related, PV-VAE \citep{pvvae}
-enriches a video VAE's latent with a \emph{predictive} reconstruction objective and
-reports improved motion-awareness and downstream understanding --- but its latent
-stays a single \emph{entangled} code and, like the tokenizers above, it is obtained
-by \emph{training the VAE}. We share the predictive ingredient (our
-forward-prediction term) yet differ on both axes that matter here: we \emph{factorize}
-the latent into named, controllable slots, and we do so on a \emph{frozen} VAE
-without retraining it.
+Tokenizers --- MAGVIT-v2 \citep{magvitv2}, Cosmos \citep{cosmos}, PVDM \citep{pvdm},
+VideoFlexTok \citep{videoflextok} --- and latent world models \citep{dreamerv3,tdmpc2,
+ivideogpt,genie} keep a per-frame spatial token grid and are judged by generation
+quality and planning return rather than by an interpretable split. We borrow their
+spatial-latent design for the dynamics code (\cref{sec:spatial-dyn}) and compare against
+VideoFlexTok at its own rate. Most directly related, PV-VAE \citep{pvvae} enriches a
+video VAE with a predictive objective but leaves the latent entangled, and like the
+tokenizers is obtained by training the VAE.
+
+\paragraph{Static and dynamic memory.}
+Outside the tokenizer setting, several systems separate persistent scene structure from
+transient motion for reconstruction and generation: MosaicMem \citep{mosaicmem} composes
+spatially-aligned memory patches into a queried view, and Mem4D \citep{mem4d} keeps a
+persistent structure memory alongside a transient dynamics memory, naming the same
+tension we measure --- one representation cannot simultaneously hold long-term static
+structure and high-fidelity dynamics. Our result is the compressed-code analogue: the
+tension is real, and it is resolved by the decoder's wiring rather than by a loss.
 
 \paragraph{Camera- and viewpoint-aware representation.}
-Geometry-aware attention (GTA \citep{gta}) and projective positional encodings
-(PRoPE \citep{prope}) inject known camera pose to improve novel-view synthesis and
-cross-view reasoning; MosaicMem \citep{mosaicmem} combines explicit 3D lifting with
-implicit dynamics for camera-consistent memory; view-invariant policies and world
-models \citep{reviwo,vista} demonstrate viewpoint robustness by held-out-camera
-control. Our camera path uses known pose in the same spirit, but as an add-on to a
-factorized embedding rather than for synthesis, and we test camera-invariance of
-the \emph{state} directly via a pose-readout asymmetry.
+Geometry-aware attention \citep{gta} and projective positional encodings \citep{prope}
+inject known camera pose for synthesis and cross-view reasoning; view-invariant policies
+\citep{reviwo,vista} demonstrate viewpoint robustness. Our moving-camera study
+(\cref{sec:droid}) uses known pose in this spirit, as a component of the dynamics-code
+analysis rather than as a headline claim.
 
-\paragraph{Visual representations for robotics.}
-R3M \citep{r3m}, VIP \citep{vip}, MVP \citep{mvp}, and Voltron \citep{voltron}
-learn frozen visual encoders judged by behavior-cloning success rate, action/state
-probes, and sample efficiency on manipulation. We evaluate \method{}'s dynamics
-code with the same frozen-encoder protocol on LIBERO \citep{libero}, and use these
-methods as the baselines for downstream usefulness.
-
-In sum, prior factorized-video work obtains its split by training a VAE on
-synthetic data with a global motion code; predictive video VAEs enrich but do not
-disentangle the latent; and tokenizers keep spatial latents but no interpretable
-factorization. \method{} is, to our knowledge, the first to recover a named
-identity/dynamics/camera factorization \emph{from a frozen, pretrained video VAE
-without retraining it}, at high compression and on real moving-camera video, once
-the dynamics code is made spatial.
+In sum, prior factorized-video work trains a generative model from scratch and enforces
+its split with an independence objective, evaluated by swap accuracy. We adapt a frozen
+VAE, show that the independence objective cannot enforce what it is asked to and that
+swap accuracy does not verify it, and obtain the split structurally instead.

@@ -1,34 +1,35 @@
-We presented \method{}, a lightweight adapter that recovers a named
-identity/dynamics/camera factorization from the latent of \emph{any frozen,
-pretrained} video VAE --- without retraining the VAE, the expense every prior
-decomposition and predictive video VAE pays. Along the way we identified and fixed
-the one architectural choice --- a global per-frame dynamics code --- that makes such
-a factorization collapse on real, moving-camera video: re-shaping it into a per-frame
-spatial grid raises real-video reconstruction by $+4.4$\,dB, attributable to the
-spatial structure rather than to rate. On the fair peer class (methods on the same
-frozen latent, matched rate) the resulting code is the most decodable (retaining
-$94.6\%$ of the full-latent reconstruction quality at $\sim\!11\times$ compression)
-and the most label-efficient, while being decomposable and useful for downstream
-control. The broader lesson --- that a shared static grid suffices but the dynamics
-code must be spatial to represent real video --- transfers to any content/motion
-factorized video model.
+We set out to split the latent of a \emph{frozen} video VAE into a static and a dynamic
+code, and found that the split is decided by the decoder rather than by the objective.
+Given a decoder free to read both codes, the per-frame code absorbs the scene: deleting
+the static code costs $11\%$ reconstruction, and eight times more capacity for it changes
+its solo reconstruction by $0.01$\,dB. An independence penalty does not repair this,
+because a static code carrying \emph{noise} satisfies such a penalty perfectly ---
+measured, it is fully satisfied by exactly the model whose static code is unused, and it
+fails to rank models by their actual overlap. Reconstructing each frame as a static image
+plus a \emph{zero-mean} residual makes the time-constant output a function of the static
+code identically, raising its ablation cost to $484\%$. Freed of the redundancy, the same
+model runs at $24\times$ compression --- half our prior rate --- where it matches
+VideoFlexTok and VideoMAE under a matched decode protocol, and on $163{,}717$
+Something-Something-v2 clips its dynamics code reads actions at $10.3\%$ against the
+static code's $6.1\%$.
 
 \paragraph{Limitations.}
 \label{sec:limitations}
-\method{} is not a codec: at matched bitrate it loses to H.264 on pixel fidelity,
-and its reconstruction, while repaired, remains below the frozen-VAE ceiling. The
-camera-invariance benefit of the pose path is not yet cleanly established on real
-robot data: the DROID within-episode metric compares \emph{non-overlapping}
-temporal windows, which see genuinely different scene content as the camera sweeps,
-and therefore cannot isolate camera-invariance from ordinary content change; a
-static-scene multi-view testbed (or overlapping windows) is required to measure it.
-The static/dynamic separation is also only \emph{partial}: identity still leaks into
-the dynamics code (a matched-rate entangled autoencoder is nearly as clean on the
-identity-leakage probe), so the factorization is real and useful but not yet a strong
-disentanglement; an explicit independence objective that pushes identity out of the
-dynamics code is the natural next step. We also do not beat web-pretrained encoders on
-absolute semantic accuracy or classical codecs on rate--distortion --- a consequence
-of building on a frozen VAE latent at extreme compression, which we report rather than
-hide. Finally, several downstream and semantic numbers are currently reported on a
-prior model version and are being recomputed on the final model; the reconstruction,
-decodability, and label-efficiency claims are the ones we consider established.
+The design trades absolute fidelity for structure: at matched rate it reconstructs
+$0.71$\,dB below an unconstrained model, and $2.3$\,dB below our prior configuration at
+twice the rate. It is not a codec. Semantic accuracy is bounded by the substrate rather
+than the encoder --- attribute mAP did not leave $0.72$--$0.77$ across more than eighty
+configurations spanning rate, code shape, auxiliary teachers and loss weights --- and we
+note a correction to our own earlier work: we previously reported the raw-latent SSv2
+ceiling as $9.5\%$ and argued from it that recognition is input-capped, but that figure
+was underfit on an $8$k-clip subset; properly fit it is $13.7\%$, so the gap to
+supervised video encoders is smaller than we claimed. Two further limits are worth
+stating. \emph{Non-redundancy did not improve}: our code overlap ($0.324$ CKA) is better
+than an entangled control's ($0.376$) but no better than the free-decoder model it
+replaces ($0.319$) --- we made the static code \emph{necessary}, not the pair
+\emph{non-overlapping}, and those are different goals. And the split remains
+appearance-versus-motion rather than stationary-objects-versus-moving-objects: attributes
+of moving objects still read marginally better from the static code than from the
+dynamics code. Finally, the matched-protocol comparison (\cref{tab:matched}) is
+single-seed and its top three rows lie within $0.0003$ latent MSE of one another; we
+report parity there, not a win.

@@ -1488,3 +1488,68 @@ REPRODUCING THE VideoFlexTok BASELINE (cost three failed attempts):
   2. `pip install mup` — muP scaling, not in the env.
   3. `TORCHDYNAMO_DISABLE=1` — otherwise InductorError: PassManager::run failed on
      Blackwell + torch 2.7. The cluster sbatch scripts already set this.
+
+## v6.3 — Paper rewritten around the structural split (2026-08-28)
+
+Abstract, introduction, method, experiments, related work and conclusion rewritten to
+match the committed model (v6.2). Compiles clean with tectonic; no dangling references,
+no undefined citations. The paper's spine changed from *"we factorize a frozen VAE
+latent"* to *"the split is decided by the decoder, not the objective"*.
+
+### What the paper now claims
+
+1. **The failure** (`sec:absorb`). With a decoder free to read both codes, the per-frame
+   code absorbs the scene: deleting z_static costs 11%±2 while deleting z_dyn costs
+   714%±47 (3 seeds). Eight times the static rate moves its solo reconstruction from
+   24.90 to 24.89 dB and leaves 76% of its dimensions unused. Capacity is not the lever.
+2. **Why the standard fix cannot work** (`sec:indep`). An independence penalty is
+   satisfied perfectly by a static code carrying NOISE. Measured: fully satisfied
+   (3.7e-3) by the model whose static code is unused; reads 0.0028–0.0051 across models
+   whose CKA overlap spans 0.32–0.40, ranking them backwards. Dropped from the objective.
+3. **The structural fix** (`sec:basedelta`). x_t = Base(z_s) + [Δ(z_d,t) − mean_t Δ].
+   Verified numerically: mean_t x̂ − Base(z_s) = 2.4e-7, and changing z_dyn entirely moves
+   the temporal mean by 4.8e-7. Ablation cost 11% → 484%±43.
+4. **The rate correction** (`sec:rate`). 91.5% of latent energy is time-constant but the
+   usual allocation spends 4% of its floats there. Rebalanced: 576 + 9×64 = 1,152 floats,
+   24.0× compression, half the prior rate.
+
+### Errors caught while writing, and fixed
+
+* **Ablation table was not rate-matched.** Loss-term rows ran at 2,400 / 2,688 / 2,304
+  floats against the committed 1,152, and several changed decoder and code shape too.
+  Split into a rate-matched block (one component per row) and a loss-term block labelled
+  directional-only, with an explicit Rate column.
+* **`\cref{sec:q4}` in the method pointed at the DROID study**, but that label now belongs
+  to the SSv2 section — a valid label with the wrong content, which compiles silently.
+  DROID given its own subsection (`sec:droid`).
+* **Four numbers wrong on first draft**: 11%/714% presented as single-run when they are
+  3-seed means; the "8× the rate" comparison also changes the grid 4×4→8×8; CKA range
+  quoted as 0.32–0.51 by stitching two different measurement sets (correct: 0.32–0.40);
+  "improves recon 21% at no measurable cost" (correct: 22%, for 0.004 mAP).
+
+### Removed from the paper, with reasons
+
+* **Identity/motion swap as disentanglement evidence.** A shared-trunk control that
+  cannot factorize scores +0.054 against ours +0.053±0.013, at two rates. Now reported
+  as a negative result about the metric, with the control recommended for any swap claim.
+* **The λ_indep ablation and leakage table** — the method no longer has that term.
+* **"z_static beats the raw latent at 288× smaller"** — contradicted by our own Table 1
+  (raw latent 0.785 colour mAP vs z_static 0.767).
+* **The un-rate-matched Q7 decodability claim** (94.6% vs 77%) — it reversed under the
+  matched protocol, and is replaced by the matched-protocol table.
+* **Camera-pose path as a headline contribution** — not in the committed configuration;
+  retained inside the moving-camera analysis.
+
+### Related work updated
+
+Added DiViD (2507.13934), DeCo-VAE (2511.14530), Mem4D (2508.07908) and the CKA
+reference; all bib entries except CKA are VERIFY-marked. The positioning is now explicit:
+this family enforces its split with independence-style objectives and evaluates by swap
+accuracy, and we show the first cannot enforce what it is asked to and the second does
+not verify it.
+
+### Outstanding before submission
+
+Seeds for the matched-protocol table (top three rows within 0.0003 latent MSE) and for
+the loss-term ablations; the DROID numbers are reported from the prior model version and
+were not re-run.
