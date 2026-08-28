@@ -37,7 +37,7 @@ and effectively full-rank over the $H\times W$ lattice. Giving $\zd$ a per-frame
 grid, which the decoder \emph{upsamples} rather than broadcasts, raises held-out
 reconstruction on real moving-camera robot video by $+4.4$\,dB; a matched-rate ablation
 attributes the gain to the spatial \emph{structure} ($+2.7$\,dB) rather than to the extra
-floats it costs ($+0.6$\,dB) (\cref{sec:q4}). We keep this design throughout: $\zs$ may
+floats it costs ($+0.6$\,dB) (\cref{sec:droid}). We keep this design throughout: $\zs$ may
 be a single shared grid because appearance is constant within a chunk, but $\zd$ cannot.
 
 \subsection{The dynamics code absorbs everything}

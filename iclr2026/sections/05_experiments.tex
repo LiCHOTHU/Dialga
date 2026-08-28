@@ -1,498 +1,270 @@
-% NUMBER PROVENANCE:
-%   [C] = confirmed this work, final model (DROID reconstruction table).
-%   [P] = prior model version (v5.1/v5.5) -- MUST be re-run on the final model
-%         before camera-ready; kept as an expected-magnitude placeholder.
-%   \tbd = not yet run.
-% TABLE CONVENTIONS (from related work): Q1 <- R3M/VideoMAE/DINOv2 (rate col,
-%   upper-bound row, chance line); Q2a <- S3VAE/C-DSVAE (diagonal latent x factor);
-%   Q2b <- disentanglement-lib (DCI/MIG/SAP); Q3 <- iVideoGPT (horizon) + R3M
-%   (frozen BC vs R3M/VC-1/DINOv2); Q4a <- VidTwin matched-rate ablation;
-%   Q5 <- codec RD tables. Bold=best, \underline=2nd; mean$\pm$std over >=3 seeds
-%   for close comparisons; always print the chance line; state the float budget.
+% NUMBER PROVENANCE. Every figure below is measured; DEVLOG v6.2 records the run.
+%   [3] = mean +- std over three seeds.  [1] = single seed, stated as such.
+%   [P] = prior model version (v5.9 DROID study), not re-run here.
+% Structure follows the method: does the static code carry anything (Q1) -> is the
+% split real (Q2) -> reconstruction against baselines at matched rate (Q3) -> transfer
+% (Q4) -> what it costs (Q5) -> ablations (Q6).
 
 \section{Experiments}
 \label{sec:experiments}
 
-\method{}'s claim is simple: it compresses a frozen video-VAE latent into a
-\emph{tiny, factorized} embedding --- a static code for \emph{what is in the
-scene} and a dynamic code for \emph{how it moves} --- that stays useful at two to
-three orders of magnitude fewer numbers than the latent it is distilled from.
-We are explicit about what we do \emph{not} claim: \method{} is \emph{not} the most
-semantic code. Web-pretrained encoders (VideoMAE, V-JEPA, DINOv2), and even a trivial
-mean-pool of the frozen latent, read CLEVRER attributes as well or better
-(\cref{tab:q1_semantic}). Our claim is a \emph{frontier} one --- \textbf{\method{} is
-the single low-rate code that is simultaneously decodable, factorized, and predictable}:
-it reconstructs to pixels better than any pretrained encoder (\cref{tab:q7_decode}),
-splits identity from motion (\cref{tab:q2_crossprobe}), and rolls forward
-(\cref{tab:q3_rollout}) --- and among label-free codes distilled from the frozen VAE
-latent it still carries the most semantic signal at $96$ floats (beating PCA-$96$ and a
-random encoder, within noise of the full latent at $288\times$ compression). The
-experiments test four hypotheses. Throughout, ``\method{}'' denotes the full model
-\emph{with the independence objective} (\cref{sec:method}); the same model
-\emph{without} it is our primary ablation baseline (``\method{}\,$-$\,indep''),
-isolating the effect of the disentanglement loss from the architecture. We instantiate
-\method{} on a frozen Wan-VAE latent as a convenient, strong substrate --- a
-proof-of-concept, not the claim; the factorization mechanism is substrate-agnostic.
-
-\textbf{H1 (factorization).} \method{} splits video into a \emph{static} code (what
-is in the scene) and a \emph{dynamic} code (how it moves): a cross-probe is
-diagonal-dominant --- identity reads from the static code, motion from the dynamic
-code, each near chance on the other (\cref{tab:q2_crossprobe}).
-\textbf{H2 (semantics + usability).} The two codes are \emph{semantically meaningful
-and independently usable} --- the static code linearly reads object identity, the
-dynamic code reads position/velocity, and each is \emph{clean} of the other (the
-independence objective drives identity out of the dynamic code, below an entangled
-code at matched budget; \cref{tab:q2_disent}). This semantic purity is what makes the
-codes usable downstream: motion-defined SSv2 reads from the dynamic code
-(\cref{tab:ssv2}), appearance-defined UCF101 and robot control from the static and
-dynamic codes (\cref{tab:ucf101,tab:q3_action}).
-\textbf{H3 (efficiency).} The factorization is \emph{compact}: at $96$--$352$ floats it
-carries the usable semantic content --- more per float than any other compression of
-the same substrate (PCA, mean-pool, random, full latent), by rate curve, label
-efficiency, and decodability (\cref{tab:q1_semantic,tab:q1_labeleff,tab:q7_decode}).
-\textbf{H4 (reconstruction, secondary).} We tested whether a cleaner split, by
-removing redundancy, frees capacity and aids reconstruction where capacity binds. It
-does \emph{not}: the independence objective is a small reconstruction \emph{tradeoff}
-(recon-neutral at full rate on CLEVRER, but a modest cost at low rate and on SSv2), not
-a gain --- the constraint removes a useful degree of freedom faster than it frees one.
-We report this honestly; it is why we treat disentanglement as buying \emph{separation
-and interpretability at a small efficiency cost}, not free improvement. Separately, the
-spatial dynamics code is what makes real-video reconstruction viable at all (the
-$+4.4$\,dB finding, \cref{tab:q4_recon}).
-
-\textbf{Where \method{} wins.} In one line: \method{} \emph{wins on disentanglement and
-efficiency while reconstruction stays competitive}. It has the lowest identity leakage
-of any model, including a matched-rate entangled autoencoder (\cref{tab:q2_disent}) --- a
-separation that entangled representations (raw VAE, DINOv2/VideoMAE, predictive VAEs)
-cannot even express; it retains more reconstructable information per float than any other
-compression of the same substrate (\cref{tab:q7_decode}) and is the most label-efficient
-(\cref{tab:q1_labeleff}); and its reconstruction ties the un-regularized model rather than
-degrading. We do \emph{not} claim to beat web-pretrained encoders on raw accuracy or codecs
-on fidelity, and say so; the wins are on the axes the factorization is built for.
-
-Throughout, the comparison that matters is \emph{at matched, extreme compression}.
-We do not compete with full-rate codecs or the frozen VAE on pixel fidelity
-(\cref{tab:q5_rd}); the point is that \emph{among low-dimensional embeddings},
-\method{} is the one code that is simultaneously decodable, factorized, and
-predictable. A consolidated status table is in \cref{tab:plan}.
+The method makes three claims and we test them in order. \textbf{(i)} In a two-code
+video autoencoder with a free decoder, the static code is close to unused, and no
+independence penalty repairs that. \textbf{(ii)} A base-plus-zero-mean-residual decoder
+makes the static code load-bearing, and this shows up on a measure that an entangled
+control fails. \textbf{(iii)} Once the redundancy is removed the same model runs at
+$24\times$ compression, where it is at parity with strong video encoders. We then report
+what the design costs, and one negative result about how factorization is usually
+evaluated.
 
 \subsection{Setup}
 \label{sec:setup}
-\textbf{Data.} \emph{CLEVRER} \citep{clevrer} (synthetic, fixed camera,
-ground-truth attributes / positions / collisions), \emph{DROID} wrist camera
-\citep{droid} (real, moving camera, known 6-DoF end-effector pose), and
-\emph{LIBERO-90} \citep{libero} (manipulation, held-out tasks). Chunks of $W{=}33$
-frames are encoded to Wan-2.2 latents $(48,9,8,8)$. \textbf{Protocol.} Unless noted
-the encoder is frozen and only a light read-out head is trained; we report a probe
-ladder (linear / attentive) and print the chance line. \textbf{Fairness.} All
-representation comparisons are at a stated float budget with matched read-out
-capacity; we include an entangled equal-rate autoencoder and a camera-blind
-(pose-withheld) null as baselines that \emph{should} fail. Close comparisons are
-reported as mean$\pm$std over $\geq 3$ seeds; \textbf{bold}=best,
-\underline{underline}=second.
+\textbf{Data.} \emph{CLEVRER} \citep{clevrer} (synthetic, fixed camera, ground-truth
+attributes and per-object positions) and \emph{Something-Something-v2} \citep{ssv2}
+(real, handheld, $174$ motion-defined actions). CLEVRER chunks are $W{=}33$ frames
+$\to$ Wan-2.2 latent $(48,9,8,8)$; SSv2 chunks are $W{=}17 \to (48,5,8,8)$. The full
+SSv2 run uses all $193{,}690$ clips ($163{,}717$ train / $28{,}891$ val after windowing),
+Wan-encoded to $770{,}432$ chunks. \textbf{Protocol.} The VAE is frozen throughout. We
+report mean$\pm$std over three seeds for every headline number and mark single-seed
+results explicitly. \textbf{Configuration.} Unless noted, \method{} is
+$\zs{=}576$ floats ($9$ channels on $8\times8$) and $\zd{=}64$ floats per frame
+($1$ channel on $8\times8$): $1{,}152$ floats per chunk, $24\times$ compression.
 
-\subsection{Q1: Semantic content of the static code}
+\subsection{Q1: Does the static code carry anything?}
 \label{sec:q1}
+We measure this by ablation --- zero one code and re-decode. A code that matters cannot
+be removed cheaply. \Cref{tab:ablate} is the paper's central table.
+
 \begin{table}[t]
 \centering\small
-\caption{\textbf{Q1 -- semantic probe on frozen features (CLEVRER, held-out).}
-Attribute-presence mAP $\uparrow$; all rows one consistent run (the DINOv2 row
-anchors to the pretrained-baseline run at $0.981$). Material/shape are near-saturated
-(prior already $0.96/0.88$), so \emph{colour} is the discriminative axis. Honest
-reading: among \emph{label-free codes distilled from the frozen VAE latent}, \method{}
-reads best at $96$ floats (beats PCA-$96$ and a random encoder) and is within noise of
-the full $27{,}648$-float latent --- a $288\times$ compression with little semantic
-loss. It does \emph{not} beat a trivial mean-pool or web-pretrained encoders:
-semantics is not where \method{} wins (see decodability \cref{tab:q7_decode} and
-factorization \cref{tab:q2_crossprobe}). All \method{}/Wan rows [C] final model;
-pretrained rows measured at matched $96$-dim (PCA).}
-\label{tab:q1_semantic}
+\caption{\textbf{Q1 --- what each code is worth} (CLEVRER, held-out, mean$\pm$std over
+three seeds). Reconstruction error increase when one code is zeroed, and when the static
+code is taken from a \emph{different clip}. With a free decoder the static code is
+nearly removable ($11\%$) while the dynamics code is indispensable ($714\%$): the split
+exists on paper only. The structural decoder inverts this. Single-seed controls at the
+same rate are given for reference.}
+\label{tab:ablate}
 \begin{tabular}{lccccc}
 \toprule
-Representation & Rate (floats) & Color & Material & Shape & Mean \\
+Model & Rate & Recon. & del.\ $\zs$ $\uparrow$ & del.\ $\zd$ & wrong-clip $\zs$ $\uparrow$ \\
 \midrule
-Base-rate prior          & ---   & 0.497 & 0.963 & 0.878 & 0.780 \\
-Random-init encoder      & 96    & 0.646 & 0.982 & 0.918 & 0.848 \\
-PCA-96                   & 96    & 0.688 & 0.976 & 0.920 & 0.862 \\
-\textbf{\method{} $\zs$ (label-free)} & \textbf{96} & 0.767 & 0.982 & 0.930 & 0.893 \\
-Raw Wan latent           & 27648 & 0.785 & 0.978 & 0.928 & 0.897 \\
-Wan mean-pool            & 48    & 0.776 & 0.993 & 0.941 & 0.904 \\
+Free decoder (prior config) & 2400 & $0.0089${\tiny$\pm.0001$} & $11\%${\tiny$\pm2$} & $714\%${\tiny$\pm47$} & $21\%${\tiny$\pm1$} \\
+\textbf{\method{} (structural)} & \textbf{1152} & $0.0132${\tiny$\pm.0003$} & $\mathbf{484\%}${\tiny$\pm43$} & $149\%${\tiny$\pm4$} & $\mathbf{466\%}${\tiny$\pm19$} \\
 \midrule
-\multicolumn{6}{l}{\emph{Web-pretrained encoders (PCA to matched $96$-dim; stronger, not label-free):}} \\
-VideoMAE \citep{videomae}         & 96 & 0.917 & 0.996 & 0.978 & 0.964 \\
-VideoFlexTok \citep{videoflextok} & 96 & \textbf{0.948} & 0.998 & 0.980 & 0.976 \\
-DINOv2 \citep{dinov2}            & 96 & 0.936 & \textbf{0.999} & \textbf{0.995} & \textbf{0.977} \\
+\multicolumn{6}{l}{\emph{Controls at $1{,}152$ floats [1 seed]:}} \\
+No constraint (free decoder) & 1152 & 0.0121 & $60\%$ & $911\%$ & --- \\
+Entangled encoder (shared trunk) & 1152 & 0.0155 & $393\%$ & $114\%$ & --- \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q1(b) -- label efficiency (CLEVRER attribute mAP $\uparrow$).}
-All methods operate on the \emph{same} frozen Wan-VAE latent (a fair, matched-input
-comparison; foundation encoders use raw pixels and are excluded here). Attribute-probe
-mAP as a function of the number of training labels. A \emph{more semantic} code needs
-\emph{fewer} labels to reach a given accuracy. \method{}'s $96$-float code is the most
-label-efficient by a clear margin in the low-label regime: at $360$ labels it already
-reads $0.854$, \emph{above} both a PCA of the same latent at matched dim ($0.814$) and
-the \emph{full} $27{,}648$-float latent ($0.819$) --- a $288\times$ smaller code that is
-more sample-efficient than the latent it is distilled from, because compression
-front-loads the abstraction that a raw latent leaves for the probe to discover.}
-\label{tab:q1_labeleff}
-\begin{tabular}{lcccccc}
-\toprule
-Train labels & 360 & 900 & 1800 & 4500 & 9000 & 18000 \\
-\midrule
-\textbf{\method{} $\zs$ (96)}      & \textbf{0.854} & \textbf{0.872} & \textbf{0.879} & 0.889 & 0.892 & 0.893 \\
-Wan PCA-96                          & 0.814 & 0.834 & 0.842 & 0.852 & 0.857 & 0.861 \\
-Full Wan latent (27648)            & 0.819 & 0.836 & 0.852 & 0.869 & 0.885 & \textbf{0.896} \\
-\bottomrule
-\end{tabular}
-\end{table}
+Three readings. First, the failure is real and large: with a free decoder the static
+code costs $11\%$ to delete against the dynamics code's $714\%$. Second, the structural
+decoder inverts the ratio --- $484\%$ against $149\%$ --- so both codes become necessary
+and neither is sufficient. Third, the effect is the \emph{decoder's}: at the same rate,
+removing the constraint returns the static code to $60\%$. Capacity is not the lever;
+in a separate measurement, giving the static code eight times the rate under a free
+decoder moved its solo reconstruction from $24.90$ to $24.89$\,dB and left $76\%$ of
+its dimensions unused.
 
-\subsection{Q2: Is the factorization real?}
+\subsection{Q2: Is the split real, and does the usual evidence show it?}
 \label{sec:q2}
-We test it with a cross-probe asymmetry matrix (\cref{tab:q2_crossprobe}) that
-should be diagonal-dominant: identity readable from $\zs$ but not $\zd$, motion
-readable from $\zd$ but not $\zs$. This asymmetry, at a tiny code size, is the
-factorization evidence.
+Ablation says both codes are needed; it does not say they hold \emph{different} things.
+For that we measure code overlap directly with kernel CKA \citep{cka}, and we include an
+\textbf{entangled control} --- one shared convolutional trunk feeding both heads, an
+encoder that cannot route the factors apart. It should fail any valid test.
 
 \begin{table}[t]
 \centering\small
-\caption{\textbf{Q2(a) -- factorization cross-probe (CLEVRER, held-out).}
-Rows = latent probed; columns = target. Identity as mAP, Position/Velocity as
-$R^2$, Collision as F1. Clean $=$ diagonal-dominant.
-\colorbox{green!12}{Green} = intended (want high),
-\colorbox{red!8}{red} = leakage (want $\approx$ chance).}
-\label{tab:q2_crossprobe}
+\caption{\textbf{Q2 --- overlap between the codes, and a control that must fail}
+(CLEVRER, $1{,}152$ floats). Kernel CKA $\downarrow$ measures shared information. The
+independence penalty $\mathcal{L}_{\mathrm{indep}}$ is the quantity such objectives
+optimise. \textbf{The identity/motion swap test is passed equally by the entangled
+control}, so it does not separate a factorizing encoder from one that cannot factorize;
+CKA does.}
+\label{tab:overlap}
+\begin{tabular}{lccc}
+\toprule
+Model & CKA $\downarrow$ & $\mathcal{L}_{\mathrm{indep}}$ & swap margin \\
+\midrule
+\textbf{\method{}} [3] & $\mathbf{0.324}${\tiny$\pm.003$} & $0.0042$ & $+0.053${\tiny$\pm.013$} \\
+Entangled encoder (shared trunk) & $0.376$ & $0.0051$ & $+0.054$ \\
+No constraint (free decoder) & $0.398$ & $0.0048$ & $-0.071$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\method{} has lower overlap than both controls, and the ordering is the one a working
+factorization predicts. Two negatives matter as much as the positive.
+\textbf{The independence penalty does not track overlap}: it reads $0.0042$--$0.0051$
+across models whose CKA spans $0.324$--$0.398$, and it ranks them backwards. And
+\textbf{the swap test is confounded}: the entangled control scores $+0.054$ against
+\method{}'s $+0.053\pm0.013$, reproduced at a second rate. The swap measures whether the
+\emph{decoder} routes identity through the static code --- which our decoder guarantees
+by construction --- not whether the \emph{encoder} separated anything. We report this
+because the test is standard in this literature \citep{s3vae,cdsvae,divid} and, without
+this control, a positive result is not evidence.
+
+\subsection{Q3: Reconstruction against strong encoders, at matched rate}
+\label{sec:q3}
+Every representation is frozen and mapped back to the Wan latent by an
+\emph{identical-capacity} head, then decoded to pixels by the frozen VAE. This is the
+only setting in which our number and the baselines' are produced the same way.
+
+\begin{table}[t]
+\centering\small
+\caption{\textbf{Q3 --- matched-protocol decodability} (CLEVRER val, $1{,}200$ clips,
+single seed). Every row: frozen representation $\to$ equal-capacity head $\to$ Wan
+latent $\to$ pixels. VideoFlexTok sits at exactly our rate, making it the like-for-like
+row. \emph{VideoMAE and DINOv2 are mean-pooled}: their native output is
+$1{,}568\times768\approx1.2$M floats, $43\times$ \emph{larger} than the Wan latent, so
+their compression figures are a property of the pooling, not of the encoder.}
+\label{tab:matched}
 \begin{tabular}{lcccc}
 \toprule
-Probe from $\downarrow$ / factor $\rightarrow$ & Identity & Position & Velocity & Collision \\
+Representation & Floats & Compression & Latent MSE $\downarrow$ & PSNR $\uparrow$ \\
 \midrule
-$\zs$ & \cellcolor{green!12}\textbf{0.78}\,[C] & \cellcolor{red!8}\tbd & \cellcolor{red!8}\tbd & \cellcolor{red!8}\tbd \\
-$\zd$ & \cellcolor{red!8}0.57\,[C] & \cellcolor{green!12}\textbf{0.74}\,[P] & \cellcolor{green!12}\tbd & \cellcolor{red!8}\tbd \\
+Full Wan latent (ceiling) & 27648 & $1.0\times$ & 0.0296 & 27.72 \\
 \midrule
-Chance / base-rate & 0.50 & 0.00 & 0.00 & \tbd \\
+\textbf{\method{}} & \textbf{1152} & $\mathbf{24.0\times}$ & \textbf{0.0327} & \textbf{27.49} \\
+VideoFlexTok \citep{videoflextok} & 1152 & $24.0\times$ & 0.0330 & 27.29 \\
+VideoMAE \citep{videomae} (pooled) & 768 & $36.0\times$ & 0.0328 & 27.40 \\
+\method{} (prior config) & 2400 & $11.5\times$ & 0.0337 & 27.45 \\
+DINOv2 \citep{dinov2} (pooled) & 768 & $36.0\times$ & 0.0401 & 26.50 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\begin{table}[t]
-\centering\small
-\caption{\textbf{H2 -- clean separation: identity leakage into the dynamic code}
-(CLEVRER, colour is the discriminative attribute; chance $0.50$). The independence
-objective is what makes the separation clean: it drives object identity \emph{out} of
-$\zd$ (colour leakage $\to$ chance) while $\zs$ keeps it, widening the static/dynamic
-gap over the no-loss ablation. This is the effect a matched-rate entangled code cannot
-achieve: \method{}(\,$+$\,indep) has the \emph{lowest} identity leakage of the three
-(at chance), and the widest static/dynamic gap. Full $200$-epoch CLEVRER models [C].}
-\label{tab:q2_disent}
-\begin{tabular}{lccc}
-\toprule
-Model & $\zs$ identity $\uparrow$ & $\zd$ leakage $\downarrow$ & gap $\uparrow$ \\
-\midrule
-\textbf{\method{} (\,$+$\,indep)}          & 0.646 & \textbf{0.507} & \textbf{0.139} \\
-\method{}\,$-$\,indep (no loss, ablation)  & 0.679 & 0.564          & 0.115 \\
-Entangled AE (shared trunk)                & 0.674 & 0.545          & 0.129 \\
-\bottomrule
-\end{tabular}
-\end{table}
+\method{} is the best non-ceiling row on both metrics, retaining $99.2\%$ of the
+full-latent PSNR at $24\times$ fewer floats. Against VideoFlexTok at \emph{identical}
+rate it is $+0.20$\,dB. We state the limit of this plainly: the top three rows span
+$0.0327$--$0.0330$ latent MSE, these are single-seed, and VideoFlexTok is a generative
+tokenizer normally judged by rFVD. The supported claim is \emph{parity at matched rate},
+not a win.
 
-
-\subsection{Q3: Is the dynamic code predictive and useful?}
-\label{sec:q3}
-Forward-rollout error (\cref{tab:q3_rollout}) and frozen-feature downstream
-control on LIBERO (\cref{tab:q3_action}), the latter against robot-representation
-baselines at matched rate.
-
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q3(a) -- forward-dynamics rollout (CLEVRER, held-out).}
-Latent MSE $\downarrow$ at horizon $h$ chunks; \method{}'s $\zd$ predictor beats
-copy-last, i.e.\ the dynamics code rolls forward meaningfully. Pixel PSNR pending
-(embers run). $h{=}4$ N/A (3 chunks/clip). [C] final model.}
-\label{tab:q3_rollout}
-\begin{tabular}{lccc}
-\toprule
-Rollout (latent MSE) & $h{=}1$ & $h{=}2$ & $h{=}4$ \\
-\midrule
-Copy-last (baseline)      & 0.053\,[C] & 0.069\,[C] & --- \\
-\textbf{\method{} predictor} & \textbf{0.027}\,[C] & \textbf{0.050}\,[C] & --- \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q3(b) -- downstream control (LIBERO-90, held-out tasks).}
-The metric that matters for control: closed-loop \textbf{task success \%} from a
-frozen encoder + small BC policy head. \method{}'s $\zd$ vs.\ robot-representation
-baselines at matched read-out.}
-\label{tab:q3_action}
-\begin{tabular}{lcc}
-\toprule
-Frozen representation & Rate & BC success \% $\uparrow$ \\
-\midrule
-Random-init      & 96  & \tbd \\
-Wan mean-pool    & 48  & \tbd \\
-R3M \citep{r3m}  & --  & \tbd \\
-VC-1             & --  & \tbd \\
-\textbf{\method{} $\zd$} & 96 & \tbd \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Q4: Moving-camera extension}
+\subsection{Q4: Does it transfer to real video at scale?}
 \label{sec:q4}
-The reconstruction fix (\cref{tab:q4_recon}, fully confirmed) and the
-camera-invariance asymmetry (\cref{tab:q4_camera}): the state should not read
-camera pose while the pose path should. The latter requires
-same-content/different-view pairs; the DROID within-episode metric compares
-non-overlapping windows and cannot isolate it (\cref{sec:limitations}).
+We train the same configuration on all of SSv2 ($163{,}717$ clips) and probe the frozen
+codes for the action class --- a \emph{motion} task, on which a working split should
+favour $\zd$.
 
 \begin{table}[t]
 \centering\small
-\caption{\textbf{Q4(a) -- moving-camera reconstruction (DROID, held-out).}
-Pixel PSNR $\uparrow$; matched-rate ablation. \emph{All confirmed [C].}
-Frozen-VAE round-trip ceiling $=33.3$\,dB.}
-\label{tab:q4_recon}
+\caption{\textbf{Q4 --- full Something-Something-v2} ($163{,}717$ train / $28{,}891$ val,
+three seeds, $896$ floats $=17.1\times$). Left: ablation. Right: linear probe, top-1 over
+$174$ classes. The dynamics code outreads the static code on a motion benchmark, and the
+static code is the \emph{more} necessary of the two for reconstruction --- the split
+behaving as intended on both axes at once.}
+\label{tab:ssv2}
+\begin{tabular}{lcc|ccc}
+\toprule
+& del.\ $\zs$ & del.\ $\zd$ & $\zs$ top-1 & $\zd$ top-1 & chance \\
+\midrule
+\textbf{\method{}} & $\mathbf{319\%}${\tiny$\pm11$} & $49\%${\tiny$\pm0$} & $6.08\%${\tiny$\pm.29$} & $\mathbf{10.32\%}${\tiny$\pm.14$} & $1.88\%$ \\
+\midrule
+\multicolumn{3}{l}{\emph{Reference:} raw Wan latent, full ($15{,}360$ floats)} & \multicolumn{3}{c}{$13.70\%$} \\
+\multicolumn{3}{l}{\phantom{\emph{Reference:}} raw Wan latent, mean-pooled ($48$)} & \multicolumn{3}{c}{$4.45\%$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The dynamics code reaches $10.32\%$ at $320$ floats against the full $15{,}360$-float
+latent's $13.70\%$ --- $75\%$ of what the substrate affords, at $48\times$ fewer numbers.
+\emph{A correction to our own prior work:} we previously reported this ceiling as
+$9.5\%$ and argued from it that SSv2 accuracy is input-capped. That figure was measured
+on an $8$k-clip subset and was underfit; a linear probe on $15{,}360$ dimensions needs
+far more data. The properly-fit ceiling is $13.70\%$, so the gap to fully-supervised
+video encoders is smaller than we claimed, and the ``input-capped'' argument should not
+be relied on.
+
+\subsection{Q5: The dynamics code must be spatial (moving camera)}
+\label{sec:droid}
+\Cref{tab:droid} reports the study motivating the spatial dynamics code
+(\cref{sec:spatial-dyn}), on DROID wrist-camera video --- real, moving-camera, and the
+setting where a global per-frame code fails. These numbers are from the earlier model
+version \pmark{} and were not re-run in this revision.
+
+\begin{table}[t]
+\centering\small
+\caption{\textbf{Q5 --- matched-rate attribution on DROID} \pmark{} (held-out, pixel
+PSNR $\uparrow$; frozen-VAE ceiling $33.3$\,dB). Quadrupling a \emph{global} dynamics
+code buys $0.6$\,dB; re-shaping the same budget into a per-frame spatial grid buys
+$2.7$\,dB. The gain is the structure, not the rate.}
+\label{tab:droid}
 \begin{tabular}{llccc}
 \toprule
-$\zd$ & rate & $\lambda_{\mathrm{pred}}$ & PSNR (dB) $\uparrow$ & $\Delta$ \\
+Config & $\zd$ form & Rate & $\lambda_{\mathrm{pred}}$ & PSNR \\
 \midrule
-global  & 96  & 1.0 & 16.10\,[C] & -- \\
-global  & 256 & 0.1 & 16.73\,[C] & +0.6 \\
-spatial & 256 & 1.0 & 19.45\,[C] & +3.4 \\
-\textbf{spatial (\method{})} & \textbf{256} & \textbf{0.1} & \textbf{20.53}\,[C] & \textbf{+4.4} \\
-\bottomrule
-\end{tabular}
-\\ {\footnotesize Attribution: spatial structure \textbf{+2.7}\,dB, $\lambda_{\mathrm{pred}}$ rebalance +1.1\,dB, extra rate +0.6\,dB.}
-\end{table}
-
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q4(b) -- camera-invariance asymmetry (DROID).}
-Pose read-out $R^2$: want \emph{low} from the invariant state, \emph{high} from
-the pose path. Retention $=$ success\% at a held-out viewpoint vs.\ training view.}
-\label{tab:q4_camera}
-\begin{tabular}{lccc}
-\toprule
-Model & Pose-$R^2$(state)$\downarrow$ & Pose-$R^2$(path)$\uparrow$ & View retention \%$\uparrow$ \\
-\midrule
-Camera-blind null  & \tbd & \tbd & \tbd \\
-\textbf{\method{} (+pose)} & \tbd & \tbd & \tbd \\
+Baseline & global & 96 & 1.0 & 16.10 \\
+$+$ rate only & global & 256 & 0.1 & 16.73 \\
+$+$ spatial & spatial & 256 & 1.0 & 19.45 \\
+\textbf{$+$ spatial $+$ rebalance} & \textbf{spatial} & 256 & 0.1 & \textbf{20.53} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Q5b: Fair baseline comparison on real video (UCF101)}
-\label{sec:ucf101}
-On UCF101 \citep{ucf101} (101 human actions) we compare \method{}'s frozen code
-against strong published video encoders \emph{under the identical protocol} ---
-same clips, frozen features, one linear probe --- so the comparison is
-apples-to-apples. VideoMAE \citep{videomae} and VideoFlexTok \citep{videoflextok}
-are much larger models; the point is not to beat them on absolute accuracy but to
-place \method{}'s compact code on the same axis. VideoFlexTok's strong probe (a
-generative tokenizer's continuous pre-quant features) is itself consistent with
-the semantic--generative spectrum. [C] = this work, matched protocol.
-
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q5b -- UCF101 frozen linear probe (101 classes, matched).}
-Top-1/top-5; 4000 train / 1500 test clips, chance $0.99$. External baselines are
-larger models run under our exact protocol.}
-\label{tab:ucf101}
-\begin{tabular}{llcc}
-\toprule
-Representation & Dim & Top-1 $\uparrow$ & Top-5 $\uparrow$ \\
-\midrule
-Random-init encoder $\zd$ & 256 & 23.00 & 43.70 \\
-Raw Wan latent (mean)     & 48  & 25.13 & 53.03 \\
-\method{} $\zs$ (static)  & 96  & 29.70 & 52.97 \\
-\method{} $\zd$ (dynamic) & 256 & 23.90 & 46.70 \\
-\textbf{\method{} $\zs\!+\!\zd$}   & 352 & \textbf{34.83} & \textbf{60.67} \\
-\midrule
-\multicolumn{4}{l}{\emph{External encoders (larger; our protocol) [C]:}} \\
-VideoMAE \citep{videomae}          & 768  & 66.47 & 87.80 \\
-VideoFlexTok \citep{videoflextok}  & 1152 & \textbf{79.53} & \textbf{93.87} \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Q5: Motion representation on real web video (SSv2)}
-\label{sec:ssv2}
-Our headline factorization is validated on synthetic CLEVRER; here we test whether
-the \emph{dynamics} code carries real-video motion where it matters most.
-Something-Something-v2 \citep{ssv2} is the standard motion-centric benchmark
-(174 fine-grained hand-object actions that are, by construction, not solvable
-from a single frame). We freeze \method{} (trained unsupervised on an 8k-clip
-SSv2 subset, no action labels) and fit a linear probe on frozen chunk features to
-predict the action class, held-out clips. The controlled comparison is
-\emph{which slot} carries the motion signal --- a raw Wan-latent mean-pool and a
-per-frame DINOv2 mean are appearance-only references at comparable pooling, and
-published masked/predictive video encoders are listed as (much larger, fully
-fine-tuned) context, not matched baselines. The claim is not state-of-the-art
-recognition; it is that a compact, factorized, unsupervised embedding routes
-real-video motion into $\zd$.
-
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q5 -- motion-representation probe (SSv2, held-out, linear).}
-Frozen-feature top-1/top-5 over 174 classes (chance $0.57$/$2.87$). Internal rows
-are matched-protocol; the reference block is much larger / fine-tuned, for context
-only. The dynamics code $\zd$ ($5.35$) far outreads the static code $\zs$ ($2.00$)
-and the raw Wan-mean ($4.65$), and $\zs\!+\!\zd$ is best ($6.65$): motion routes
-into $\zd$, as the factorization intends. Absolute accuracy is low --- a linear
-probe on a small unsupervised model, not fine-tuned recognition.}
-\label{tab:ssv2}
-\begin{tabular}{llcc}
-\toprule
-Feature & Pooling & Top-1 $\uparrow$ & Top-5 $\uparrow$ \\
-\midrule
-Random-init encoder $\zd$ & frozen & 3.70 & 10.15 \\
-Raw Wan latent            & mean   & 4.65 & 13.25 \\
-DINOv2 (per-frame, 768-d) & mean   & 13.80 & 31.60 \\
-\midrule
-\method{} $\zs$ (static)  & frozen & 2.00 & \phantom{0}8.15 \\
-\textbf{\method{} $\zd$ (dynamic)} & frozen & \textbf{5.35} & \textbf{14.50} \\
-\textbf{\method{} $\zs\!+\!\zd$}   & frozen & \textbf{6.65} & \textbf{16.20} \\
-\midrule
-\multicolumn{4}{l}{\emph{Reference (larger, fine-tuned; not matched):}} \\
-VideoMAE \citep{videomae} & attentive & \tbd & \tbd \\
-V-JEPA \citep{vjepa}      & attentive & \tbd & \tbd \\
-\bottomrule
-\end{tabular}
-\end{table}
-
-\subsection{Q6: Reconstruction at extreme compression}
+\subsection{Q6: What the design costs}
 \label{sec:q5}
-\method{} occupies an operating point no classical codec reaches: a
-$96$--$964$-float code, one to three orders of magnitude below both the frozen-VAE
-latent and the bitrate of the codecs it is placed beside. At that regime the right
-question is not whether it beats a codec at the codec's own, far higher rate --- it
-does not, and we say so --- but whether, \emph{at a matched, tiny budget}, its code
-is the best available. It is. The matched-rate ablation (\cref{tab:q4_recon}) shows
-\method{}'s $256$-float spatial code reconstructs real video $+4.4$\,dB better than
-a same-rate global code, and \cref{tab:q1_semantic} shows its $96$-float code is
-\emph{more} semantically accessible than any $96$-float alternative. \Cref{tab:q5_rd}
-then places that operating point against the full-rate codecs and the VAE ceiling
-for context only: fidelity degrades \emph{gracefully} (SSIM $\approx 0.96$,
-$33.8$\,dB), and the bits we do not spend on pixels buy a factorized, probeable,
-predictable representation. This is the intended trade, not a failure to compete.
+Two costs, both real. \textbf{Absolute fidelity.} At matched settings \method{}
+reconstructs at $32.29\pm0.08$\,dB against $33.00$\,dB for an unconstrained model at the
+same rate and $34.63$\,dB for the prior configuration at $2{,}400$ floats (frozen-VAE
+ceiling $46.85$\,dB). The structure costs $0.71$\,dB at $24\times$; notably this cost
+\emph{shrinks} with compression --- it is $4.03$\,dB at $2.8\times$ --- because at low
+rate the dynamics code could not absorb the scene in any case.
+\textbf{Semantic accuracy is bounded by the substrate.} CLEVRER attribute mAP is
+$0.725\pm0.008$ against $0.749\pm0.005$ for the prior configuration; across more than
+eighty configurations spanning rate, code shape, memory, auxiliary teachers and loss
+weights, this quantity never left $0.72$--$0.77$. It is a property of the frozen latent,
+not of the encoder.
+
+\subsection{Q7: Ablations}
+\label{sec:q6}
+\Cref{tab:ablations} isolates each design decision on CLEVRER.
 
 \begin{table}[t]
 \centering\small
-\caption{\textbf{Q6 -- reconstruction vs.\ rate (CLEVRER val, 512 clips).} Rate is
-floats per $33$-frame chunk. The frozen Wan-2.2 VAE and the classical codecs are
-high-rate \emph{ceilings for context}, not matched competitors --- they need
-$10$--$300\times$ more numbers than \method{}. At \method{}'s own extreme
-compression, fidelity degrades gracefully (SSIM $\approx 0.96$); the head-to-head
-\emph{at matched rate} is won by \method{}'s design (\cref{tab:q4_recon},
-$+4.4$\,dB over a same-budget code). \method{} numbers are prior-model (\pmark{});
-final-model recomputation pending. The bottom block lists published tokenizers on
-\emph{other} datasets (K600) for context only --- rFVD is dataset-dependent and
-not directly comparable to our CLEVRER rows.}
-\label{tab:q5_rd}
-\begin{tabular}{lccccc}
+\caption{\textbf{Q7 --- ablations} (CLEVRER; [3] three seeds, [1] single seed). The upper
+block is \emph{rate-matched} at $1{,}152$ floats and changes exactly one component per
+row. The lower block studies the loss terms, and we flag plainly that those runs sit at
+their own rates and shapes: they are directional evidence about each term, not
+single-variable ablations of the committed model.}
+\label{tab:ablations}
+\begin{tabular}{lcccc}
 \toprule
-Method & Rate (floats) & PSNR $\uparrow$ & SSIM $\uparrow$ & LPIPS $\downarrow$ & rFVD $\downarrow$ \\
+& Rate & Recon.\ $\downarrow$ & del.\ $\zs$ $\uparrow$ & mAP \\
 \midrule
-Wan-2.2 VAE (ceiling)      & full ($\sim\!27$k) & 48.31 & 0.994 & 0.001 & 1.86 \\
-H.264 (@34\,kbps)          & ---   & 43.25 & 0.989 & 0.009 & 41.75 \\
-H.265 (@37\,kbps)          & ---   & 40.86 & 0.983 & 0.021 & 164.56 \\
+\multicolumn{5}{l}{\emph{Rate-matched, one component changed:}} \\
+\textbf{\method{}} [3] & 1152 & 0.0132 & $\mathbf{484\%}$ & 0.725 \\
+$-$ structural decoder (free decoder) [1] & 1152 & \textbf{0.0121} & $60\%$ & 0.745 \\
+$-$ separate trunks (entangled encoder) [1] & 1152 & 0.0155 & $393\%$ & 0.743 \\
 \midrule
-\method{} (964f, @23\,kbps)  \pmark & 964  & 33.82 & 0.962 & 0.079 & 153.04 \\
-\textbf{\method{} (3844f)} \pmark    & 3844 & 34.77 & 0.967 & 0.061 & 119.98 \\
-\midrule
-\multicolumn{6}{l}{\emph{Reference video tokenizers (published, \textbf{other datasets} --- rFVD not cross-comparable):}} \\
-VideoFlexTok \citep{videoflextok} (K600) & 160 tok & --- & --- & --- & 48.7\phantom{0} \\
-LARP \citep{larp} (K600)                 & ---     & --- & --- & --- & 42.1\phantom{0} \\
-VidTok-FSQ \citep{vidtok} (K600)         & ---     & --- & --- & --- & 84.1\phantom{0} \\
+\multicolumn{5}{l}{\emph{Loss terms, each at its own rate --- directional only:}} \\
+$+$ independence penalty $\lambda_{\mathrm{indep}}{=}1$ [1] & 2400 & 0.0103 & $11\%$ & 0.743 \\
+$-$ consistency term $\lambda_{\mathrm{cons}}{=}0$ [1] & 2688 & 0.0087 & $159\%$ & \textbf{0.684} \\
+$-$ scene term $\lambda_{\mathrm{scene}}{=}0$ [1] & 2304 & 0.0098 & $516\%$ & 0.732 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\subsection{Q7: Decodability --- the axis the semantic encoders lose}
-\label{sec:decode}
-The comparison that most sharply separates \method{} from strong pretrained video
-encoders is not \emph{how semantic} the code is (there, larger label-/web-pretrained
-models win --- \cref{tab:q1_semantic}) but \emph{how decodable} it is. We test this
-directly and symmetrically: freeze each representation, train one \emph{equal-capacity}
-decoder head to map its frozen per-chunk feature back to the Wan-2.2 latent
-$(48,9,8,8)$ under MSE, and report held-out reconstruction error (CLEVRER,
-$2{,}000$ val chunks, same split for all methods). Discriminative encoders that
-throw appearance away reconstruct \emph{worst} (\cref{tab:q7_decode}): \method{}'s
-code retains the most reconstructable information, ahead of VideoMAE, VideoFlexTok,
-and DINOv2. Together with \cref{tab:q1_semantic} this is the paper's central
-picture --- the decode--semantic frontier: the pretrained encoders are \emph{more semantic},
-\method{} is \emph{more decodable}, and \emph{no single representation wins both} ---
-\method{} is the one that is simultaneously decodable, factorized, and reasonably
-probeable at low rate.
+In the rate-matched block, the structural decoder is what produces the factorization:
+removing it returns the static code to $60\%$ at identical rate, and it is the only
+single change that does so. Separate trunks buy $0.0023$ reconstruction and $91$ points
+of ablation cost over an entangled encoder, but --- per \cref{tab:overlap} --- their
+effect is visible in CKA and not in the swap test.
 
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Q7 -- decodability of frozen representations (CLEVRER val).} Every
-method's frozen feature is mapped back to the Wan latent by an identical-capacity
-decoder head; lower val latent-MSE = more pixel-reconstructable information retained.
-\method{} reconstructs best among learned encoders, and \emph{nearly matches the
-full $27{,}648$-float latent ceiling at $\sim\!11\times$ compression}. The ablation
-block isolates the cause: a random-init copy of our encoder decodes far worse
-($0.066$), so decodability comes from \emph{training}, not architecture; and \method{}
-beats a trivial latent mean-pool ($0.039$) --- the opposite of the semantic probe
-(\cref{tab:q1_semantic}), where mean-pool wins. ``Recon.\ retained'' $\uparrow$ is the fraction of the full-latent reconstruction
-quality a code recovers (ceiling-MSE\,/\,method-MSE, higher = better) --- \method{}
-recovers \textbf{$94.6\%$ at $11\times$ compression}, well above every pretrained
-encoder. Native feature dims differ; a budget-matched version (all methods PCA'd to
-$768$/$352$) is computing and the ordering holds at native dim.}
-\label{tab:q7_decode}
-\begin{tabular}{lccc}
-\toprule
-Representation & Dim & Recon.\ retained $\uparrow$ & Latent-MSE $\downarrow$ \\
-\midrule
-\textbf{\method{} ($\zs\!+\!\zd$)} & 2400 & \textbf{94.6\%} & \textbf{0.0241} \\
-VideoMAE \citep{videomae}          & 768  & 77.0\% & 0.0296 \\
-VideoFlexTok \citep{videoflextok}  & 1152 & 77.0\% & 0.0296 \\
-DINOv2 \citep{dinov2}              & 768  & 60.6\% & 0.0376 \\
-\midrule
-\multicolumn{4}{l}{\emph{Ablation / controls:}} \\
-Full Wan latent (ceiling)          & 27648 & 100.0\% & 0.0228 \\
-Wan mean-pool                      & 48   & 58.2\% & 0.0392 \\
-Random-init encoder (untrained)    & 2400 & 34.6\% & 0.0658 \\
-\bottomrule
-\end{tabular}
-\end{table}
+The loss-term block is weaker evidence and we treat it as such. The consistency term is
+the sole source of semantic content: removing it costs $0.06$ mAP while \emph{improving}
+reconstruction, the clearest statement of that trade we have. The independence penalty
+run improves reconstruction and leaves the static code at $11\%$ --- but that run also
+differs in rate and decoder, so it shows the penalty does not \emph{rescue} a free
+decoder rather than isolating the penalty itself. Rate-matched versions of these three
+rows are the main outstanding experiment.
 
-\subsection{Experiment plan and status}
+\subsection{Status}
 \label{sec:plan}
-\begin{table}[t]
-\centering\small
-\caption{\textbf{Consolidated experiment plan.} \done{}=have a number (some on a
-prior model, to re-run); \todomark{}=not yet run. P1 highest priority.}
-\label{tab:plan}
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{cllll c}
-\toprule
-Pri & Experiment & Dataset & Key baseline(s) & Metric & Status \\
-\midrule
-P1 & Q2(a) cross-probe matrix   & CLEVRER & entangled AE, chance     & mAP/$R^2$/F1 & \done \\
-P1 & Q4(a) moving-cam recon      & DROID   & global-$\zd$             & PSNR         & \done \\
-P1 & Q1 semantic probe (final)   & CLEVRER & raw/PCA/random/DINOv2    & mAP          & \done \\
-P2 & Q3(b) action probe (final)  & LIBERO  & R3M/VC-1/DINOv2, wan-mean& MSE/acc      & \done \\
-P1 & Q5 motion probe ($\zd$)     & SSv2    & wan-mean/random          & top-1/5 acc  & \done \\
-P2 & Q3(b) frozen BC + samp.-eff.& LIBERO  & R3M/VC-1/DINOv2          & success \%   & \todomark \\
-P2 & Q4(b) camera asymmetry      & DROID   & camera-blind null        & pose-$R^2$   & \todomark \\
-P3 & Q3(a) forward rollout       & CLEVRER/DROID & copy-last          & MSE/PSNR@$h$ & \todomark \\
-P3 & Q4(b) view-retention policy & DROID   & camera-blind             & retention \% & \todomark \\
-P4 & Q5 rate--distortion vs codec& DROID/CLEVRER & H.264/H.265        & PSNR/LPIPS/rFVD & \todomark \\
-P1 & Multi-seed rerun (headline) & all     & --                       & mean$\pm$std & \todomark \\
-\bottomrule
-\end{tabular}}
-\end{table}
-
-\noindent\textbf{Reading of the plan.} The headline claims are Q1/Q5
-(semantic content and reconstruction at a tiny code size --- representation
-\emph{efficiency}) and Q4(a) (moving-camera reconstruction), all with data in
-hand; the highest-leverage remaining runs are the real-video motion probe (SSv2,
-done) and a frozen-encoder BC result against R3M/VC-1 (the top-tier usefulness
-bar). All \emph{[P]} numbers are recomputed on the final model before
-camera-ready.
+Confirmed over three seeds: \cref{tab:ablate}, \cref{tab:overlap} (\method{} row),
+\cref{tab:ssv2}, and the PSNR figures in \cref{sec:q5}. Single-seed and to be repeated
+before camera-ready: the controls in \cref{tab:ablate,tab:ablations} and all of
+\cref{tab:matched} --- where the top three rows are close enough that seeds decide the
+ordering. Not re-run in this revision: the DROID moving-camera study
+(\cref{sec:spatial-dyn}), which is reported from the earlier model version.
