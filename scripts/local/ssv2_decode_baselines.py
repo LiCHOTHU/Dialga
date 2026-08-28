@@ -75,9 +75,15 @@ def main():
     ap.add_argument("--n_val", type=int, default=600)
     ap.add_argument("--n_pixel", type=int, default=96)
     ap.add_argument("--epochs", type=int, default=60)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds the decode head; features are seed-independent")
+    ap.add_argument("--feat_cache", default="",
+                    help="dir to cache extracted features; RGB encoders re-decode every "
+                         "webm otherwise, which dominates the runtime of a seed sweep")
     ap.add_argument("--out", default="outputs/logs/ssv2_decode.json")
     args = ap.parse_args()
     dev = torch.device("cuda")
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
 
     meta = json.loads((Path(args.cache_dir) / "metadata.json").read_text())
     wins = meta["windows"]; W = int(meta["args"]["window_frames"])
@@ -94,9 +100,17 @@ def main():
 
     res = {}
     vae = None
+    fc = Path(args.feat_cache) if args.feat_cache else None
+    if fc:
+        fc.mkdir(parents=True, exist_ok=True)
     for method in args.methods:
         # ---- features ----------------------------------------------------
-        if method == "vae":
+        cpath = (fc / f"{method}_{args.n_train}_{args.n_val}.pt") if fc else None
+        if cpath is not None and cpath.exists() and method != "vae":
+            d = torch.load(cpath, map_location="cpu", weights_only=False)
+            Ftr, Fva = d["tr"], d["va"]
+            print(f"  [{method}] features from cache", flush=True)
+        elif method == "vae":
             # Substrate ceiling: decode the TRUE latent, no head at all. Separates how
             # much fidelity the frozen VAE loses from how much the shared decode head
             # loses -- on real video the head, not the VAE, turns out to bind.
@@ -120,7 +134,7 @@ def main():
                   f"latent_mse 0.000000  PSNR {p:6.2f} dB", flush=True)
             Path(args.out).write_text(json.dumps(res, indent=2))
             continue
-        if method == "wanflat":
+        elif method == "wanflat":
             Ftr, Fva = Ltr.flatten(1), Lva.flatten(1)
         elif method == "wanmean":
             Ftr, Fva = Ltr.mean(dim=(2, 3, 4)), Lva.mean(dim=(2, 3, 4))
@@ -154,6 +168,9 @@ def main():
                 return torch.from_numpy(np.stack(out))
             Ftr, Fva = rgb(tr_i), rgb(va_i)
             del ext; torch.cuda.empty_cache()
+
+        if cpath is not None and not cpath.exists() and method != "vae":
+            torch.save({"tr": Ftr, "va": Fva}, cpath)
 
         # ---- equal-capacity head ----------------------------------------
         mu, sd = Ftr.mean(0, keepdim=True), Ftr.std(0, keepdim=True) + 1e-5

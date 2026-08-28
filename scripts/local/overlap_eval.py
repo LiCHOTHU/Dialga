@@ -100,10 +100,20 @@ def main():
     ap.add_argument("--ckpts", nargs="+", required=True)
     ap.add_argument("--labels", nargs="+", required=True)
     ap.add_argument("--cache_dir", default="outputs/cache/clevrer_W33_10k")
+    ap.add_argument("--dataset", choices=["clevrer", "ssv2"], default=None,
+                    help="default: inferred from the cache path")
     ap.add_argument("--out", default="outputs/logs/overlap.json")
     args = ap.parse_args()
     dev = torch.device("cuda")
-    va = ClevrerSequence(args.cache_dir, 4, 600, "val", preload=True)
+    # SSv2 caches carry no attrs/slot_mask, so the CLEVRER loader raises KeyError on
+    # them. Pick the loader from the cache rather than assuming CLEVRER.
+    ds = args.dataset or ("ssv2" if "ssv2" in Path(args.cache_dir).name.lower()
+                          or "libero" in Path(args.cache_dir).name.lower() else "clevrer")
+    if ds == "ssv2":
+        from src.data.ssv2_sequence import SSv2Sequence
+        va = SSv2Sequence(args.cache_dir, 4, 600, "val", preload=True)
+    else:
+        va = ClevrerSequence(args.cache_dir, 4, 600, "val", preload=True)
     dl = DataLoader(va, batch_size=32)
     print(f"[data] {len(va)} val videos\n")
     print(f"{'model':<22}{'CKA linear':>13}{'CKA rbf':>13}{'linear xcorr':>14}")

@@ -217,9 +217,12 @@ def main():
                          "(matched-budget decode comparison, defuses the dim confound)")
     ap.add_argument("--pixel", action="store_true", help="also Wan-decode a val subset -> PSNR")
     ap.add_argument("--pixel_n", type=int, default=64)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seeds head init/shuffling; the table was single-seed without it")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)

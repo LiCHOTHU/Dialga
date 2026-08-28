@@ -103,7 +103,9 @@ across models whose CKA spans $0.324$--$0.398$, and it ranks them backwards. And
 \emph{decoder} routes identity through the static code --- which our decoder guarantees
 by construction --- not whether the \emph{encoder} separated anything. We report this
 because the test is standard in this literature \citep{s3vae,cdsvae,divid} and, without
-this control, a positive result is not evidence.
+this control, a positive result is not evidence. We qualify the CKA claim in
+\cref{tab:ssv2diag}: on CLEVRER it orders the models correctly, but on real video it does
+not, and we no longer claim CKA as a sufficient test.
 
 \subsection{Q3: Reconstruction against strong encoders, at matched rate}
 \label{sec:q3}
@@ -185,6 +187,47 @@ better than VideoMAE, which says that on this substrate the pooled self-supervis
 features retain little that a channel mean does not already carry. These are
 single-seed.
 
+\subsection{Q3c: The same controls on real video --- where CKA stops working}
+\label{sec:ssv2diag}
+\cref{tab:overlap} ran these diagnostics on CLEVRER. Repeating them on SSv2, against an
+entangled control trained on all $163{,}717$ clips with the committed configuration and a
+shared trunk, changes one of the conclusions.
+
+\begin{table}[t]
+\centering\small
+\caption{\textbf{Q3c --- overlap, ablation and reconstruction on SSv2} (three seeds for
+\method{}; $400$ val videos for ablation, $600$ for CKA). Deletion cost is the \%
+increase in reconstruction MSE when a code is zeroed. \textbf{Linear CKA ranks the
+entangled control as the \emph{better}-factorized model}, and the deletion costs do not
+separate the two either. What does separate them is the dynamics code: the control's is
+collapsed (effective rank $69$ of $320$ against our $117$), it is $13$ points cheaper to
+delete, and it reads actions far worse (\cref{tab:libero}).}
+\label{tab:ssv2diag}
+\begin{tabular}{lccccc}
+\toprule
+& CKA lin.\ $\downarrow$ & CKA rbf $\downarrow$ & del.\ $\zs$ & del.\ $\zd$ & PSNR $\uparrow$ \\
+\midrule
+\textbf{\method{}} & $0.182${\tiny$\pm.021$} & $\mathbf{0.289}${\tiny$\pm.018$}
+  & $332\%${\tiny$\pm9$} & $\mathbf{48\%}${\tiny$\pm1$} & $\mathbf{15.05}${\tiny$\pm.07$} \\
+Entangled (shared trunk) & $\mathbf{0.022}$ & $0.300$ & $351\%$ & $35\%$ & $14.94$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{A negative result about our own metric.} On CLEVRER we reported CKA as the
+diagnostic that separates a factorizing encoder from one that cannot factorize. On SSv2
+it does not: linear CKA reads $0.022$ for the entangled control against our $0.182$, and
+the RBF variant reads $0.300$ against $0.289$ --- indistinguishable. The control's low
+linear CKA is not evidence of a better split; its dynamics code has collapsed to an
+effective rank of $69$ of $320$ dimensions (ours: $117$), and two codes overlap less when
+one of them carries less. Deletion cost fails here too, and for a reason we can state
+exactly: the base+delta wiring makes the time-constant output a function of $\zs$ by
+construction, so a \emph{large} deletion cost for $\zs$ is guaranteed by the architecture and is
+available to the control for free. We therefore retract the general claim that CKA
+verifies the split. The measurements that do separate the two models on real video are
+the dynamics code's deletion cost ($48\%$ vs $35\%$), its effective rank, and its
+action read-out --- all properties of $\zd$, none of them an overlap statistic.
+
 \subsection{Q4: Does it transfer to real video at scale?}
 \label{sec:q4}
 We train the same configuration on all of SSv2 ($163{,}717$ clips) and probe the frozen
@@ -235,10 +278,11 @@ are held out ($15$ of $90$), so no probe sees its test task's action statistics.
 \caption{\textbf{Q4b --- LIBERO action read-out}, $4{,}499$ demonstrations, $14{,}996$
 train / $3{,}000$ held-out windows over $15$ unseen tasks; three seeds. Ridge for the
 $6$ continuous DoF ($R^2$ against the train mean), logistic for the gripper (base rate
-$0.393$). \emph{random} is the committed architecture untrained. It is the row that
-matters: untrained, the static code reads actions \emph{better} than the dynamics code,
-and training reverses the ordering. The asymmetry is therefore produced by the
-objective, not by the architecture or by the codes' differing widths.}
+$0.393$). \emph{random} is the committed architecture untrained. Two controls: untrained, the static
+code reads actions \emph{better} than the dynamics code and training reverses the
+ordering, so the asymmetry is produced by the objective rather than by the architecture
+or the codes' differing widths; and the entangled encoder, which cannot route the factors
+apart, produces a gap of $0.061$ against our $0.177$.}
 \label{tab:libero}
 \begin{tabular}{llccc}
 \toprule
@@ -250,6 +294,10 @@ Model & Feature & Floats & $R^2$ $\uparrow$ & Gripper acc.\ $\uparrow$ \\
  & $\zd$ (time-pooled)        & 64  & $0.540${\tiny$\pm.032$} & $0.751${\tiny$\pm.013$} \\
  & $\zs + \zd$                & 896 & $0.666${\tiny$\pm.005$} & $\mathbf{0.805}${\tiny$\pm.008$} \\
 \midrule
+\multirow{2}{*}{entangled}
+ & $\zs$                      & 576 & $0.503$ & $0.789$ \\
+ & $\zd$ (full temporal)      & 320 & $0.564$ & $0.767$ \\
+\midrule
 \multirow{2}{*}{random init}
  & $\zs$                      & 576 & $0.525$ & $0.760$ \\
  & $\zd$ (full temporal)      & 320 & $0.298$ & $0.719$ \\
@@ -259,8 +307,9 @@ Reference & raw Wan latent, mean-pooled & 48 & $0.591$ & $0.745$ \\
 \end{tabular}
 \end{table}
 
-Trained, $\zd$ reads actions at $R^2\,0.662$ against $\zs$'s $0.485$, and adding $\zs$
-to $\zd$ moves the result by $0.004$ --- the static code contributes essentially nothing
+Trained, $\zd$ reads actions at $R^2\,0.662$ against $\zs$'s $0.485$ --- a gap of
+$0.177$, against the entangled control's $0.061$ ($0.564$ vs $0.503$) --- and adding
+$\zs$ to $\zd$ moves the result by $0.004$ --- the static code contributes essentially nothing
 to a motion target, which is the intended behaviour. Time-pooling $\zd$ costs $0.12$
 $R^2$, confirming that the signal lives in its time axis and that pooling it, as the
 probes in \cref{tab:ssv2} do, understates it. Two honest qualifications. The gripper

@@ -1606,3 +1606,45 @@ control row and CKA); no SSv2 entangled checkpoint existed. The CLEVRER OOD shor
 remains unusable — neither code linearly encodes CLEVRER motion (fast-vs-slow 0.497/0.530
 at chance 0.50), which also invalidates the prior "position R² 0.74 from z_dyn" claim for
 this model.
+
+## v6.5 — SSv2 controls; a retraction about CKA (2026-08-28)
+
+Trained the entangled shared-trunk control on all 163,717 SSv2 clips (none existed) and
+ran the full diagnostic suite against it. Paper recompiled (tectonic; no TeX was installed
+locally) — no undefined references or citations.
+
+**New numbers filled into the paper.**
+
+| | CKA lin | CKA rbf | del z_static | del z_dyn | PSNR |
+|---|---|---|---|---|---|
+| DIALGA (3 seeds) | 0.182±.021 | 0.289±.018 | 332%±9 | 48%±1 | 15.05±.07 |
+| entangled | **0.022** | 0.300 | 351% | 35% | 14.94 |
+
+**Retraction: CKA does not verify the split.** On CLEVRER we reported CKA as the
+diagnostic that separates a factorizing encoder from one that cannot (0.324 vs 0.376).
+On SSv2 it reverses: linear CKA reads 0.022 for the entangled control against our 0.182,
+and RBF is a tie (0.300 vs 0.289). I checked whether the control's codes were degenerate
+before writing this up — they are not in scale (std 2.06/2.09 vs our 1.95/2.10) and its
+static effective rank matches ours (63.3 vs 63.5), but its **dynamics code is collapsed:
+effective rank 69 of 320 against our 117**. Two codes overlap less when one carries less,
+so its low CKA is an artifact of that collapse, not evidence of a better split.
+
+Deletion cost fails on this control too (351% vs our 332%), and the reason is structural:
+base+delta makes the time-constant output a function of z_static by construction, so a
+large del-z_static is guaranteed by the architecture and comes free to the control. Q2's
+claim is now qualified rather than asserted.
+
+What *does* separate the two models on real video is all z_dyn, none of it an overlap
+statistic: deletion cost 48% vs 35%, effective rank 117 vs 69, and the LIBERO action gap
+(z_dyn − z_static) of **0.177 for ours vs 0.061 for the control**.
+
+**New code.** `scripts/local/ablate_eval.py` — deletion-cost eval that runs on any
+dataset. The equivalent existed only inside the trainer's eval loop, and `swap_eval.py`,
+the other route to it, computes identity from CLEVRER attributes and crashes on SSv2
+(KeyError 'attrs'). Also made `overlap_eval.py` and `swap_eval.py` pick their loader from
+the cache instead of assuming CLEVRER, and added `--seed` + `--feat_cache` to
+`ssv2_decode_baselines.py` so a seed sweep pays the webm decoding once.
+
+**Note.** No CLEVRER checkpoint matching the committed config still exists on disk (133
+CLEVRER checkpoints, none basedelta at the committed rate), so tab:matched cannot be
+given seed error bars without retraining. Left as-is with its single-seed caveat.

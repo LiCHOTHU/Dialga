@@ -128,10 +128,19 @@ def main():
     ap.add_argument("--ckpts", nargs="+", required=True)
     ap.add_argument("--labels", nargs="+", required=True)
     ap.add_argument("--cache_dir", default="outputs/cache/clevrer_W33_10k")
+    ap.add_argument("--dataset", choices=["clevrer", "ssv2"], default=None,
+                    help="default: inferred from the cache path")
     ap.add_argument("--out", default="outputs/logs/swap.json")
     args = ap.parse_args()
     dev = torch.device("cuda")
-    va = ClevrerSequence(args.cache_dir, 4, 400, "val", preload=True)
+    # SSv2/LIBERO caches carry no attrs/slot_mask; pick the loader from the cache.
+    _n = Path(args.cache_dir).name.lower()
+    if args.dataset == "ssv2" or (args.dataset is None and
+                                  ("ssv2" in _n or "libero" in _n)):
+        from src.data.ssv2_sequence import SSv2Sequence
+        va = SSv2Sequence(args.cache_dir, 4, 400, "val", preload=True)
+    else:
+        va = ClevrerSequence(args.cache_dir, 4, 400, "val", preload=True)
     dl = DataLoader(va, batch_size=32)
     print(f"[data] {len(va)} val videos\n")
     print(f"{'model':<22}{'id(recon)':>11}{'id(swap)=A':>12}{'id leak=B':>11}{'margin':>9}")
